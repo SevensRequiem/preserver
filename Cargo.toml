@@ -1,0 +1,56 @@
+[package]
+name = "preserver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Encrypted GitHub and local-folder backups plus public-archive mirroring to removable drives"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+age = { version = "=0.12.1", default-features = false }
+anyhow = "=1.0.104"
+clap = { version = "=4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+jiff = { version = "=0.2.43", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+rpassword = "=7.5.5"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+toml = { version = "=1.2.1", default-features = false, features = ["parse", "display", "serde"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.6", features = ["fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+cast_possible_truncation = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.profiling]
+inherits = "release"
+debug = true

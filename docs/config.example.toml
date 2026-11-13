@@ -1,0 +1,22 @@
+# Install as ~/.config/code-archive/config.toml (Linux) or
+# %APPDATA%\code-archive\config.toml (Windows). The repo ships no host defaults.
+
+# GitHub owners (users or orgs) whose repositories are backed up. Required.
+owners = ["your-github-user", "your-org"]
+
+# Filesystem id of the primary backup drive (ext4 UUID, FAT "XXXX-XXXX" or NTFS serial). Required.
+primary_uuid = "00000000-0000-0000-0000-000000000000"
+
+# "ssh" (FIDO key through the preserver-ssh shim) or "https" (token from the gh CLI). Override with --transport.
+transport = "ssh"
+
+# Public-archive download cap in Mbit/s; 0 means no cap.
+bandwidth_mbit = 80
+
+# Percent of the drive kept free by the public-archive budget (0 to 90).
+reserve_percent = 10
+
+# Local folders backed up as encrypted L0/Dnn tar.zst archives.
+[[local]]
+name = "documents"
+path = "/home/you/Documents"
