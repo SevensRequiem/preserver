@@ -1,0 +1,14 @@
+[Unit]
+Description=preserver encrypted backup of local folders
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/preserver personal --local-only
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes

@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            ext: ""
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            ext: ".exe"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          want=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          [ "$TAG" = "v$want" ] || { echo "tag $TAG does not match Cargo.toml version $want" >&2; exit 1; }
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends clang lld llvm musl-tools
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Name the binary
+        shell: bash
+        run: |
+          mkdir dist-out
+          cp "target/${{ matrix.target }}/release/preserver${{ matrix.ext }}" "dist-out/preserver-${{ matrix.target }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: preserver-${{ matrix.target }}
+          path: dist-out/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist-out
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist-out
+        run: sha256sum preserver-* > SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist-out/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Binaries are named preserver-TARGET. Verify with sha256sum -c SHA256SUMS, or install with install.sh."

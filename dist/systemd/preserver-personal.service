@@ -1,0 +1,14 @@
+[Unit]
+Description=preserver encrypted personal backup (GitHub repos and local folders)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/preserver personal
+Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket
+# The tray imports DISPLAY, WAYLAND_DISPLAY and XAUTHORITY into the user manager before starting
+# this unit, so the FIDO askpass dialog can show. PrivateTmp is left off: it would hide
+# /tmp/.X11-unix from the askpass.
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
