@@ -106,6 +106,8 @@ est = 0.03
 [[set.source]]
 name = "amd-apm"
 kind = "http"
+enabled = false
+todo = "amd.com answers HTTP 404 to non-browser clients for these PDFs (2026-11-14): find a mirror or a fetch that works without impersonating a browser"
 resolve = "static"
 urls = [
   "https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24592.pdf",
