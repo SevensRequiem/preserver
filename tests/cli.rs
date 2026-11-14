@@ -70,9 +70,25 @@ fn bad_config_is_rejected_before_anything_runs() {
 #[test]
 fn later_phases_say_so() {
     let root = fresh_dir("phases");
-    let out = preserver(&root).arg("public").output().unwrap();
+    let out = preserver(&root).args(["clone", "/x"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("phase 2"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("phase 4"), "{}", stderr(&out));
+}
+
+#[test]
+fn public_refuses_an_unknown_set_before_touching_the_drive() {
+    let root = fresh_dir("public");
+    write_config(&root);
+    let out = preserver(&root)
+        .args(["public", "no-such-set", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no set \"no-such-set\" in the catalog"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

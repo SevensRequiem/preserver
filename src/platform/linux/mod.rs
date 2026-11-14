@@ -4,8 +4,8 @@ mod tray;
 mod udisks;
 
 pub(crate) use fs::{
-    is_mounted, link_self, private_dir_all, private_dir_new, private_file, private_file_new,
-    restrict_dir, set_mode, symlink, sync_dir, sync_fs,
+    disk_free, is_mounted, link_self, private_dir_all, private_dir_new, private_file,
+    private_file_new, restrict_dir, set_mode, symlink, sync_dir, sync_fs,
 };
 pub(crate) use notify::notify;
 pub(crate) use tray::run_tray;

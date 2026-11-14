@@ -31,6 +31,10 @@ pub(crate) fn sync_fs(_path: &Path) -> io::Result<()> {
     Err(unsupported())
 }
 
+pub(crate) fn disk_free(_path: &Path) -> io::Result<(u64, u64)> {
+    Err(unsupported())
+}
+
 pub(crate) fn private_file(path: &Path) -> io::Result<File> {
     File::create(path)
 }

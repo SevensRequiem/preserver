@@ -79,6 +79,15 @@ pub(crate) fn link_self(link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(exe, link)
 }
 
+/// Bytes an unprivileged user can still write, and the size, of the filesystem holding `path`.
+pub(crate) fn disk_free(path: &Path) -> io::Result<(u64, u64)> {
+    let st = rustix::fs::statvfs(path)?;
+    Ok((
+        st.f_bavail.saturating_mul(st.f_frsize),
+        st.f_blocks.saturating_mul(st.f_frsize),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

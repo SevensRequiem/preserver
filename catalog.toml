@@ -1,0 +1,1398 @@
+# Sets run in this order with --first-pass. priority is the clone tier: 0 USB core, 1 the 1 TB disk, 2 full.
+# estimate and est are GB. Sizes marked (E) are guesses.
+# keep is how many set versions stay visible. Unchanged files are hard links, so it only costs what changed.
+# A disabled source needs a todo that says what is missing.
+
+[[set]]
+name = "keys"
+title = "Trust anchors"
+priority = 0
+estimate = 0.1
+keep = 3
+use = "The keyrings that verify everything else. A changed upstream key fails the set and raises a notification instead of replacing the key stored in the repo."
+
+[[set.source]]
+name = "gnu-keyring"
+kind = "http"
+resolve = "static"
+urls = ["https://ftp.gnu.org/gnu/gnu-keyring.gpg"]
+stored = "gnu-keyring"
+license = "n/a"
+
+[[set.source]]
+name = "fedora-keys"
+kind = "http"
+resolve = "static"
+urls = ["https://fedoraproject.org/fedora.gpg"]
+stored = "fedora"
+license = "n/a"
+
+[[set.source]]
+name = "rust-key"
+kind = "http"
+resolve = "static"
+urls = ["https://static.rust-lang.org/rust-key.gpg.ascii"]
+stored = "rust"
+signers = ["108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"]
+license = "n/a"
+
+[[set.source]]
+name = "alpine-ncopa"
+kind = "http"
+resolve = "static"
+urls = ["https://alpinelinux.org/keys/ncopa.asc"]
+stored = "alpine-ncopa"
+license = "n/a"
+
+[[set.source]]
+name = "llvm-keys"
+kind = "http"
+resolve = "static"
+urls = ["https://releases.llvm.org/release-keys.asc"]
+stored = "llvm"
+license = "n/a"
+
+[[set.source]]
+name = "musl-key"
+kind = "http"
+resolve = "static"
+urls = ["https://musl.libc.org/musl.pub"]
+stored = "musl"
+license = "n/a"
+
+[[set.source]]
+name = "debian-cd-key"
+kind = "http"
+resolve = "static"
+urls = ["https://keyring.debian.org/pks/lookup?op=get&search=0xDF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+assets = ["debian-cd-key.asc"]
+stored = "debian-cd"
+signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+license = "n/a"
+
+[[set.source]]
+name = "node-release-keys"
+kind = "git"
+url = "https://github.com/nodejs/release-keys"
+est = 0.01
+license = "MIT"
+
+[[set.source]]
+name = "kernel-pgpkeys"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/docs/kernel/pgpkeys.git"
+est = 0.05
+license = "n/a"
+
+[[set]]
+name = "specs"
+title = "Specifications and references"
+priority = 0
+estimate = 5
+use = "ISA manuals, ABIs, language drafts and reference docs. Intel, AMD and POSIX material is free to read but not for redistribution."
+
+[[set.source]]
+name = "intel-sdm"
+kind = "http"
+resolve = "static"
+urls = ["https://cdrdv2.intel.com/v1/dl/getContent/671200"]
+assets = ["intel-sdm.pdf"]
+license = "Intel terms (no redistribution)"
+est = 0.03
+
+[[set.source]]
+name = "amd-apm"
+kind = "http"
+resolve = "static"
+urls = [
+  "https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24592.pdf",
+  "https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24593.pdf",
+  "https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24594.pdf",
+  "https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/26568.pdf",
+]
+assets = ["amd64-apm-vol1.pdf", "amd64-apm-vol2.pdf", "amd64-apm-vol3.pdf", "amd64-apm-vol4.pdf"]
+license = "AMD (free to read)"
+est = 0.02
+
+[[set.source]]
+name = "amd-rdna2-isa"
+kind = "http"
+enabled = false
+todo = "URL not verified: find the rdna2 ISA PDF under amd.com radeon-tech-docs and add it as a static url"
+
+[[set.source]]
+name = "arm-arm"
+kind = "http"
+enabled = false
+todo = "developer.arm.com/documentation/ddi0487/latest is an HTML page that links the PDF: needs a scrape resolver"
+
+[[set.source]]
+name = "riscv-isa"
+kind = "http"
+resolve = "gh-latest"
+repo = "riscv/riscv-isa-manual"
+assets = ["*.pdf", "*.epub"]
+license = "CC-BY-4.0"
+est = 0.03
+
+[[set.source]]
+name = "x86-64-psabi"
+kind = "git"
+url = "https://gitlab.com/x86-psABIs/x86-64-ABI.git"
+est = 0.01
+license = "free"
+
+[[set.source]]
+name = "elf-gabi"
+kind = "http"
+enabled = false
+todo = "sco.com/developers/gabi/latest is a tree of HTML pages: needs a recursive-mirror resolver"
+
+[[set.source]]
+name = "abi-aa"
+kind = "http"
+resolve = "gh-latest"
+repo = "ARM-software/abi-aa"
+assets = ["*.pdf"]
+license = "CC-BY-SA-4.0"
+est = 0.02
+
+[[set.source]]
+name = "riscv-psabi"
+kind = "http"
+resolve = "gh-latest"
+repo = "riscv-non-isa/riscv-elf-psabi-doc"
+assets = ["*.pdf"]
+license = "CC-BY-4.0"
+est = 0.005
+
+[[set.source]]
+name = "dwarf"
+kind = "http"
+resolve = "static"
+urls = ["https://dwarfstd.org/doc/DWARF5.pdf"]
+license = "free"
+est = 0.003
+
+[[set.source]]
+name = "c-drafts"
+kind = "http"
+enabled = false
+todo = "newest WG14 working draft is found by parsing wg14_document_log: needs a scrape resolver. N3220 (C23) is the pinned fallback"
+
+[[set.source]]
+name = "cpp-drafts"
+kind = "http"
+enabled = false
+todo = "newest WG21 working draft is found by parsing the papers index: needs a scrape resolver"
+
+[[set.source]]
+name = "cpp-draft-src"
+kind = "git"
+url = "https://github.com/cplusplus/draft"
+est = 0.3
+license = "CC-BY-4.0"
+
+[[set.source]]
+name = "posix"
+kind = "http"
+resolve = "static"
+urls = ["https://pubs.opengroup.org/onlinepubs/9799919799/download/susv5.tgz"]
+license = "personal use only"
+est = 0.01
+
+[[set.source]]
+name = "unicode"
+kind = "http"
+enabled = false
+todo = "needs two steps: highest N.N.N/ directory under unicode.org/Public, then the files inside it"
+
+[[set.source]]
+name = "man-pages"
+kind = "http"
+resolve = "listing"
+url = "https://cdn.kernel.org/pub/linux/docs/man-pages/"
+pattern = '^man-pages-(\d[\d.]*\d)\.tar\.xz$'
+sig = ".sign"
+sig_over = "xz"
+keyring = "kernel"
+license = "various-free"
+est = 0.002
+
+[[set.source]]
+name = "cppreference"
+kind = "http"
+resolve = "gh-latest"
+repo = "PeterFeicht/cppreference-doc"
+assets = ["html-book-*.tar.xz"]
+license = "CC-BY-SA/GFDL"
+est = 0.05
+
+[[set.source]]
+name = "rfcs"
+kind = "http"
+enabled = false
+url = "rsync.rfc-editor.org::rfcs"
+todo = "phase 3: was an rsync module; becomes an https listing of rfc-editor.org"
+est = 3
+license = "IETF Trust"
+
+[[set.source]]
+name = "vulkan-docs"
+kind = "git"
+url = "https://github.com/KhronosGroup/Vulkan-Docs"
+est = 0.5
+license = "CC-BY-4.0/Apache-2.0"
+
+[[set.source]]
+name = "uefi-acpi"
+kind = "http"
+enabled = false
+todo = "uefi.org/specifications lists the newest UEFI and ACPI PDFs on a page: needs a scrape resolver"
+
+[[set]]
+name = "books"
+title = "Free CS books"
+priority = 0
+estimate = 1
+use = "Books whose licences allow copying (Crafting Interpreters, Pro Git, SICP, OSTEP-style free texts). Check the licence column in SET.toml before sharing a copy."
+
+[[set.source]]
+name = "progit"
+kind = "http"
+resolve = "gh-latest"
+repo = "progit/progit2"
+assets = ["*.pdf", "*.epub"]
+license = "CC-BY-NC-SA-3.0"
+est = 0.033
+
+[[set.source]]
+name = "craftinginterpreters"
+kind = "git"
+url = "https://github.com/munificent/craftinginterpreters"
+est = 0.1
+license = "CC-BY-NC-ND-4.0/MIT"
+
+[[set.source]]
+name = "ods"
+kind = "http"
+resolve = "static"
+urls = ["https://opendatastructures.org/ods-cpp.pdf", "https://opendatastructures.org/ods-java.pdf", "https://opendatastructures.org/ods-python.pdf"]
+license = "CC-BY-2.5"
+est = 0.02
+
+[[set.source]]
+name = "mcs"
+kind = "http"
+resolve = "static"
+urls = ["https://courses.csail.mit.edu/6.042/spring18/mcs.pdf"]
+license = "CC-BY-SA-3.0"
+est = 0.01
+
+[[set.source]]
+name = "erickson"
+kind = "http"
+resolve = "static"
+urls = ["https://jeffe.cs.illinois.edu/teaching/algorithms/book/Algorithms-JeffE.pdf"]
+license = "CC-BY-4.0"
+est = 0.02
+
+[[set.source]]
+name = "lkmpg"
+kind = "git"
+url = "https://github.com/sysprog21/lkmpg"
+est = 0.02
+license = "OSL-3.0"
+
+[[set.source]]
+name = "linux-insides"
+kind = "git"
+url = "https://github.com/0xAX/linux-insides"
+est = 0.05
+license = "CC-BY-NC-SA-4.0"
+
+[[set.source]]
+name = "bottomupcs"
+kind = "git"
+url = "https://github.com/ianw/bottomupcs"
+est = 0.02
+license = "CC-BY-SA-3.0"
+
+[[set.source]]
+name = "sicp"
+kind = "git"
+url = "https://github.com/sarabander/sicp-pdf"
+est = 0.02
+license = "CC-BY-SA-4.0"
+
+[[set.source]]
+name = "d2l"
+kind = "git"
+url = "https://github.com/d2l-ai/d2l-en"
+est = 0.3
+license = "CC-BY-SA-4.0"
+
+[[set.source]]
+name = "systemsapproach"
+kind = "git"
+url = "https://github.com/SystemsApproach/book"
+est = 0.05
+license = "check (believed CC-BY-4.0)"
+
+[[set.source]]
+name = "go-website"
+kind = "git"
+url = "https://go.googlesource.com/website"
+est = 0.2
+license = "BSD-3/CC-BY-4.0"
+
+[[set.source]]
+name = "rust-book"
+kind = "git"
+url = "https://github.com/rust-lang/book"
+est = 0.1
+license = "MIT/Apache-2.0"
+
+[[set.source]]
+name = "scraped-books"
+kind = "http"
+enabled = false
+todo = "OSTEP, Mogensen, Wirth, Beej, Modern C, Dive into Systems, Kuphaldt, Tarnoff, PGU, LDD3, Jorgensen, dbdesign and the SQLite docs are links on HTML pages: add static urls once each PDF address is confirmed"
+
+[[set]]
+name = "toolchains"
+title = "Compilers and language runtimes, source and bootstrap binaries"
+priority = 0
+estimate = 10
+use = "Source and bootstrap tarballs for GCC alternatives, Go, Rust, Zig, Node, musl, LLVM and Perl."
+
+[[set.source]]
+name = "gcc"
+kind = "http"
+enabled = false
+url = "rsync://mirrors.kernel.org/gnu/gcc/"
+todo = "phase 3 (two-level https listing): wants the newest two major gcc-N.N.N/ directories: needs a list-only resolver for rsync, then --files-from"
+
+[[set.source]]
+name = "musl"
+kind = "http"
+enabled = false
+todo = "the listing url 404s: confirm the index page of musl.libc.org (probably releases.html, whose hrefs are releases/musl-X.Y.Z.tar.gz, so the pattern needs that prefix), then enable"
+resolve = "listing"
+url = "https://musl.libc.org/releases/"
+pattern = '^musl-(\d+\.\d+\.\d+)\.tar\.gz$'
+top = 2
+sig = ".asc"
+keyring = "musl"
+license = "MIT"
+est = 0.002
+
+[[set.source]]
+name = "llvm-src"
+kind = "http"
+resolve = "gh-latest"
+repo = "llvm/llvm-project"
+assets = ["llvm-project-*.src.tar.xz"]
+sig = ".sig"
+keyring = "llvm"
+license = "Apache-2.0-LLVM"
+est = 0.18
+
+[[set.source]]
+name = "go"
+kind = "http"
+resolve = "json"
+extract = "go"
+url = "https://go.dev/dl/?mode=json"
+assets = ["amd64", "arm64"]
+license = "BSD-3"
+est = 0.25
+
+[[set.source]]
+name = "go-bootstrap-chain"
+kind = "http"
+resolve = "static"
+urls = [
+  "https://dl.google.com/go/go1.4-bootstrap-20171003.tar.gz",
+  "https://dl.google.com/go/go1.17.13.src.tar.gz",
+  "https://dl.google.com/go/go1.20.14.src.tar.gz",
+  "https://dl.google.com/go/go1.22.12.src.tar.gz",
+]
+license = "BSD-3"
+est = 0.15
+
+[[set.source]]
+name = "rust"
+kind = "http"
+resolve = "json"
+extract = "rust"
+url = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
+assets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "src"]
+sums = "{file}.sha256"
+sig = ".asc"
+keyring = "rust"
+signers = ["108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"]
+license = "MIT/Apache-2.0"
+est = 1.0
+
+[[set.source]]
+name = "mrustc"
+kind = "git"
+url = "https://github.com/thepowersgang/mrustc"
+est = 0.05
+license = "MIT"
+
+[[set.source]]
+name = "rustc-1.90-src"
+kind = "http"
+resolve = "static"
+urls = ["https://static.rust-lang.org/dist/rustc-1.90.0-src.tar.xz"]
+sums = "{file}.sha256"
+sig = ".asc"
+keyring = "rust"
+signers = ["108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"]
+license = "MIT/Apache-2.0"
+est = 0.3
+
+[[set.source]]
+name = "python"
+kind = "http"
+enabled = false
+todo = "needs two steps (newest 3.N.N/ directory, then Python-N.tar.xz inside it) and Sigstore verification, and cosign is not installed"
+
+[[set.source]]
+name = "perl"
+kind = "http"
+resolve = "listing"
+url = "https://www.cpan.org/src/5.0/"
+pattern = '^perl-(5\.\d*[02468]\.\d+)\.tar\.xz$'
+sums = "{file}.sha256.txt"
+license = "Artistic/GPL"
+est = 0.03
+
+[[set.source]]
+name = "zig"
+kind = "http"
+resolve = "json"
+extract = "zig"
+url = "https://ziglang.org/download/index.json"
+assets = ["src", "x86_64-linux", "aarch64-linux"]
+sig = ".minisig"
+minisign = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+license = "MIT"
+est = 0.15
+
+[[set.source]]
+name = "node"
+kind = "http"
+resolve = "json"
+extract = "node"
+url = "https://nodejs.org/dist/index.json"
+assets = ["node-{v}.tar.xz", "node-{v}-linux-x64.tar.xz"]
+sums = "SHASUMS256.txt.asc"
+sums_sig = "clear"
+keyring = "node-release"
+signers = [
+  "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+  "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
+  "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+  "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+  "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+  "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+  "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+  "A363A499291CBBC940DD62E41F10027AF002F8B0",
+]
+license = "MIT"
+est = 0.08
+
+[[set.source]]
+name = "cmake"
+kind = "http"
+enabled = false
+todo = "signed by Brad King's key, which is not pinned in keys/ yet: add keys/cmake.gpg and the signer, then resolve = gh-latest, repo = Kitware/CMake, assets cmake-*.tar.gz, sums *SHA-256.txt, sig .asc"
+
+[[set.source]]
+name = "meson"
+kind = "http"
+enabled = false
+todo = "signing key not pinned in keys/ yet: add keys/meson.gpg, then resolve = gh-latest, repo = mesonbuild/meson, assets meson-*.tar.gz, sig .asc"
+
+[[set.source]]
+name = "ninja"
+kind = "git"
+url = "https://github.com/ninja-build/ninja"
+est = 0.01
+license = "Apache-2.0"
+
+[[set]]
+name = "kernel"
+title = "Linux kernel, firmware, microcode"
+priority = 0
+estimate = 1.5
+keep = 2
+use = "Stable and longterm kernel tarballs (signature over the uncompressed tar), linux-firmware and Intel microcode."
+
+[[set.source]]
+name = "stable"
+kind = "http"
+resolve = "json"
+extract = "kernel"
+url = "https://www.kernel.org/releases.json"
+filter = "stable"
+top = 1
+sig_over = "xz"
+keyring = "kernel"
+signers = ["ABAF11C65A2970B130ABE3C479BE3E4300411886", "647F28654894E3BD457199BE38DBBDC86092693E"]
+license = "GPL-2.0"
+est = 0.15
+
+[[set.source]]
+name = "longterm"
+kind = "http"
+resolve = "json"
+extract = "kernel"
+url = "https://www.kernel.org/releases.json"
+filter = "longterm"
+top = 2
+sig_over = "xz"
+keyring = "kernel"
+signers = ["ABAF11C65A2970B130ABE3C479BE3E4300411886", "647F28654894E3BD457199BE38DBBDC86092693E"]
+license = "GPL-2.0"
+est = 0.3
+
+[[set.source]]
+name = "linux-firmware"
+kind = "http"
+resolve = "listing"
+url = "https://cdn.kernel.org/pub/linux/kernel/firmware/"
+pattern = '^linux-firmware-(\d{8})\.tar\.xz$'
+sig = ".sign"
+sig_over = "xz"
+keyring = "kernel"
+license = "various-redistributable"
+est = 0.65
+
+[[set.source]]
+name = "intel-ucode"
+kind = "git"
+url = "https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files"
+est = 0.1
+license = "Intel-redistributable"
+
+[[set]]
+name = "gnu"
+title = "GNU, latest release of each package"
+priority = 1
+estimate = 12
+keep = 1
+
+[[set.source]]
+name = "gnu-latest"
+kind = "http"
+enabled = false
+url = "rsync://mirrors.kernel.org/gnu/"
+todo = "phase 3 (two-level https listing): needs rsync --list-only, then the newest tarball of each package plus its .sig fed to --files-from, verified with gnu-keyring"
+
+[[set]]
+name = "lfs"
+title = "Linux From Scratch and BLFS"
+priority = 0
+estimate = 12
+
+[[set.source]]
+name = "lfs-books"
+kind = "http"
+enabled = false
+todo = "file names under lfs/downloads/stable-systemd and stable are unverified, and upstream publishes md5 only (so these would be TOFU). Add listing patterns once seen"
+
+[[set.source]]
+name = "lfs-packages"
+kind = "http"
+enabled = false
+todo = "walk the wget-list: needs a list resolver with md5sums (md5 is rejected, so this is TOFU)"
+
+[[set.source]]
+name = "blfs-sources"
+kind = "http"
+enabled = false
+todo = "package URLs come from parsing the BLFS book; full tier only"
+
+[[set]]
+name = "bootstrap"
+title = "Bootstrappable builds"
+priority = 0
+estimate = 3
+
+[[set.source]]
+name = "live-bootstrap"
+kind = "git"
+url = "https://github.com/fosslinux/live-bootstrap"
+est = 0.1
+license = "GPL-3.0"
+todo = "the stage0-posix and builder-hex0 submodules are not mirrored by a bare mirror: add them as their own git sources"
+
+[[set.source]]
+name = "mes"
+kind = "git"
+url = "https://git.savannah.gnu.org/git/mes.git"
+est = 0.05
+license = "GPL-3.0"
+
+[[set.source]]
+name = "lb-distfiles"
+kind = "http"
+enabled = false
+todo = "walk steps/manifest then steps/*/sources for the pinned sha256 values: needs a resolver that reads the live-bootstrap mirror"
+
+[[set]]
+name = "isos"
+title = "Installer and rescue images"
+priority = 0
+estimate = 60
+keep = 1
+use = "Fedora 45, Debian 13, Alpine and Ventoy images. Write one to a stick, or copy ISOs onto a Ventoy stick."
+
+[[set.source]]
+name = "fedora-workstation"
+kind = "http"
+resolve = "listing"
+url = "https://mirrors.kernel.org/fedora/releases/45/Workstation/x86_64/iso/"
+pattern = '^Fedora-Workstation-Live-.*\.iso$'
+sums = "*-CHECKSUM"
+sums_sig = "clear"
+keyring = "fedora"
+license = "various-free"
+est = 3
+
+[[set.source]]
+name = "fedora-kde"
+kind = "http"
+resolve = "listing"
+url = "https://mirrors.kernel.org/fedora/releases/45/KDE/x86_64/iso/"
+pattern = '^Fedora-KDE-Desktop-Live-.*\.iso$'
+sums = "*-CHECKSUM"
+sums_sig = "clear"
+keyring = "fedora"
+license = "various-free"
+est = 3
+
+[[set.source]]
+name = "fedora-server-dvd"
+kind = "http"
+resolve = "listing"
+url = "https://mirrors.kernel.org/fedora/releases/45/Server/x86_64/iso/"
+pattern = '^Fedora-Server-dvd-.*\.iso$'
+sums = "*-CHECKSUM"
+sums_sig = "clear"
+keyring = "fedora"
+license = "various-free"
+est = 5
+
+[[set.source]]
+name = "fedora-netinst"
+kind = "http"
+resolve = "listing"
+url = "https://mirrors.kernel.org/fedora/releases/45/Everything/x86_64/iso/"
+pattern = '^Fedora-Everything-netinst-.*\.iso$'
+sums = "*-CHECKSUM"
+sums_sig = "clear"
+keyring = "fedora"
+license = "various-free"
+est = 1
+
+[[set.source]]
+name = "debian-dvd1"
+kind = "http"
+resolve = "listing"
+url = "https://cdimage.debian.org/debian-cd/current/amd64/iso-dvd/"
+pattern = '^debian-[\d.]+-amd64-DVD-1\.iso$'
+sums = "SHA512SUMS"
+sums_sig = ".sign"
+keyring = "debian-cd"
+signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+license = "DFSG"
+est = 3.7
+
+[[set.source]]
+name = "debian-jigdo-bd"
+kind = "http"
+resolve = "listing"
+url = "https://cdimage.debian.org/debian-cd/current/amd64/jigdo-bd/"
+pattern = '^debian-[\d.]+-amd64-BD-\d+\.(?:jigdo|template)$'
+sums = "SHA512SUMS"
+sums_sig = ".sign"
+keyring = "debian-cd"
+signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+license = "DFSG"
+est = 0.2
+
+[[set.source]]
+name = "debian-live"
+kind = "http"
+resolve = "listing"
+url = "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/"
+pattern = '^debian-live-[\d.]+-amd64-kde\.iso$'
+sums = "SHA512SUMS"
+sums_sig = ".sign"
+keyring = "debian-cd"
+signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+license = "DFSG"
+est = 3.5
+
+[[set.source]]
+name = "debian-netinst"
+kind = "http"
+resolve = "listing"
+url = "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/"
+pattern = '^debian-[\d.]+-amd64-netinst\.iso$'
+sums = "SHA512SUMS"
+sums_sig = ".sign"
+keyring = "debian-cd"
+signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+license = "DFSG"
+est = 0.8
+
+[[set.source]]
+name = "alpine-x86_64"
+kind = "http"
+resolve = "yaml-lite"
+url = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml"
+assets = ["alpine-extended", "alpine-standard"]
+sig = ".asc"
+keyring = "alpine-ncopa"
+license = "various-free"
+est = 1.9
+
+[[set.source]]
+name = "alpine-aarch64"
+kind = "http"
+resolve = "yaml-lite"
+url = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/latest-releases.yaml"
+assets = ["alpine-rpi", "alpine-standard", "alpine-uboot"]
+sig = ".asc"
+keyring = "alpine-ncopa"
+license = "various-free"
+est = 1.0
+
+[[set.source]]
+name = "arch"
+kind = "http"
+enabled = false
+todo = "signed by pierre@archlinux.org: pin keys/arch.gpg (WKD), then resolve = listing on geo.mirror.pkgbuild.com/iso/latest/ with sig .sig and sums sha256sums.txt"
+
+[[set.source]]
+name = "ubuntu-lts"
+kind = "http"
+enabled = false
+todo = "pin keys/ubuntu.gpg (fingerprint 843938DF228D22F7B3742BC0D94AA3F0EFE21092), then listing on releases.ubuntu.com/26.04/ with sums SHA256SUMS and sums_sig .gpg"
+
+[[set.source]]
+name = "systemrescue"
+kind = "http"
+enabled = false
+todo = "file names are scraped from system-rescue.org/Download and the key from gnupg-pubkey.txt: needs a scrape resolver and a pinned key"
+
+[[set.source]]
+name = "ventoy"
+kind = "http"
+resolve = "gh-latest"
+repo = "ventoy/Ventoy"
+assets = ["ventoy-*-linux.tar.gz", "ventoy-*-livecd.iso"]
+sums = "sha256.txt"
+license = "GPL-3.0 plus binary blobs"
+est = 0.22
+
+[[set]]
+name = "own-deps"
+title = "Offline dependency mirrors for my own repos"
+priority = 0
+estimate = 10
+
+[[set.source]]
+name = "goproxy-and-cargo-vendor"
+kind = "git"
+enabled = false
+todo = "a local job (GOMODCACHE go mod download all, cargo vendor) over the repos under ~/Projects, not a fetcher kind: belongs with the kit work"
+
+[[set]]
+name = "ai-runtimes"
+title = "ggml runtimes, ollama and front ends"
+priority = 0
+estimate = 12
+keep = 2
+use = "llama.cpp (source plus bNNNN binaries), whisper.cpp, ollama, opencode and VSCodium. Chat with llama-server's built-in web UI; code with opencode against its /v1 endpoint. For prebuilt ROCm binaries on the RX 6700 XT set HSA_OVERRIDE_GFX_VERSION=10.3.0."
+
+[[set.source]]
+name = "llama-cpp"
+kind = "git"
+url = "https://github.com/ggml-org/llama.cpp"
+est = 0.3
+license = "MIT"
+
+[[set.source]]
+name = "llama-cpp-bin"
+kind = "http"
+resolve = "gh-tags"
+repo = "ggml-org/llama.cpp"
+pattern = '^b\d+$'
+assets = ["llama-*-bin-ubuntu-x64.*", "llama-*-bin-ubuntu-vulkan-x64.*", "llama-*-bin-ubuntu-rocm-*-x64.*"]
+license = "MIT"
+est = 0.35
+
+[[set.source]]
+name = "whisper-cpp"
+kind = "git"
+url = "https://github.com/ggml-org/whisper.cpp"
+est = 0.1
+license = "MIT"
+
+[[set.source]]
+name = "stable-diffusion-cpp"
+kind = "git"
+url = "https://github.com/leejet/stable-diffusion.cpp"
+est = 0.1
+license = "MIT"
+todo = "submodules are not mirrored by a bare mirror"
+
+[[set.source]]
+name = "ollama"
+kind = "http"
+resolve = "gh-latest"
+repo = "ollama/ollama"
+assets = ["ollama-linux-amd64.tar.zst", "ollama-linux-amd64-rocm.tar.zst", "ollama-linux-arm64.tar.zst"]
+sums = "sha256sum.txt"
+license = "MIT"
+est = 4.2
+
+[[set.source]]
+name = "ollama-src"
+kind = "git"
+url = "https://github.com/ollama/ollama"
+est = 0.1
+license = "MIT"
+
+[[set.source]]
+name = "opencode"
+kind = "http"
+resolve = "gh-latest"
+repo = "anomalyco/opencode"
+assets = ["opencode-linux-x64.tar.gz", "opencode-linux-arm64.tar.gz"]
+license = "MIT"
+est = 0.16
+
+[[set.source]]
+name = "crush"
+kind = "http"
+resolve = "gh-latest"
+repo = "charmbracelet/crush"
+assets = ["crush_*_Linux_x86_64.tar.gz"]
+sums = "checksums.txt"
+license = "FSL-1.1 (unconfirmed)"
+est = 0.03
+
+[[set.source]]
+name = "vscodium"
+kind = "http"
+resolve = "gh-latest"
+repo = "VSCodium/vscodium"
+assets = ["codium-*.x86_64.rpm", "codium_*_amd64.deb", "VSCodium-linux-x64-*.tar.gz"]
+license = "MIT"
+est = 0.5
+
+[[set.source]]
+name = "continue-vsix"
+kind = "http"
+enabled = false
+todo = "open-vsx.org/api/Continue/continue/latest is JSON with the version: needs an open-vsx json extractor and its .sha256 endpoint"
+
+[[set.source]]
+name = "nvidia-driver"
+kind = "http"
+enabled = false
+todo = "download.nvidia.com/XFree86/Linux-x86_64/latest.txt is plain text: needs a text resolver. Full tier only"
+
+[[set.source]]
+name = "cuda-redist"
+kind = "http"
+enabled = false
+todo = "redistrib_N.json lists archives with sha256: needs a cuda extractor. Full tier only"
+
+[[set]]
+name = "system-src"
+title = "Graphics, bootloaders, ARM boot"
+priority = 0
+estimate = 1
+
+[[set.source]]
+name = "grub"
+kind = "http"
+resolve = "listing"
+url = "https://ftp.gnu.org/gnu/grub/"
+pattern = '^grub-(\d+\.\d+)\.tar\.xz$'
+top = 2
+sig = ".sig"
+keyring = "gnu-keyring"
+license = "GPL-3.0"
+est = 0.01
+
+[[set.source]]
+name = "mesa"
+kind = "http"
+enabled = false
+todo = "signing keys come from mesa docs/release-maintainers-keys.asc, not pinned in keys/ yet: add keys/mesa.gpg, then listing on archive.mesa3d.org with sig .sig"
+
+[[set.source]]
+name = "systemd"
+kind = "git"
+url = "https://github.com/systemd/systemd"
+est = 0.4
+license = "LGPL-2.1"
+
+[[set.source]]
+name = "shim"
+kind = "http"
+enabled = false
+todo = "signed by a key not pinned in keys/ yet: add keys/shim.gpg, then gh-latest on rhboot/shim with sig .asc"
+
+[[set.source]]
+name = "rpi-firmware"
+kind = "http"
+enabled = false
+todo = "GitHub tarballs are not byte-stable (so TOFU would false-alarm) and the git history is multi-GB: needs a shallow-clone resolver"
+
+[[set.source]]
+name = "rpi-eeprom"
+kind = "git"
+url = "https://github.com/raspberrypi/rpi-eeprom"
+est = 0.1
+license = "BSD-3/Broadcom"
+
+[[set]]
+name = "ai-models"
+title = "GGUF models, small set"
+priority = 0
+estimate = 22
+keep = 1
+use = "Run with llama-server --models-dir. Ollama can import any of these with a Modelfile whose FROM is the local .gguf. The default chat model fits a 12 GB card."
+
+[[set.source]]
+name = "gemma4-12b"
+kind = "hf"
+repo = "ggml-org/gemma-4-12B-it-GGUF"
+assets = ["gemma-4-12B-it-Q4_0.gguf", "mmproj-gemma-4-12B-it-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 7.4
+
+[[set.source]]
+name = "qwen35-9b"
+kind = "hf"
+repo = "unsloth/Qwen3.5-9B-GGUF"
+assets = ["Qwen3.5-9B-Q6_K.gguf", "mmproj-F16.gguf"]
+license = "Apache-2.0"
+est = 8.4
+
+[[set.source]]
+name = "qwen35-4b"
+kind = "hf"
+repo = "unsloth/Qwen3.5-4B-GGUF"
+assets = ["*-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 4.5
+
+[[set.source]]
+name = "qwen35-2b"
+kind = "hf"
+repo = "unsloth/Qwen3.5-2B-GGUF"
+assets = ["*-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 2.2
+
+[[set.source]]
+name = "qwen35-0.8b"
+kind = "hf"
+repo = "unsloth/Qwen3.5-0.8B-GGUF"
+assets = ["*-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 0.9
+
+[[set.source]]
+name = "whisper"
+kind = "hf"
+repo = "ggerganov/whisper.cpp"
+assets = ["ggml-large-v3-turbo.bin", "ggml-large-v3-turbo-q8_0.bin", "ggml-medium.en-q8_0.bin", "ggml-small.en.bin", "ggml-base.en.bin"]
+license = "MIT"
+est = 4
+
+[[set.source]]
+name = "embeddings"
+kind = "hf"
+enabled = false
+repo = "ggml-org/embeddinggemma-300M-GGUF"
+assets = ["*.gguf"]
+todo = "which quant to keep is undecided (smallest Q8 in embeddinggemma-300M, bge-m3-Q8_0 and Qwen3-Reranker-0.6B-Q8_0 repos): pick file names"
+
+[[set.source]]
+name = "gemma4-e4b"
+kind = "hf"
+enabled = false
+repo = "ggml-org/gemma-4-E4B-it-GGUF"
+assets = ["*Q4*.gguf"]
+todo = "the glob may match several quants: pin the exact file names"
+
+[[set.source]]
+name = "qwen3-tts"
+kind = "hf"
+enabled = false
+repo = "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF"
+assets = ["*Q8_0.gguf"]
+todo = "the model card states no licence: confirm before archiving"
+
+[[set]]
+name = "kiwix"
+title = "Offline knowledge (ZIM), small set"
+priority = 0
+estimate = 46
+keep = 1
+use = "Open with kiwix-serve --library or kiwix-desktop. kiwix-tools binaries are in this set."
+
+[[set.source]]
+name = "wikipedia-mini"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/wikipedia/"
+pattern = '^wikipedia_en_all_mini_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 13
+
+[[set.source]]
+name = "se-sites"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/stack_exchange/"
+pattern = '^((?:superuser|askubuntu|serverfault)\.com|(?:unix|math|electronics|cs|cstheory|softwareengineering|codereview|dba|security|retrocomputing|raspberrypi|datascience|stats)\.stackexchange\.com)_en_all_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 24.6
+
+[[set.source]]
+name = "distro-wikis"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/other/"
+pattern = '^((?:archlinux|gentoo|alpinelinux|openstreetmap-wiki)_en_all_maxi)_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "various-free"
+est = 1.3
+
+[[set.source]]
+name = "wikibooks"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/wikibooks/"
+pattern = '^(wikibooks_en_all_(?:maxi|nopic))_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 7.7
+
+[[set.source]]
+name = "wikiversity"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/wikiversity/"
+pattern = '^wikiversity_en_all_maxi_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 2
+
+[[set.source]]
+name = "devdocs"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/devdocs/"
+pattern = '^(devdocs_en_[a-z0-9~._-]+)_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "per-doc"
+est = 0.6
+
+[[set.source]]
+name = "kiwix-tools"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/release/kiwix-tools/"
+pattern = '^kiwix-tools_linux-(?:x86_64|aarch64)-(\d+\.\d+\.\d+)\.tar\.gz$'
+license = "GPL-3.0"
+est = 0.04
+
+[[set]]
+name = "repo-alpine"
+title = "Alpine v3.24 mirror (x86_64 and aarch64)"
+priority = 1
+estimate = 135
+use = "Point apk at this tree as a repository. Packages are signed by the Alpine keys; apk checks APKINDEX on use."
+
+[[set.source]]
+name = "alpine"
+kind = "repo"
+enabled = false
+url = "rsync://rsync.alpinelinux.org/alpine/v3.24/"
+todo = "phase 3"
+# main and community, x86_64 and aarch64
+est = 133  # measured 2026-11-13: 132.4 GB
+license = "various-free"
+
+[[set.source]]
+name = "aports"
+kind = "git"
+url = "https://gitlab.alpinelinux.org/alpine/aports.git"
+est = 1
+license = "various"
+
+[[set.source]]
+name = "alpine-distfiles"
+kind = "http"
+enabled = false
+todo = "Alpine ships no source mirror: needs a resolver that reads each APKBUILD source= and sha512sums= from the aports mirror"
+
+[[set]]
+name = "repo-debian"
+title = "Debian 13 mirror (amd64, all, source)"
+priority = 1
+estimate = 250
+keep = 1
+
+[[set.source]]
+name = "debian"
+kind = "repo"
+enabled = false
+url = "rsync://mirrors.kernel.org/debian/"
+todo = "phase 3"
+# trixie amd64 and source: the pool file list comes from Packages and Sources. Est 240 GB
+
+[[set.source]]
+name = "debian-security"
+kind = "repo"
+enabled = false
+url = "rsync://mirrors.kernel.org/debian-security/"
+todo = "phase 3"
+# trixie-security, same walk as debian. Est 10 GB
+
+[[set]]
+name = "repo-fedora"
+title = "Fedora 45 mirror (x86_64 and source)"
+priority = 1
+estimate = 311
+keep = 1
+use = "Use as a dnf baseurl. Fedora's own signatures on the packages and repodata are checked by dnf on use."
+
+[[set.source]]
+name = "fedora-release"
+kind = "repo"
+enabled = false
+url = "rsync://mirrors.kernel.org/fedora/releases/45/Everything/"
+todo = "phase 3"
+# x86_64 and source, without debug and drpms
+est = 259  # measured 2026-11-13: 258.6 GB
+license = "various-free"
+
+[[set.source]]
+name = "fedora-updates"
+kind = "repo"
+enabled = false
+url = "rsync://mirrors.kernel.org/fedora/updates/45/Everything/"
+todo = "phase 3"
+# x86_64 and source, without debug and drpms
+est = 52  # measured 2026-11-13; grows toward ~150 GB by end of life
+license = "various-free"
+
+[[set]]
+name = "kiwix-large"
+title = "Offline knowledge (ZIM), large set"
+priority = 1
+estimate = 275
+keep = 1
+
+[[set.source]]
+name = "wikipedia-maxi"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/wikipedia/"
+pattern = '^wikipedia_en_all_maxi_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 119
+
+[[set.source]]
+name = "wikipedia-nopic"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/wikipedia/"
+pattern = '^wikipedia_en_all_nopic_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 49
+
+[[set.source]]
+name = "stackoverflow"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/stack_exchange/"
+pattern = '^stackoverflow\.com_en_all_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "CC-BY-SA"
+est = 107
+
+[[set]]
+name = "maps"
+title = "Offline maps"
+priority = 1
+estimate = 138
+keep = 1
+use = "Planet basemap is a PMTiles file: serve it with the pmtiles CLI and MapLibre, or cut a smaller one with pmtiles extract."
+
+[[set.source]]
+name = "protomaps-planet"
+kind = "http"
+enabled = false
+todo = "needs the daily build index at maps.protomaps.com/builds (format unverified) and BLAKE3 checking with b3sum, which dnf provides"
+
+[[set.source]]
+name = "geofabrik-na"
+kind = "http"
+enabled = false
+todo = "the pattern matches nothing on the index page: confirm where download.geofabrik.de lists the dated north-america-YYMMDD.osm.pbf files (or switch to north-america-latest.osm.pbf with its .md5 replaced by a sha256 source), then enable"
+resolve = "listing"
+url = "https://download.geofabrik.de/"
+pattern = '^north-america-(\d{6})\.osm\.pbf$'
+license = "ODbL"
+est = 18.2
+
+[[set.source]]
+name = "pmtiles-cli"
+kind = "http"
+resolve = "gh-latest"
+repo = "protomaps/go-pmtiles"
+assets = ["go-pmtiles_*_Linux_x86_64.tar.gz", "go-pmtiles_*_Linux_arm64.tar.gz"]
+license = "BSD-3"
+est = 0.035
+
+[[set.source]]
+name = "maplibre-gl-js"
+kind = "http"
+resolve = "gh-latest"
+repo = "maplibre/maplibre-gl-js"
+assets = ["dist.zip"]
+license = "BSD-3"
+est = 0.01
+
+[[set.source]]
+name = "basemaps-assets"
+kind = "git"
+url = "https://github.com/protomaps/basemaps-assets"
+est = 0.1
+license = "OFL/CC0"
+
+[[set]]
+name = "ai-models-large"
+title = "GGUF models, large set"
+priority = 2
+estimate = 148
+keep = 1
+
+[[set.source]]
+name = "qwen36-35b-a3b"
+kind = "hf"
+repo = "unsloth/Qwen3.6-35B-A3B-GGUF"
+assets = ["Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "mmproj-F16.gguf"]
+license = "Apache-2.0"
+est = 23.3
+
+[[set.source]]
+name = "gpt-oss-20b"
+kind = "hf"
+repo = "ggml-org/gpt-oss-20b-GGUF"
+assets = ["gpt-oss-20b-MXFP4.gguf"]
+license = "Apache-2.0"
+est = 12.1
+
+[[set.source]]
+name = "qwen3-coder-30b"
+kind = "hf"
+repo = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+assets = ["Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf"]
+license = "Apache-2.0"
+est = 17.7
+
+[[set.source]]
+name = "qwen38-27b"
+kind = "hf"
+repo = "ggml-org/Qwen3.8-27B-GGUF"
+assets = ["Qwen3.8-27B-Q4_K_M.gguf", "mmproj-Qwen3.8-27B-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 20
+
+[[set.source]]
+name = "gemma4-12b-q8"
+kind = "hf"
+repo = "ggml-org/gemma-4-12B-it-GGUF"
+assets = ["gemma-4-12B-it-Q8_0.gguf"]
+license = "Apache-2.0"
+est = 12.7
+
+[[set.source]]
+name = "gemma4-26b-a4b"
+kind = "hf"
+repo = "ggml-org/gemma-4-26B-A4B-it-GGUF"
+assets = ["*Q4_0.gguf", "mmproj*Q8_0*"]
+license = "Apache-2.0"
+est = 14.6
+
+[[set.source]]
+name = "gemma4-31b"
+kind = "hf"
+repo = "ggml-org/gemma-4-31B-it-GGUF"
+assets = ["*Q4_0.gguf", "mmproj*Q8_0*"]
+license = "Apache-2.0"
+est = 18
+
+[[set.source]]
+name = "image-models"
+kind = "hf"
+enabled = false
+repo = "leejet/Z-Image-Turbo-GGUF"
+assets = ["*.gguf"]
+todo = "needs several repos per model (Z-Image-Turbo + ae.sft from FLUX.1-schnell + Qwen3-4B-Instruct-2507; FLUX.2-klein-4B + VAE) per sd.cpp docs, and licences to check (FLUX VAEs may be gated)"
+
+[[set]]
+name = "extras"
+title = "Full-tier extras"
+priority = 2
+estimate = 224
+keep = 1
+
+[[set.source]]
+name = "linux-git"
+kind = "git"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+est = 6
+license = "GPL-2.0"
+todo = "seeding from clone.bundle would save time; a plain mirror works but the first fetch is slow"
+
+[[set.source]]
+name = "llvm-bin"
+kind = "http"
+resolve = "gh-latest"
+repo = "llvm/llvm-project"
+assets = ["LLVM-*-Linux-X64.tar.xz"]
+license = "Apache-2.0-LLVM"
+est = 2
+
+[[set.source]]
+name = "gutenberg"
+kind = "http"
+resolve = "listing"
+url = "https://download.kiwix.org/zim/gutenberg/"
+pattern = '^gutenberg_en_all_(\d{4}-\d{2})\.zim$'
+sums = "{file}.sha256"
+license = "public-domain"
+est = 206

@@ -1,6 +1,6 @@
 use crate::config::{Config, Transport, load_drives};
 use crate::paths::Paths;
-use crate::{migrate, personal, platform};
+use crate::{migrate, personal, platform, public, queue};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -197,7 +197,15 @@ pub fn run(cli: Cli) -> Result<()> {
             migrate::migrate(&paths, dry_run, &mut std::io::stdout())
         }
         Command::Tray => platform::run_tray(&Paths::from_env()?),
-        Command::Public { .. } | Command::Queue { .. } => bail!("not implemented yet (phase 2)"),
+        Command::Queue { action } => queue::cli(&Paths::from_env()?, action),
+        Command::Public {
+            sets,
+            dry_run,
+            first_pass,
+        } => {
+            let (mut paths, cfg) = load()?;
+            public::run(&mut paths, &cfg, &sets, dry_run, first_pass)
+        }
         Command::Clone { .. } | Command::Verify { .. } => bail!("not implemented yet (phase 4)"),
         Command::Install => bail!("not implemented yet (phase 5)"),
     }

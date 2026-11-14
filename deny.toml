@@ -15,6 +15,7 @@ ignore = [
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained, merged into zbus 6; revisit when zbus moves to 6.x" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained, merged into zbus 6; revisit when zbus moves to 6.x" },
     { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained, pulled in by age's i18n; drop when age does" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 Marvin attack: a timing leak in private-key operations (decrypt, sign). preserver holds no RSA private key; rsa only verifies OpenPGP signatures with public keys, through pgp, which needs rsa 0.9 (the fix is 0.10)" },
 ]
 
 [licenses]
@@ -27,6 +28,7 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "CC0-1.0",
+    "Zlib",
 ]
 confidence-threshold = 0.9
 

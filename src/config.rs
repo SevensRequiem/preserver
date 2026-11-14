@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ impl Transport {
 
 /// A filesystem id as udisks reports it: hex digits and dashes (ext4 UUID, FAT `XXXX-XXXX`, NTFS serial).
 /// The spelling from the config is kept, because it names the mount point and the drives.d file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub(crate) struct DriveId(String);
 
@@ -84,7 +84,6 @@ pub(crate) struct Config {
     #[serde(default)]
     pub transport: Transport,
     #[serde(default = "default_bandwidth")]
-    #[expect(dead_code, reason = "read by the public sync in phase 2")]
     pub bandwidth_mbit: u32,
     #[serde(default = "default_reserve")]
     pub reserve_percent: u8,

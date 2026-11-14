@@ -11,15 +11,23 @@ publish = false
 age = { version = "=0.12.1", default-features = false }
 anyhow = "=1.0.104"
 clap = { version = "=4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
-jiff = { version = "=0.2.43", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jiff = { version = "=0.2.43", default-features = false, features = ["std", "serde", "tz-system", "tzdb-zoneinfo"] }
+lzma-rust2 = { version = "=0.25.0", default-features = false, features = ["std", "xz"] }
+minisign-verify = "=0.3.0"
+pgp = { version = "=0.21.1", default-features = false }
+regex = "=1.13.1"
 rpassword = "=7.5.5"
 ruzstd = "=0.9.1"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "=0.7.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+sha2 = { version = "=0.10.9", features = ["compress"] }
 tar = { version = "=0.4.46", default-features = false }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "display", "serde"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+ureq = { version = "=3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.6", features = ["fs"] }
@@ -27,6 +35,11 @@ rustix = { version = "=1.1.6", features = ["fs"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "=0.3.7", default-features = false, features = ["blocking", "async-io"] }
 zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+
+[dev-dependencies]
+# Test keys only: its rand_core re-export is the RNG trait rpgp key generation wants.
+rsa = { version = "=0.9.10", default-features = false, features = ["getrandom"] }
 
 [lints.rust]
 unsafe_code = "deny"
