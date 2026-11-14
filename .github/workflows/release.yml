@@ -66,10 +66,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: src
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist-out
           merge-multiple: true
+      - name: Installer bundle
+        run: tar -C src -czf dist-out/preserver-install.tar.gz install.sh install.bat dist
       - name: Checksums
         working-directory: dist-out
         run: sha256sum preserver-* > SHA256SUMS
@@ -77,4 +83,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist-out/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Binaries are named preserver-TARGET. Verify with sha256sum -c SHA256SUMS, or install with install.sh."
+        run: gh release create "$TAG" dist-out/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Download your preserver-TARGET binary, SHA256SUMS and preserver-install.tar.gz into one folder. Run sha256sum -c --ignore-missing SHA256SUMS, extract the tarball there, then run ./install.sh . (Linux) or install.bat . (Windows)."
