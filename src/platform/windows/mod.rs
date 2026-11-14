@@ -136,3 +136,11 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     }
     File::open(path)
 }
+
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    let f = open_nofollow(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}

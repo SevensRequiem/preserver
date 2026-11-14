@@ -13,7 +13,7 @@ use crate::paths::Paths;
 use crate::personal::local::escapes;
 use crate::platform::{self, FsInfo};
 use crate::public::index;
-use crate::public::versioned::{plain_dirs, read_set_file, read_sums, version_dirs};
+use crate::public::versioned::{plain_dirs, read_meta, read_set_file, read_sums, version_dirs};
 use crate::queue::{
     BlockReason, Halt, Job, JobKind, JobState, Lane, Pass, Store, Target, apply_control,
     halt_requested, reset, runnable,
@@ -225,7 +225,7 @@ fn scan(
     limits: Limits,
 ) -> Result<(Inputs, Scan)> {
     let state: State = dst
-        .and_then(|d| std::fs::read(d.join(STATE)).ok())
+        .and_then(|d| read_meta(&d.join(STATE)).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     let mut skipped = Vec::new();
@@ -373,12 +373,17 @@ fn scan(
         if let Some(h) = &have {
             haves.insert(set.name.clone(), h.clone());
         }
+        let leftover = match (dst, &have) {
+            (Some(d), None) => tree_bytes(&d.join("public").join(&set.name), &limits)?,
+            _ => 0,
+        };
         let Some(version) = version_dirs(&dir).into_iter().next() else {
             set_ins.push(SetIn {
                 name: set.name.clone(),
                 version: String::new(),
                 variants: Vec::new(),
                 have,
+                stale: leftover,
             });
             continue;
         };
@@ -430,6 +435,7 @@ fn scan(
             version,
             variants,
             have,
+            stale: leftover,
         });
     }
     // Sets on the target the copy does not select stay, and take their room.
@@ -498,7 +504,7 @@ fn execute(job: &Job, env: &Env, stop: &(dyn Fn() -> bool + Sync), prog: &Prog) 
     check_owned(&dst)?;
     exec::ensure_dir(&root, "preserver/.state")?;
     let state_file = dst.join(STATE);
-    let mut state: State = std::fs::read(&state_file)
+    let mut state: State = read_meta(&state_file)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
@@ -586,6 +592,20 @@ fn execute(job: &Job, env: &Env, stop: &(dyn Fn() -> bool + Sync), prog: &Prog) 
     let _ = std::fs::remove_file(dst.join(".INDEX.html.tmp"));
     index::write(&cat, &dst)?;
     platform::sync_fs(&dst)?;
+    if !scanned.skipped.is_empty() {
+        let names: Vec<&str> = scanned
+            .skipped
+            .iter()
+            .take(5)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        bail!(
+            "{} personal files cannot go on this target ({}), so it is not a complete backup: {}; format it as exFAT or use another target",
+            scanned.skipped.len(),
+            scanned.skipped[0].1,
+            names.join(", ")
+        );
+    }
     Ok(true)
 }
 
@@ -746,7 +766,9 @@ fn record(store: &Store, file: &Path, start: Timestamp) -> Result<Vec<String>> {
         if j.updated < start {
             continue;
         }
-        let name = rule.clone().unwrap_or_else(|| j.id.clone());
+        let name = rule
+            .clone()
+            .unwrap_or_else(|| format!("once-{}", rules::rule_id(target)));
         st.sets.retain(|v| v["name"] != name.as_str());
         st.sets.push(serde_json::json!({
             "name": name,
@@ -810,7 +832,17 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
 
 /// Turns due rules into jobs; the daemon calls it before every pass.
 pub(crate) fn schedule(paths: &Paths, now: Timestamp) -> Result<()> {
-    let rules = rules::load(&paths.copy_rules)?;
+    let cat = Catalog::embedded()?;
+    let rules: Vec<rules::Rule> = rules::load(&paths.copy_rules)?
+        .into_iter()
+        .filter(|r| {
+            let ok = rules::rule_sets(&cat, r);
+            if let Err(e) = &ok {
+                tracing::warn!("copy rule {} skipped: {e:#}", r.id);
+            }
+            ok.is_ok()
+        })
+        .collect();
     if rules.is_empty() {
         return Ok(());
     }
@@ -822,12 +854,11 @@ pub(crate) fn schedule(paths: &Paths, now: Timestamp) -> Result<()> {
         return Ok(());
     }
     let primary = Config::load(&paths.cfg)?.primary_uuid;
-    let cat = Catalog::embedded()?;
     for act in acts {
         match act {
             rules::Act::Create(r) => {
                 let kind = JobKind::Copy {
-                    sets: rules::resolve_sets(&cat, &r.sets)?,
+                    sets: rules::rule_sets(&cat, &r)?,
                     target: r.target,
                     size: r.size,
                     rule: Some(r.id),
@@ -876,8 +907,10 @@ fn resolve_target(
             let subdir = path
                 .strip_prefix(&m)
                 .unwrap_or(Path::new(""))
-                .to_string_lossy()
-                .into_owned();
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let t = Target::Drive {
                 id,
                 subdir,

@@ -1,5 +1,5 @@
 use super::gb;
-use super::versioned::{read_set_file, version_dirs};
+use super::versioned::{plain_dirs, read_meta, read_set_file, version_dirs};
 use crate::catalog::Catalog;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -65,6 +65,9 @@ fn render(cat: &Catalog, public: &Path) -> String {
     let mut out = HEAD.to_string();
     for set in &cat.sets {
         let dir = public.join(&set.name);
+        if plain_dirs(&[&dir]).is_err() {
+            continue;
+        }
         let mut licenses: Vec<String> = Vec::new();
         let mut license = |l: &str| {
             if !l.is_empty() && !licenses.iter().any(|x| x == l) {
@@ -90,8 +93,9 @@ fn render(cat: &Catalog, public: &Path) -> String {
                 v = esc(&v),
             );
         }
-        let mirrors: Mirrors = std::fs::read_to_string(dir.join("MIRRORS.toml"))
+        let mirrors: Mirrors = read_meta(&dir.join("MIRRORS.toml"))
             .ok()
+            .and_then(|b| String::from_utf8(b).ok())
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default();
         let mut rows = String::new();

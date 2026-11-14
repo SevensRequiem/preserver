@@ -129,16 +129,33 @@ pub(crate) fn version_dirs(dir: &Path) -> Vec<String> {
     out
 }
 
+/// The most a metadata file read from a drive may hold; the drive is not trusted.
+const META_CAP: u64 = 32 << 20;
+
+/// Reads a metadata file from a drive anyone may have written to: never through a link, never
+/// waiting on a FIFO, and never more than `META_CAP` bytes.
+pub(crate) fn read_meta(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    platform::open_regular(path)?
+        .take(META_CAP + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > META_CAP {
+        return Err(std::io::Error::other("file too large"));
+    }
+    Ok(buf)
+}
+
 pub(crate) fn read_set_file(path: &Path) -> SetFile {
-    std::fs::read_to_string(path)
+    read_meta(path)
         .ok()
+        .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| toml::from_str(&t).ok())
         .unwrap_or_default()
 }
 
 /// `SHA256SUMS` as a map from relative path to hash.
 pub(crate) fn read_sums(path: &Path) -> HashMap<String, String> {
-    std::fs::read_to_string(path)
+    String::from_utf8(read_meta(path).unwrap_or_default())
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.split_once("  "))

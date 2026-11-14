@@ -20,6 +20,21 @@ struct Fake {
     plugged: AtomicBool,
     fstype: Mutex<String>,
     said: Mutex<String>,
+    /// A target of this many bytes, one byte per cluster: free is what its files leave.
+    capacity: Mutex<Option<u64>>,
+}
+
+fn du(p: &Path) -> u64 {
+    std::fs::read_dir(p)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => du(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 impl Fake {
@@ -44,6 +59,7 @@ impl Fake {
             plugged: AtomicBool::new(true),
             fstype: Mutex::new("ext4".into()),
             said: Mutex::new(String::new()),
+            capacity: Mutex::new(None),
         };
         f.version(
             "keys",
@@ -104,11 +120,16 @@ impl Fake {
         };
         let fstype = |_: &Target, _: &Path| self.fstype.lock().unwrap().clone();
         let say = |s: &str| self.said.lock().unwrap().push_str(s);
+        let cap = *self.capacity.lock().unwrap();
+        let free = |_: &Path| match cap {
+            Some(c) => Ok((c.saturating_sub(du(&self.target())), c)),
+            None => Ok((1 << 40, 1 << 41)),
+        };
         f(&Env {
             mount: &mount,
             fstype: &fstype,
-            free: &|_| Ok((1 << 40, 1 << 41)),
-            cluster: &|_| 4096,
+            free: &free,
+            cluster: &|_| if cap.is_some() { 1 } else { 4096 },
             say: &say,
         })
     }
@@ -423,7 +444,13 @@ fn record_writes_status_and_forgets_finished_jobs() {
     let st = Status::read(&file);
     assert_eq!(st.sets.len(), 1);
     assert_eq!(st.sets[0]["state"], "ok");
-    assert!(last_runs(&file).contains_key(&ok.id));
+    let key = format!("once-{}", rules::rule_id(&f.dir_target()));
+    assert!(last_runs(&file).contains_key(&key));
+
+    f.copy(&["specs"]);
+    f.copy(&["specs"]);
+    record(&f.store, &file, start).unwrap();
+    assert_eq!(Status::read(&file).sets.len(), 1, "one entry per target");
 }
 
 fn fs(id: &str, label: &str, mount: Option<&Path>, removable: bool) -> FsInfo {
@@ -479,6 +506,157 @@ fn targets_resolve_from_dirs_ids_and_labels() {
         Some(tmp.path()),
     );
     assert!(format!("{:#}", err.unwrap_err()).contains("overlaps"));
+
+    let spaced = stick.join("My Backups/é");
+    std::fs::create_dir_all(&spaced).unwrap();
+    match r(&spaced.display().to_string()).unwrap() {
+        Target::Drive { subdir, .. } => assert_eq!(subdir, "My Backups/é"),
+        t @ Target::Dir { .. } => panic!("{t:?}"),
+    }
+    for bad in ["../x", "/abs", "a\\b", "a\nb", "./a"] {
+        let t = Target::Drive {
+            id: OTHER.parse().unwrap(),
+            subdir: bad.into(),
+            label: String::new(),
+        };
+        assert!(t.validate().is_err(), "{bad:?}");
+    }
+}
+
+fn big(f: &Fake, version: &str, fill: u8) {
+    let files = [
+        ("gnu-keyring/a.gpg", vec![fill; 100_000]),
+        ("fedora-keys/b.gpg", vec![fill; 100_000]),
+    ];
+    let slices: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+    f.version("keys", version, &slices);
+}
+
+#[test]
+fn an_in_place_replacement_fits_in_the_room_the_old_version_gives_back() {
+    let f = Fake::new();
+    *f.fstype.lock().unwrap() = "vfat".into();
+    big(&f, "2026-11-01", 1);
+    assert_eq!(f.copy(&["keys"]).state, JobState::Done);
+    std::fs::remove_dir_all(f.primary().join("preserver/public/keys/2026-11-01")).unwrap();
+    big(&f, "2026-11-14", 2);
+    *f.capacity.lock().unwrap() = Some(du(&f.target()) + 100_000);
+
+    let job = f.copy(&["keys"]);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert!(f.said.lock().unwrap().contains("replace in place"));
+    let keys = f.dst().join("public/keys");
+    assert_eq!(version_dirs(&keys), ["2026-11-14"]);
+    assert_eq!(
+        std::fs::read(keys.join("2026-11-14/gnu-keyring/a.gpg")).unwrap(),
+        vec![2u8; 100_000]
+    );
+    assert!(!keys.join(".staging/.retired").exists());
+}
+
+#[test]
+fn a_stage_without_a_version_counts_as_room_and_goes_with_a_dropped_set() {
+    for (extra, kept) in [(150_000, true), (50_000, false)] {
+        let f = Fake::new();
+        assert_eq!(f.copy(&["specs"]).state, JobState::Done);
+        big(&f, "2026-11-14", 3);
+        write(
+            &f.dst()
+                .join("public/keys/.staging/2026-11-10~full/gnu-keyring/a.gpg"),
+            &vec![9u8; 100_000],
+        );
+        *f.capacity.lock().unwrap() = Some(du(&f.target()) + extra);
+
+        let job = f.copy(&["keys"]);
+        assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+        let keys = f.dst().join("public/keys");
+        assert_eq!(version_dirs(&keys) == ["2026-11-14"], kept, "{extra}");
+        assert_eq!(keys.exists() && du(&keys) > 0, kept, "{extra}");
+    }
+}
+
+#[test]
+fn the_kit_takes_room_from_later_in_place_decisions() {
+    let f = Fake::new();
+    big(&f, "2026-11-01", 1);
+    assert_eq!(f.copy(&["keys", "-personal"]).state, JobState::Done);
+    std::fs::remove_dir_all(f.primary().join("preserver/public/keys/2026-11-01")).unwrap();
+    big(&f, "2026-11-14", 2);
+    write(
+        &f.primary().join("preserver/kit/big.bin"),
+        &vec![7u8; 100_000],
+    );
+    *f.capacity.lock().unwrap() = Some(du(&f.target()) + 230_000);
+
+    let job = f.copy(&["keys", "kit", "-personal"]);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(version_dirs(&f.dst().join("public/keys")), ["2026-11-14"]);
+    assert!(f.dst().join("kit/big.bin").is_file());
+}
+
+#[test]
+fn personal_files_the_target_cannot_hold_fail_the_copy() {
+    let f = Fake::new();
+    *f.fstype.lock().unwrap() = "vfat".into();
+    write(&f.primary().join("preserver/local-personal/aux"), b"x");
+    let job = f.copy(&["keys"]);
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.error.as_deref().unwrap().contains("aux"),
+        "{:?}",
+        job.error
+    );
+    assert_eq!(
+        read(&f.dst().join("github-repos-personal/o/r.bundle.age")),
+        "bundle",
+        "the rest still went across"
+    );
+}
+
+#[test]
+fn metadata_on_the_target_is_read_without_links_or_fifos_or_without_end() {
+    let f = Fake::new();
+    let d = f.tmp.path().join("meta");
+    std::fs::create_dir_all(&d).unwrap();
+    write(&d.join("ok"), b"fine");
+    assert_eq!(read_meta(&d.join("ok")).unwrap(), b"fine");
+    std::os::unix::fs::symlink("/dev/zero", d.join("zero")).unwrap();
+    assert!(read_meta(&d.join("zero")).is_err());
+    std::os::unix::fs::symlink(d.join("ok"), d.join("link")).unwrap();
+    assert!(read_meta(&d.join("link")).is_err());
+    let fifo = d.join("fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    assert!(read_meta(&fifo).is_err());
+    let sparse = std::fs::File::create(d.join("sparse")).unwrap();
+    sparse.set_len(64 << 20).unwrap();
+    assert!(read_meta(&d.join("sparse")).is_err());
+}
+
+#[test]
+fn a_reused_file_that_rotted_on_the_target_is_copied_again() {
+    let f = Fake::new();
+    assert_eq!(f.copy(&["keys"]).state, JobState::Done);
+    let old = f.dst().join("public/keys/2026-11-01/gnu-keyring/a.gpg");
+    std::fs::write(&old, b"key X").unwrap();
+    f.version(
+        "keys",
+        "2026-11-14",
+        &[
+            ("gnu-keyring/a.gpg", b"key a"),
+            ("fedora-keys/b.gpg", b"key bb"),
+        ],
+    );
+    let job = f.copy(&["keys"]);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    let new = f.dst().join("public/keys/2026-11-14");
+    assert_eq!(read(&new.join("gnu-keyring/a.gpg")), "key a");
 }
 
 #[test]

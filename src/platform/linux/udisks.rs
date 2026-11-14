@@ -136,7 +136,7 @@ fn watch(
         loop {
             match subscribe() {
                 Ok(signals) => {
-                    if failing {
+                    if std::mem::take(&mut failing) {
                         tracing::info!("drive events: watching udisks again");
                         on_change();
                     }

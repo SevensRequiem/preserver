@@ -266,6 +266,67 @@ pub(crate) fn delete_kit(archive: &Path) -> Result<()> {
     retire(&archive.join("kit"), &archive.join(".kit-old"))
 }
 
+/// A regular file at `base/rel`, with plain directories all the way: the old version lives on
+/// the untrusted target, so a link swapped in for one of its directories must not pull a file
+/// from elsewhere into the set.
+fn plain_file(base: &Path, rel: &str) -> bool {
+    let mut p = base.to_path_buf();
+    let mut parts = rel.split('/').peekable();
+    while let Some(c) = parts.next() {
+        p.push(c);
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return m.is_file();
+        }
+        if !m.is_dir() {
+            return false;
+        }
+    }
+    false
+}
+
+/// Deletes the files of a retired version the new one will not reuse, so a replacement in
+/// place peaks at the larger of the two versions and not at their sum.
+fn prune_retired(dir: &Path, rel: &str, keep: &HashSet<&str>) -> Result<()> {
+    for e in std::fs::read_dir(dir).with_context(|| dir.display().to_string())? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let rel = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        if e.file_type()?.is_dir() {
+            prune_retired(&e.path(), &rel, keep)?;
+        } else if !keep.contains(rel.as_str()) {
+            remove_if_there(&e.path()).with_context(|| e.path().display().to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Moves (in place) or links the old version's file into the stage. The old SHA256SUMS is the
+/// target's own word, so the file is read back before the new one vouches for it; false when
+/// it could not be had or did not match, and the file is copied from the primary instead.
+fn reuse(from: &Path, rel: &str, dst: &Path, in_place: bool, want: &str) -> Result<bool> {
+    let src = from.join(rel);
+    let moved = plain_file(from, rel)
+        && if in_place {
+            std::fs::rename(&src, dst).is_ok()
+        } else {
+            std::fs::hard_link(&src, dst).is_ok()
+        };
+    if moved && hash_file(dst).is_ok_and(|h| h == want) {
+        return Ok(true);
+    }
+    if moved {
+        std::fs::remove_file(dst).with_context(|| dst.display().to_string())?;
+    }
+    Ok(false)
+}
+
 /// Copies one set version: staged under `.staging/<version>~<variant>`, read back, given its
 /// own SET.toml and SHA256SUMS for the files it holds, and renamed into place. Files the
 /// target already has are hard linked from the old version, or, for a replacement in place,
@@ -304,6 +365,15 @@ pub(crate) fn copy_set(
         _ => None,
     };
     let sums = have.map(|h| &h.sums);
+    if in_place && let Some(sums) = sums {
+        let keep: HashSet<&str> = step
+            .files
+            .iter()
+            .filter(|f| sums.get(&f.rel) == Some(&f.sha256))
+            .map(|f| f.rel.as_str())
+            .collect();
+        prune_retired(&retired, "", &keep)?;
+    }
 
     let mut check = Vec::new();
     for f in &step.files {
@@ -318,18 +388,10 @@ pub(crate) fn copy_set(
             Err(_) => {}
         }
         let reusable = sums.is_some_and(|s| s.get(&f.rel) == Some(&f.sha256));
-        if let (Some(from), true) = (&reuse_from, reusable) {
-            let from = from.join(&f.rel);
-            let plain = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file());
-            let moved = plain
-                && if in_place {
-                    std::fs::rename(&from, &dst).is_ok()
-                } else {
-                    std::fs::hard_link(&from, &dst).is_ok()
-                };
-            if moved {
-                continue;
-            }
+        if let (Some(from), true) = (&reuse_from, reusable)
+            && reuse(from, &f.rel, &dst, in_place, &f.sha256)?
+        {
+            continue;
         }
         let h = copy_file(ctx, &src.join(&f.rel), &dst, &f.sha256)?;
         check.push((dst, h));

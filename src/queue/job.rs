@@ -1,4 +1,3 @@
-use crate::catalog::valid_name;
 use crate::config::DriveId;
 use anyhow::{Result, bail};
 use jiff::Timestamp;
@@ -75,11 +74,15 @@ impl Target {
         match self {
             Self::Drive { subdir, label, .. } => {
                 let ok = subdir.is_empty()
-                    || Path::new(subdir).components().all(
-                        |c| matches!(c, Component::Normal(n) if n.to_str().is_some_and(valid_name)),
-                    );
+                    || (!subdir.contains('\\')
+                        && !subdir.chars().any(char::is_control)
+                        && Path::new(subdir)
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_))));
                 if !ok {
-                    bail!("bad subdirectory {subdir:?}: relative names only, no '..'");
+                    bail!(
+                        "bad subdirectory {subdir:?}: relative names only, no '..', backslash or control characters"
+                    );
                 }
                 if label.chars().any(char::is_control) {
                     bail!("bad label {label:?}");

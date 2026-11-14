@@ -120,6 +120,9 @@ pub(crate) struct SetIn {
     pub version: String,
     pub variants: Vec<(String, Vec<FileEnt>)>,
     pub have: Option<Have>,
+    /// What a set dir with no visible version still holds (an interrupted first copy's
+    /// stage): room that comes back when the set is replaced or deleted.
+    pub stale: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +199,11 @@ pub(crate) struct Plan {
 }
 
 impl SetIn {
+    /// What the set takes on the target now.
+    fn held(&self) -> u64 {
+        self.have.as_ref().map_or(0, |h| h.bytes) + self.stale
+    }
+
     /// Admitted candidates, biggest first, with the variants that came out the same merged.
     fn candidates(&self, limits: &Limits, skipped: &mut Vec<(String, String)>) -> Vec<SetStep> {
         let mut out: Vec<(SetStep, Vec<(String, String)>)> = Vec::new();
@@ -253,7 +261,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
         .sets
         .iter()
         .filter(mirrored)
-        .filter_map(|s| s.have.as_ref().map(|h| h.bytes))
+        .map(SetIn::held)
         .sum::<u64>()
         + match &inp.kit {
             Some(Ok(k)) => k.have_bytes,
@@ -263,7 +271,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
         .sets
         .iter()
         .filter(|s| s.version.is_empty())
-        .filter_map(|s| s.have.as_ref().map(|h| h.bytes))
+        .map(SetIn::held)
         .sum();
     let avail = inp.free + replaceable;
     let fixed = inp.personal_kept + inp.other_kept + unmirrored;
@@ -301,14 +309,16 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
             if cost <= left {
                 left -= cost;
                 p.used += cost;
+                let new = lim.fp(k.bytes);
                 let action = if k.unchanged {
                     Action::Unchanged
-                } else if k.have_bytes == 0 {
-                    Action::New
                 } else {
                     // The tar is one file and a tree has no reusable parts worth tracking.
-                    Action::Replace {
-                        in_place: lim.fp(k.bytes) > sim,
+                    let in_place = place(&mut sim, new, new, k.have_bytes);
+                    if k.have_bytes == 0 {
+                        Action::New
+                    } else {
+                        Action::Replace { in_place }
                     }
                 };
                 if action != Action::Unchanged {
@@ -348,7 +358,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
                 format!("none of its files can go on {}", lim.fs)
             };
             p.dropped.push((s.name.clone(), why));
-            if s.have.is_some() {
+            if s.held() > 0 {
                 p.deletes.push(s.name.clone());
             }
             continue;
@@ -376,7 +386,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
                     gb(left)
                 ),
             ));
-            if s.have.is_some() {
+            if s.held() > 0 {
                 p.deletes.push(s.name.clone());
             }
             continue;
@@ -410,8 +420,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
             inp.sets
                 .iter()
                 .find(|s| s.name == *d)
-                .and_then(|s| s.have.as_ref())
-                .map_or(0, |h| h.bytes)
+                .map_or(0, SetIn::held)
         };
     }
     let have_of = |name: &str| {
@@ -579,6 +588,7 @@ mod tests {
                     version: "2026-11-01".into(),
                     variants,
                     have: None,
+                    stale: 0,
                 }
             })
             .collect()
@@ -768,6 +778,7 @@ mod tests {
                 })
                 .collect(),
             have: None,
+            stale: 0,
         }
     }
 

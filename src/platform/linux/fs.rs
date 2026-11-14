@@ -126,6 +126,23 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Opens a regular file for reading: no link as the last component, and a FIFO or device is
+/// refused instead of waited on.
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                .bits()
+                .cast_signed(),
+        )
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

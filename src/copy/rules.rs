@@ -48,14 +48,15 @@ pub(crate) fn is_rule_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The file is hand-editable, so every rule is checked as it would be on the command line.
+/// The file is hand-editable, so every rule is checked as it would be on the command line,
+/// except for its sets: a catalog that lost a set after an upgrade must not stop `--list` and
+/// `--remove` or the other rules. `rule_sets` judges those where they are used.
 pub(crate) fn load(file: &Path) -> Result<Vec<Rule>> {
     let text = match std::fs::read_to_string(file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         r => r.with_context(|| file.display().to_string())?,
     };
     let f: File = toml::from_str(&text).with_context(|| file.display().to_string())?;
-    let cat = Catalog::embedded()?;
     for r in &f.rule {
         let ok = is_rule_id(&r.id) && r.id == rule_id(&r.target) && r.interval > 0;
         if !ok {
@@ -63,7 +64,6 @@ pub(crate) fn load(file: &Path) -> Result<Vec<Rule>> {
         }
         r.target
             .validate()
-            .and_then(|()| resolve_sets(&cat, &r.sets).map(drop))
             .with_context(|| format!("{}: rule {}", file.display(), r.id))?;
     }
     Ok(f.rule)
@@ -193,6 +193,19 @@ pub(crate) fn resolve_sets(cat: &Catalog, tokens: &[String]) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// The sets of a saved rule. A `-name` the catalog no longer has is ignored, a wanted one
+/// that is gone fails the rule.
+pub(crate) fn rule_sets(cat: &Catalog, r: &Rule) -> Result<Vec<String>> {
+    let known = |n: &str| RESERVED.contains(&n) || cat.sets.iter().any(|c| c.name == n);
+    let tokens: Vec<String> = r
+        .sets
+        .iter()
+        .filter(|t| t.strip_prefix('-').is_none_or(known))
+        .cloned()
+        .collect();
+    resolve_sets(cat, &tokens)
+}
+
 pub(crate) enum Act {
     Create(Rule),
     Retry(String),
@@ -306,7 +319,6 @@ mod tests {
                 "escaping subdir",
                 text.replace("subdir = \"\"", "subdir = \"../x\""),
             ),
-            ("unknown set", text.replace("\"keys\"", "\"nope\"")),
             ("zero interval", text.replace("86400", "0")),
             ("unknown field", format!("{text}\nextra = 1\n")),
         ] {
@@ -369,6 +381,26 @@ mod tests {
         assert!(t(&["nope"]).is_err());
         assert!(t(&["-nope"]).is_err());
         assert!(t(&["personal", "-personal"]).is_err());
+    }
+
+    #[test]
+    fn a_set_the_catalog_lost_only_skips_its_rule() {
+        let tmp = TempDir::new();
+        let file = tmp.path().join("copy.toml");
+        let mut stale = drive_rule("0123-ABCD", "");
+        stale.sets = vec!["oldset".into()];
+        let mut minus = drive_rule("0123-ABCD", "x");
+        minus.sets = vec!["keys".into(), "-oldset".into()];
+        save(&file, vec![stale.clone(), minus.clone()]).unwrap();
+        assert_eq!(load(&file).unwrap().len(), 2);
+        let cat = Catalog::embedded().unwrap();
+        assert!(rule_sets(&cat, &stale).is_err());
+        assert_eq!(
+            rule_sets(&cat, &minus).unwrap(),
+            ["personal".to_string(), "keys".to_string()]
+        );
+        assert!(remove(&file, &stale.id).unwrap());
+        assert_eq!(load(&file).unwrap().len(), 1);
     }
 
     fn job(rule: &str, state: JobState, updated: &str) -> Job {
