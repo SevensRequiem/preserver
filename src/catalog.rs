@@ -276,6 +276,36 @@ mod tests {
         assert!((est("repo-alpine", "alpine") - 133.0).abs() < f64::EPSILON);
     }
 
+    #[test]
+    fn fedora_isos_are_pinned_to_the_current_release() {
+        let c = Catalog::embedded().unwrap();
+        let isos: Vec<&Source> = c
+            .sets
+            .iter()
+            .flat_map(|s| &s.sources)
+            .filter(|s| s.keyring == "fedora")
+            .collect();
+        assert_eq!(isos.len(), 4);
+        for src in isos {
+            assert_eq!(
+                src.signers,
+                ["4F50A6114CD5C6976A7F1179655A4B02F577861E"],
+                "{}",
+                src.name
+            );
+            let re = Regex::new(&src.pattern).unwrap();
+            let base = src.name.strip_prefix("fedora-").unwrap();
+            let (kind, tail) = match base {
+                "workstation" => ("Workstation-Live", ""),
+                "kde" => ("KDE-Desktop-Live", ""),
+                "server-dvd" => ("Server-dvd", "x86_64-"),
+                _ => ("Everything-netinst", "x86_64-"),
+            };
+            assert!(re.is_match(&format!("Fedora-{kind}-{tail}45-1.1.iso")));
+            assert!(!re.is_match(&format!("Fedora-{kind}-{tail}43-1.6.iso")));
+        }
+    }
+
     fn one(source: &str) -> String {
         format!(
             "[[set]]\nname = \"s\"\ntitle = \"t\"\npriority = 0\nestimate = 1\n[[set.source]]\n{source}\n"

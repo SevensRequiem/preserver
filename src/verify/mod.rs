@@ -17,13 +17,15 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 /// Signatures, sums files and keys are read whole; nothing honest comes near this.
-const SIDE_LIMIT: u64 = 16 << 20;
+pub(crate) const SIDE_LIMIT: u64 = 16 << 20;
 /// Decoder memory for a signed `.xz`, in KiB: four times what `xz -9` needs (64 MiB).
+/// Most an honest tarball inflates by under xz.
+const XZ_RATIO: u64 = 64;
 const XZ_MEM_KIB: u32 = 256 << 10;
 
 pub(crate) struct Verifier<'a> {
     pub keys: &'a [Keyring<'a>],
-    /// `tofu.json`: the hash first seen for each (url, version) that nothing else vouches for.
+    /// `tofu.json`: the hash first seen for each url that nothing else vouches for.
     pub tofu: &'a Path,
     /// Raises a desktop notification: urgent, title, body.
     pub note: &'a (dyn Fn(bool, &str, &str) + Sync),
@@ -110,13 +112,16 @@ impl Verifier<'_> {
             return Ok("minisign".into());
         }
         let ring = self.ring(s)?;
+        let xz_cap = std::fs::metadata(data)?.len().saturating_mul(XZ_RATIO);
         let mut open = || -> Result<Box<dyn Read>> {
             let f = BufReader::new(File::open(data)?);
             Ok(match s.sig_over {
                 // kernel.org signs the tar, not the .tar.xz that is published. The file is
                 // still untrusted here, so its dictionary may not ask for unbounded memory.
+                // Its output is capped too, or a small file could stream out for ever; a
+                // cut-off tar fails the signature.
                 Some(SigOver::Xz) => {
-                    Box::new(lzma_rust2::XzReader::new_mem_limit(f, true, XZ_MEM_KIB))
+                    Box::new(lzma_rust2::XzReader::new_mem_limit(f, true, XZ_MEM_KIB).take(xz_cap))
                 }
                 None => Box::new(f),
             })
@@ -153,7 +158,14 @@ impl Verifier<'_> {
     fn check_stored_key(&self, s: &Source, file: &Path) -> Result<()> {
         let stored = keys::find(self.keys, &s.stored)
             .with_context(|| format!("keyring {:?} is not in keys/", s.stored))?;
-        let have = pgp::primary_fingerprints(&std::fs::read(file)?);
+        let fetched = std::fs::read(file)?;
+        let gone = pgp::revocations(&fetched);
+        if !gone.is_empty() {
+            let msg = format!("key {} revoked upstream: {gone:?}", s.stored);
+            (self.note)(true, "Signing key revoked", &msg);
+            bail!(msg);
+        }
+        let have = pgp::primary_fingerprints(&fetched);
         let want = pgp::primary_fingerprints(stored);
         if want.is_empty() {
             bail!("keyring {:?} holds no usable key", s.stored);
@@ -172,24 +184,28 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    /// Trust on first use: records the hash of a (url, version) nothing else vouches for, and
-    /// refuses a different hash for the same pair from then on.
-    fn tofu(&self, url: &str, version: &str, hash: &str) -> Result<()> {
+    /// Trust on first use: records the hash of a url nothing else vouches for, and refuses a
+    /// different hash for it from then on. The server's `ETag` or `Last-Modified` is not part of
+    /// the key, since whoever swaps the file also chooses those. To accept a change, delete
+    /// the url's line from `tofu.json`.
+    fn tofu(&self, url: &str, hash: &str) -> Result<()> {
         let mut seen: BTreeMap<String, String> = match std::fs::read(self.tofu) {
             Ok(b) => serde_json::from_slice(&b).context("tofu store")?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e).context("tofu store"),
         };
-        let key = format!("{url} @ {version}");
-        if let Some(old) = seen.get(&key) {
+        if let Some(old) = seen.get(url) {
             if old == hash {
                 return Ok(());
             }
-            let msg = format!("{url} version {version} changed: recorded {old}, now {hash}");
+            let msg = format!(
+                "{url} changed: recorded {old}, now {hash}; delete its line from {} to accept",
+                self.tofu.display()
+            );
             (self.note)(true, "Unsigned download changed", &msg);
             bail!("tofu: {msg}");
         }
-        seen.insert(key, hash.to_string());
+        seen.insert(url.to_string(), hash.to_string());
         let mut out = Vec::new();
         let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
         serde::Serialize::serialize(
@@ -234,7 +250,7 @@ impl Verifier<'_> {
             how.push("pinned-key".into());
         }
         if how.is_empty() {
-            self.tofu(&it.url, &it.version, &h256)?;
+            self.tofu(&it.url, &h256)?;
             how.push("tofu".into());
         }
         Ok((how.join("+"), h256))
@@ -519,6 +535,23 @@ mod tests {
     }
 
     #[test]
+    fn upstream_revocation_of_a_stored_key_raises_an_alert() {
+        let env = Env::new();
+        let mut key = TestKey::new();
+        let ring = key.public();
+        key.revoke();
+        let mut s = source();
+        s.stored = "test".into();
+        env.with(&[("test", &ring)], |v| {
+            let file = env.write("key.asc", key.armored().as_bytes());
+            let err = v.item(&s, &item("key.asc"), &file).unwrap_err();
+            assert!(err.to_string().contains("revoked upstream"), "{err}");
+        });
+        let notes = env.notes();
+        assert!(notes[0].starts_with("Signing key revoked"), "{notes:?}");
+    }
+
+    #[test]
     fn tofu_records_first_use_and_refuses_a_change() {
         let env = Env::new();
         let file = env.write("f.bin", DATA);
@@ -527,7 +560,7 @@ mod tests {
         env.with(&[], |v| {
             assert_eq!(v.item(&source(), &it, &file).unwrap().0, "tofu");
             let want = format!(
-                "{{\n \"https://example.invalid/d/f.bin @ 1\": \"{}\"\n}}",
+                "{{\n \"https://example.invalid/d/f.bin\": \"{}\"\n}}",
                 sha256(DATA)
             );
             assert_eq!(std::fs::read_to_string(&store).unwrap(), want);
@@ -547,20 +580,21 @@ mod tests {
                 "the record is kept"
             );
 
-            // A new version of the same URL is a new first use.
+            // A new ETag or Last-Modified from the server changes nothing: the url is the key.
             let mut next = it.clone();
             next.version = "2".into();
-            assert_eq!(v.item(&source(), &next, &file).unwrap().0, "tofu");
+            let err = v.item(&source(), &next, &file).unwrap_err();
+            assert!(err.to_string().starts_with("tofu: "), "{err}");
             let m: BTreeMap<String, String> =
                 serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
-            assert_eq!(m.len(), 2);
+            assert_eq!(m.len(), 1);
 
             // A damaged store is an error, never a silent reset.
             std::fs::write(&store, b"{").unwrap();
             assert!(v.item(&source(), &it, &file).is_err());
         });
         let notes = env.notes();
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(
             notes[0].starts_with("Unsigned download changed: "),
             "{}",

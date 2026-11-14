@@ -364,6 +364,8 @@ fn keep_prunes_and_unchanged_files_are_hard_links() {
     let mut served_a = 0;
     for round in 1..=3u8 {
         env.routes(&[("d/a.bin", &a), ("d/b.bin", &[round; 100])]);
+        // An unsigned file that changed is only taken once the user accepted it.
+        let _ = std::fs::remove_file(&env.paths.tofu);
         let before = env.srv.served();
         let job = env.sync(&cat);
         assert_eq!(job.state, JobState::Done, "round {round}: {:?}", job.error);
@@ -659,4 +661,33 @@ fn a_resumed_stage_counts_toward_the_budget_and_leftovers_stay_private() {
             "{rel}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_on_the_drive_is_refused_and_nothing_behind_it_is_touched() {
+    let env = Env::new();
+    env.routes(&[("d/x.bin", b"payload")]);
+    let cat = catalog(1, vec![env.fixed("src", "d/x.bin")]);
+    let victim = env.paths.mnt.join("victim");
+    std::fs::create_dir_all(victim.join("keep")).unwrap();
+    std::fs::write(victim.join("keep/file"), b"mine").unwrap();
+    std::fs::create_dir_all(env.set_dir()).unwrap();
+    for link in [
+        env.set_dir().join(".staging"),
+        env.set_dir().parent().unwrap().join("other"),
+    ] {
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+    }
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Failed);
+    assert!(job.error.unwrap().contains("not a plain directory"));
+    assert_eq!(files(&victim), ["keep/file"]);
+
+    // A link that replaces the set directory itself is refused the same way.
+    std::fs::remove_file(env.set_dir().join(".staging")).unwrap();
+    std::fs::remove_dir(env.set_dir()).unwrap();
+    std::os::unix::fs::symlink(&victim, env.set_dir()).unwrap();
+    assert_eq!(env.sync(&cat).state, JobState::Failed);
+    assert_eq!(files(&victim), ["keep/file"]);
 }

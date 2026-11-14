@@ -55,8 +55,9 @@ impl Public<'_> {
         root.join("code-archive").join("public")
     }
 
-    /// Refuses a set whose estimate would eat into the reserve.
-    fn budget(&self, set: &Set, root: &Path) -> Result<()> {
+    /// Refuses a set whose estimate would eat into the reserve. Otherwise returns how many
+    /// bytes the set may still take, the reserve kept free.
+    fn budget(&self, set: &Set, root: &Path) -> Result<u64> {
         let (free, total) = (self.free)(root)?;
         let reserve = total / 100 * u64::from(self.reserve_percent);
         #[expect(
@@ -72,7 +73,8 @@ impl Public<'_> {
         if stage.is_dir() {
             versioned::regular_files(&stage, "", &mut staged)?;
         }
-        let need = estimate.saturating_sub(staged.iter().map(|(_, len)| len).sum());
+        let held: u64 = staged.iter().map(|(_, len)| len).sum();
+        let need = estimate.saturating_sub(held);
         if free < reserve || need > free - reserve {
             bail!(
                 "budget: needs about {}, {} free above the {}% reserve",
@@ -81,7 +83,7 @@ impl Public<'_> {
                 self.reserve_percent
             );
         }
-        Ok(())
+        Ok(free - reserve + held)
     }
 
     /// The set's line in `status/public.json`, in the Go tool's format.
@@ -146,10 +148,22 @@ impl Public<'_> {
             self.record(name, "skipped", "", "no enabled sources");
             return Ok(Vec::new());
         }
-        if let Err(e) = self.budget(set, root) {
-            self.record(name, "skipped", "", &format!("{e:#}"));
-            return Ok(Vec::new());
-        }
+        // The drive is writable by whoever holds it: a link in the way would send the
+        // staging cleanup and the downloads out of the set.
+        let dir = Self::public_dir(root).join(name);
+        versioned::plain_dirs(&[
+            &root.join("code-archive"),
+            &Self::public_dir(root),
+            &dir,
+            &dir.join(".staging"),
+        ])?;
+        let allowed = match self.budget(set, root) {
+            Ok(n) => n,
+            Err(e) => {
+                self.record(name, "skipped", "", &format!("{e:#}"));
+                return Ok(Vec::new());
+            }
+        };
         let by = self.resolve_set(set)?;
         if by.is_empty() {
             self.record(
@@ -160,9 +174,8 @@ impl Public<'_> {
             );
             return Ok(Vec::new());
         }
-        let dir = Self::public_dir(root).join(name);
         std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
-        match versioned::prepare(set, &dir, &by)? {
+        match versioned::prepare(set, &dir, &by, allowed)? {
             Prepared::Unchanged(version) => {
                 self.record(name, "unchanged", &version, "");
                 Ok(Vec::new())

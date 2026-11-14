@@ -100,6 +100,27 @@ fn revoked(key: &SignedPublicKey) -> bool {
     })
 }
 
+/// The fingerprints of the keys and subkeys of a keyring file that carry a revocation made by
+/// their own primary key: what an upstream publishes when a signing key is stolen.
+pub(crate) fn revocations(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in keyring(bytes) {
+        if revoked(&key) {
+            out.push(fpr(&key.primary_key));
+        }
+        for sub in &key.public_subkeys {
+            let gone = sub.signatures.iter().any(|s| {
+                s.typ() == Some(SignatureType::SubkeyRevocation)
+                    && s.verify_subkey_binding(&key.primary_key, &sub.key).is_ok()
+            });
+            if gone {
+                out.push(fpr(&sub.key));
+            }
+        }
+    }
+    out
+}
+
 /// A subkey may sign when one of its bindings is valid, carries the signing flag and holds
 /// the subkey's own signature back over the primary; a valid revocation ends that.
 fn subkey_usable(key: &SignedPublicKey, sub: &SignedPublicSubKey) -> Result<()> {

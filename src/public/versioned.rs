@@ -6,7 +6,7 @@ use crate::catalog::{Kind, Set, Source};
 use crate::net::download::{Expect, Fetch};
 use crate::platform;
 use crate::resolve::{HF_BASE, Item, hex};
-use crate::verify::{Verifier, side};
+use crate::verify::{SIDE_LIMIT, Verifier, side};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -96,12 +96,28 @@ pub(crate) fn plan_hash(by: &[(&Source, Vec<Item>)]) -> String {
     hex(&h.finalize())
 }
 
+/// Refuses a path that exists and is not a plain directory, a symlink most of all: the drive
+/// is writable by anyone who holds it, and a link must never carry a read, a write or a
+/// recursive delete out of the archive. A path that does not exist yet passes.
+pub(crate) fn plain_dirs(paths: &[&Path]) -> Result<()> {
+    for p in paths {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => bail!("{} is not a plain directory, refusing the set", p.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| p.display().to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// The visible versions of a set, newest first.
 pub(crate) fn version_dirs(dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter(|e| e.path().join("SET.toml").is_file())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| !n.starts_with('.'))
@@ -188,9 +204,28 @@ pub(crate) enum Prepared {
     Staged(Box<Staged>, Vec<Fetch>),
 }
 
+/// Deletes the stages of older plans; `stage_root` has been checked to be a plain directory.
+fn clear_other_stages(stage_root: &Path, keep: &str) {
+    for e in std::fs::read_dir(stage_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if e.file_name().to_str() != Some(keep) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Sets up the staging directory for the resolved set: links what the previous version
 /// already has and lists the downloads for the rest, signatures and sums files included.
-pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Result<Prepared> {
+/// `room` is what the set may still take: the size limit of a body nobody announced.
+pub(crate) fn prepare(
+    set: &Set,
+    dir: &Path,
+    by: &[(&Source, Vec<Item>)],
+    room: u64,
+) -> Result<Prepared> {
     let plan = plan_hash(by);
     let have = version_dirs(dir);
     let mut prior = SetFile::default();
@@ -206,21 +241,18 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
     }
     let stage_root = dir.join(".staging");
     let stage = stage_root.join(&plan[..16]);
-    for e in std::fs::read_dir(&stage_root)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        if e.file_name().to_str() != Some(&plan[..16]) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
+    plain_dirs(&[dir, &stage_root, &stage])?;
+    clear_other_stages(&stage_root, &plan[..16]);
     std::fs::create_dir_all(&stage).with_context(|| stage.display().to_string())?;
 
     let mut slots = Vec::new();
     let mut fetches: Vec<Fetch> = Vec::new();
     let mut side_links = Vec::new();
     for (si, (src, items)) in by.iter().enumerate() {
+        plain_dirs(&[&stage.join(&src.name)])?;
+        if !have.is_empty() {
+            plain_dirs(&[&prior_dir.join(&src.name)])?;
+        }
         std::fs::create_dir_all(stage.join(&src.name))?;
         for it in items {
             let rel = format!("{}/{}", src.name, it.name);
@@ -249,6 +281,7 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
                         url: it.url.clone(),
                         dest: dst.clone(),
                         size: it.size,
+                        limit: room,
                         expect: expect(it).with_context(|| rel.clone())?,
                     });
                 }
@@ -259,6 +292,7 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
                             url: url.clone(),
                             dest: beside,
                             size: None,
+                            limit: SIDE_LIMIT,
                             expect: Expect::None,
                         });
                     }

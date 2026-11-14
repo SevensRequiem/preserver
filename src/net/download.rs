@@ -38,6 +38,9 @@ pub(crate) struct Fetch {
     /// created here, so a vanished mount point fails instead of filling the host's disk.
     pub dest: PathBuf,
     pub size: Option<u64>,
+    /// The most a body of unknown size may grow to: the transfer stops and drops its part
+    /// past it. A known `size` is the limit instead.
+    pub limit: u64,
     pub expect: Expect,
 }
 
@@ -265,6 +268,10 @@ impl Downloader {
         // again. A stop ends the run, and its count is what the paused job shows.
         done.fetch_add(part.offset, Ordering::Relaxed);
         let r = self.transfer(f, &mut part, &side, stop, done);
+        if matches!(r, Err(Fail::Permanent(_))) {
+            remove(&f.part())?;
+            remove(&side)?;
+        }
         let share = part.offset;
         let r = r.and_then(|()| Self::finish(f, part, &side));
         if let Err(e) = &r
@@ -324,7 +331,7 @@ impl Downloader {
                     }
                     part.validator = validator;
                     part.total = Some(total);
-                    self.copy(&mut body, part, Some(last - first + 1), stop, done)?;
+                    self.copy(&mut body, part, Some(last - first + 1), f, stop, done)?;
                     if part.offset < total {
                         Self::checkpoint(f, part, side)?;
                     }
@@ -347,7 +354,7 @@ impl Downloader {
                         ranged = false;
                         continue;
                     }
-                    self.copy(&mut body, part, len, stop, done)?;
+                    self.copy(&mut body, part, len, f, stop, done)?;
                     if let Some(s) = f.size.filter(|s| part.offset > *s) {
                         return Err(retry(format!(
                             "{}: more than the expected {s} bytes",
@@ -425,9 +432,11 @@ impl Downloader {
         body: &mut impl Read,
         p: &mut Part,
         exact: Option<u64>,
+        f: &Fetch,
         stop: &AtomicBool,
         done: &AtomicU64,
     ) -> Result<(), Fail> {
+        let cap = f.size.unwrap_or(f.limit);
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0u64;
         loop {
@@ -459,6 +468,12 @@ impl Downloader {
             got += n as u64;
             p.offset += n as u64;
             done.fetch_add(n as u64, Ordering::Relaxed);
+            if p.offset > cap {
+                return Err(Fail::Permanent(format!(
+                    "{}: body is larger than the {cap} bytes allowed",
+                    f.url
+                )));
+            }
         }
     }
 
@@ -624,6 +639,7 @@ mod tests {
             url: srv.url(name),
             dest: dir.join(name),
             size: Some(data.len() as u64),
+            limit: u64::MAX,
             expect: Expect::Both(
                 sha2::Sha256::digest(data).into(),
                 sha2::Sha512::digest(data).into(),
@@ -669,6 +685,27 @@ mod tests {
         // Only the missing 3 MiB came over the wire again.
         assert_eq!(srv.served(), data.len() as u64 - 2 * CP);
         assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
+    }
+
+    #[test]
+    fn a_body_past_the_limit_is_cut_off_and_dropped() {
+        let tmp = TempDir::new();
+        let data = body(3 * CP, 5);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        srv.set(|b| b.ranges = false);
+        let f = Fetch {
+            size: None,
+            limit: CP / 2,
+            expect: Expect::None,
+            ..fetch(&srv, tmp.path(), "big.bin", &data)
+        };
+        let err = d_fetch(&f).unwrap_err();
+        assert!(matches!(err, Fail::Permanent(_)), "{err}");
+        assert!(!f.part().exists() && !f.sidecar().exists() && !f.dest.exists());
+    }
+
+    fn d_fetch(f: &Fetch) -> Result<(), Fail> {
+        dl(0).fetch(f, &AtomicBool::new(false), &AtomicU64::new(0))
     }
 
     #[test]
@@ -836,6 +873,7 @@ mod tests {
                 url: url.into(),
                 dest: PathBuf::new(),
                 size: None,
+                limit: u64::MAX,
                 expect: Expect::None,
             };
             assert_eq!(f.host(), want, "{url}");

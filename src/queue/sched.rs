@@ -446,6 +446,7 @@ mod tests {
                 },
                 dest: tmp.path().join(format!("f{i}")),
                 size: Some(data.len() as u64),
+                limit: u64::MAX,
                 expect: Expect::None,
             })
             .collect();
@@ -504,6 +505,7 @@ mod tests {
                 url: self.srv.url("big.iso"),
                 dest: root.join("staging/big.iso"),
                 size: Some(self.data.len() as u64),
+                limit: u64::MAX,
                 expect: Expect::Sha256(sha2::Sha256::digest(&self.data).into()),
             }
         }
