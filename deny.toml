@@ -39,13 +39,16 @@ exceptions = [
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
     # egui's bundled fonts (Ubuntu-Light, Hack, emoji-icon-font); the texts ship in dist/licenses/.
     { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+    # Windows clipboard for the GUI (arboard <- egui-winit); Boost license, permissive.
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 deny = [
-    { crate = "cc", wrappers = ["ring"], reason = "no new C build dependencies; ring is the only audited exception" },
+    { crate = "cc", wrappers = ["ring", "wayland-backend"], reason = "no new C build dependencies; ring is the audited exception, and wayland-backend's build.rs compiles C only with its log feature, which preserver leaves off" },
 ]
 
 [sources]
