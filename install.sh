@@ -11,7 +11,7 @@ units=(preserver-tray.service preserver-personal.service preserver-local.service
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "install.sh: $*"; }
-have_systemd() { command -v systemctl >/dev/null 2>&1; }
+have_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 ctl() { systemctl --user "$@"; }
 
 usage() {
@@ -90,7 +90,6 @@ install_binary() {
 
 install_units() {
 	local u
-	[ -d "$src/dist/systemd" ] || die "no dist/systemd next to this script"
 	mkdir -p "$unitdir"
 	for u in "${units[@]}"; do
 		install -m 0644 "$src/dist/systemd/$u" "$unitdir/.$u.new"
@@ -100,7 +99,7 @@ install_units() {
 }
 
 enable_units() {
-	have_systemd || { say "warning: no systemctl, units are installed but not enabled"; return 0; }
+	have_systemd || { say "warning: no systemd user session, units are installed but not enabled; from a login session run: systemctl --user daemon-reload && systemctl --user enable --now preserver-tray.service preserver-local.timer"; return 0; }
 	ctl daemon-reload
 	ctl enable preserver-tray.service preserver-local.timer
 	ctl start preserver-local.timer
@@ -141,6 +140,10 @@ else
 	[ -f "$new" ] || die "build did not produce $new"
 fi
 
+[ -d "$src/dist/systemd" ] || die "no dist/systemd next to this script, nothing installed"
+for u in "${units[@]}"; do
+	[ -f "$src/dist/systemd/$u" ] || die "dist/systemd/$u not found, nothing installed"
+done
 install_binary "$new"
 install_units
 enable_units

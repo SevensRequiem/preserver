@@ -18,7 +18,7 @@ if /i "%~1"=="/?" goto usage
 if /i "%~1"=="-h" goto usage
 if not "%~2"=="" goto usage
 if "%LOCALAPPDATA%"=="" (echo install.bat: LOCALAPPDATA is not set 1>&2 & exit /b 1)
-echo "%BIN%" | findstr /r /c:"[&<>%%^]" >nul && (echo install.bat: unsupported character in %BIN% 1>&2 & exit /b 1)
+echo "%BIN%" | findstr /r /c:"[&<>%%^]" >nul && (echo install.bat: unsupported character in "%BIN%" 1>&2 & exit /b 1)
 
 set "ARCH=%PROCESSOR_ARCHITECTURE%"
 if defined PROCESSOR_ARCHITEW6432 set "ARCH=%PROCESSOR_ARCHITEW6432%"
@@ -32,8 +32,8 @@ if "%~1"=="" goto fromsource
 
 set "REL=%~1"
 set "NAME=preserver-%TARGET%.exe"
-if not exist "%REL%\%NAME%" (echo install.bat: %REL%\%NAME% not found 1>&2 & goto fail)
-if not exist "%REL%\SHA256SUMS" (echo install.bat: %REL%\SHA256SUMS not found 1>&2 & goto fail)
+if not exist "%REL%\%NAME%" (echo install.bat: "%REL%\%NAME%" not found 1>&2 & goto fail)
+if not exist "%REL%\SHA256SUMS" (echo install.bat: "%REL%\SHA256SUMS" not found 1>&2 & goto fail)
 set "WANT="
 set "COUNT=0"
 for /f "usebackq tokens=1,2" %%a in ("%REL%\SHA256SUMS") do (
@@ -54,14 +54,14 @@ pushd "%SELF%" || goto fail
 cargo build --release --locked || (popd & goto fail)
 popd
 if defined CARGO_TARGET_DIR (set "BUILT=%CARGO_TARGET_DIR%\release\preserver.exe") else (set "BUILT=%SELF%target\release\preserver.exe")
-if not exist "%BUILT%" (echo install.bat: build did not produce %BUILT% 1>&2 & goto fail)
+if not exist "%BUILT%" (echo install.bat: build did not produce "%BUILT%" 1>&2 & goto fail)
 copy /y "%BUILT%" "%WORK%\preserver.exe" >nul || goto fail
 
 :install
 schtasks /End /TN "\preserver\tray" >nul 2>&1
-if exist "%EXE%" fc /b "%EXE%" "%WORK%\preserver.exe" >nul 2>&1 && (echo install.bat: %EXE% is already this binary & goto tasks)
+if exist "%EXE%" fc /b "%EXE%" "%WORK%\preserver.exe" >nul 2>&1 && (echo install.bat: "%EXE%" is already this binary & goto tasks)
 rem A running exe can be renamed but not overwritten, so the old one moves to .prev first.
-if exist "%EXE%" (move /y "%EXE%" "%PREV%" >nul || goto fail & echo install.bat: kept the previous binary as %PREV%)
+if exist "%EXE%" (move /y "%EXE%" "%PREV%" >nul || goto fail & echo install.bat: kept the previous binary as "%PREV%")
 move /y "%WORK%\preserver.exe" "%EXE%" >nul || goto fail
 echo install.bat: installed %EXE%
 

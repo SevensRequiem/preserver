@@ -44,7 +44,7 @@ jobs:
           [ "$TAG" = "v$want" ] || { echo "tag $TAG does not match Cargo.toml version $want" >&2; exit 1; }
       - name: Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang lld llvm musl-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld llvm musl-tools
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install --profile minimal
       - run: cargo build --release --locked --target ${{ matrix.target }}

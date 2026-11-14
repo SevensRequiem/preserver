@@ -76,14 +76,19 @@ pub(crate) fn restore_bundle(identities: &Identities, file: &Path, dir: &Path) -
     result
 }
 
-/// The locked key for a backup file: the one stored with the backup (the bundle's own tree, so
-/// an old drive or copy restores by itself), then the primary drive's, then the home copy.
+/// The locked key for a backup file: the one stored with the backup (the bundle's own tree or the
+/// archive root's github-repos-personal, so an old drive or copy restores by itself), then the primary drive's, then the home copy.
 fn identity_file(paths: &Paths, file: &Path) -> PathBuf {
     let drive = paths.gh_dest().join("identity.age");
     file.ancestors()
         .skip(1)
         .take(4)
-        .map(|d| d.join("identity.age"))
+        .flat_map(|d| {
+            [
+                d.join("identity.age"),
+                d.join("github-repos-personal/identity.age"),
+            ]
+        })
         .chain((!paths.mnt.as_os_str().is_empty()).then_some(drive))
         .find(|f| f.is_file())
         .unwrap_or_else(|| paths.personal.join("identity.age"))
@@ -183,6 +188,19 @@ mod tests {
         restore_bundle(&ids, &file, &out).unwrap();
         tgit(&out, &["fsck", "--strict"]);
         assert!(out.join("f.txt").exists());
+    }
+
+    #[test]
+    fn a_local_archive_finds_the_key_stored_on_its_drive() {
+        let tmp = TempDir::new();
+        let mut p = crate::testutil::paths(tmp.path());
+        p.mnt = PathBuf::new();
+        let archive = tmp.path().join("old/preserver");
+        let key = archive.join("github-repos-personal/identity.age");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "locked").unwrap();
+        let file = archive.join("local-personal/docs/2026-11/L0.tar.zst.age");
+        assert_eq!(identity_file(&p, &file), key);
     }
 
     #[test]

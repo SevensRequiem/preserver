@@ -89,3 +89,9 @@ ls "$units"/preserver-* >/dev/null 2>&1 && fail "units left behind"
 [ -f "$HOME/.config/preserver/identity.age" ] || fail "uninstall touched data"
 run --uninstall || fail "second uninstall"
 ok uninstall
+
+mkdir "$t/lone"
+cp "$repo/install.sh" "$t/lone/"
+"$t/lone/install.sh" "$t/r1" >"$t/out" 2>&1 && fail "install.sh without dist/systemd succeeded"
+[ ! -e "$bin" ] || fail "binary installed before the units were found"
+ok "missing units refused before anything is installed"
