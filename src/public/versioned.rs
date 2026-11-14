@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// One file of a set version. The Go tool's SET.toml layout, field for field.
+/// One file of a set version. The layout of a version's `SET.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct PlanEntry {
@@ -79,7 +79,7 @@ pub(crate) struct SetFile {
 }
 
 /// The identity of a resolved set: what would be fetched, sorted by source and name. A set
-/// whose newest version has this hash is unchanged. Same bytes as the Go tool hashed.
+/// whose newest version has this hash is unchanged.
 pub(crate) fn plan_hash(by: &[(&Source, Vec<Item>)]) -> String {
     let mut plan: Vec<PlanEntry> = by
         .iter()

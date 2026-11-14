@@ -4,7 +4,6 @@ mod config;
 mod crypt;
 mod git;
 mod keys;
-mod migrate;
 mod net;
 mod paths;
 mod personal;

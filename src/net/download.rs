@@ -418,7 +418,7 @@ impl Downloader {
                 p.h256 = Resumable::resume(st.sha256, st.offset);
                 p.h512 = st.sha512.map(|s| Resumable::resume(s, st.offset));
             }
-            // No (usable) sidecar, e.g. a Go-era leftover: nothing proves what the bytes are.
+            // No (usable) sidecar: nothing proves what the bytes are.
             None => remove(side)?,
         }
         p.file.set_len(p.offset).map_err(Fail::Disk)?;

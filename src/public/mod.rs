@@ -52,7 +52,7 @@ fn trunc(s: &str, n: usize) -> String {
 
 impl Public<'_> {
     fn public_dir(root: &Path) -> std::path::PathBuf {
-        root.join("code-archive").join("public")
+        root.join("preserver").join("public")
     }
 
     /// Refuses a set whose estimate would eat into the reserve. Otherwise returns how many
@@ -86,7 +86,7 @@ impl Public<'_> {
         Ok(free - reserve + held)
     }
 
-    /// The set's line in `status/public.json`, in the Go tool's format.
+    /// The set's line in `status/public.json`.
     fn record(&self, set: &str, state: &str, version: &str, detail: &str) {
         tracing::info!("set {set}: {state} {version} {detail}");
         let mut res = serde_json::json!({
@@ -152,7 +152,7 @@ impl Public<'_> {
         // staging cleanup and the downloads out of the set.
         let dir = Self::public_dir(root).join(name);
         versioned::plain_dirs(&[
-            &root.join("code-archive"),
+            &root.join("preserver"),
             &Self::public_dir(root),
             &dir,
             &dir.join(".staging"),
@@ -204,7 +204,7 @@ impl Public<'_> {
                         job.error = Some(trunc(&msg, 600));
                     }
                 }
-                if let Err(e) = index::write(self.cat, &root.join("code-archive")) {
+                if let Err(e) = index::write(self.cat, &root.join("preserver")) {
                     tracing::warn!("index: {e:#}");
                 }
             }

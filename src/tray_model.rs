@@ -1,4 +1,4 @@
-//! What the tray shows, as a pure function of the status files and job locks. Ports Go's tray.go.
+//! What the tray shows, as a pure function of the status files and job locks.
 
 use crate::config::Transport;
 use crate::status::Status;
@@ -248,11 +248,8 @@ mod tests {
         for (name, github) in [
             ("no status file", Job::default()),
             (
-                "go zero time",
-                job(
-                    r#"{"last_ok":"0001-01-01T00:00:00Z","last_run":"0001-01-01T00:00:00Z"}"#,
-                    false,
-                ),
+                "null times",
+                job(r#"{"last_ok":null,"last_run":null}"#, false),
             ),
         ] {
             let m = model(&inputs(github));

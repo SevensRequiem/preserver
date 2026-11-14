@@ -6,13 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, TryLockError};
 use std::path::Path;
 
-/// The Go tool's status file: same names, and Go's zero time stands for "never".
+/// A job's status file. `None` times mean "never".
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Status {
-    #[serde(with = "go_time")]
     pub last_ok: Option<Timestamp>,
-    #[serde(with = "go_time")]
     pub last_run: Option<Timestamp>,
     pub error: String,
     pub running: bool,
@@ -20,36 +18,8 @@ pub(crate) struct Status {
     pub sets: Vec<serde_json::Value>,
 }
 
-mod go_time {
-    use jiff::Timestamp;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    const ZERO: &str = "0001-01-01T00:00:00Z";
-
-    #[expect(
-        clippy::ref_option,
-        reason = "serde's with-module passes the field by reference"
-    )]
-    pub(super) fn serialize<S: Serializer>(t: &Option<Timestamp>, s: S) -> Result<S::Ok, S::Error> {
-        match t {
-            Some(t) => s.collect_str(t),
-            None => s.serialize_str(ZERO),
-        }
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Option<Timestamp>, D::Error> {
-        let t: Timestamp = String::deserialize(d)?
-            .parse()
-            .map_err(serde::de::Error::custom)?;
-        let zero: Timestamp = ZERO.parse().map_err(serde::de::Error::custom)?;
-        Ok((t > zero).then_some(t))
-    }
-}
-
 impl Status {
-    /// An absent or unreadable file reads as "never ran", as in Go.
+    /// An absent or unreadable file reads as "never ran".
     pub(crate) fn read(file: &Path) -> Self {
         std::fs::read(file)
             .ok()
@@ -64,7 +34,7 @@ impl Status {
 }
 
 /// Takes the job lock, or returns `None` when another process holds it.
-/// It is a flock, so it interlocks with the Go tool and is released when the file closes.
+/// It is a flock, released when the file closes.
 pub(crate) fn try_lock(file: &Path) -> Result<Option<File>> {
     let f = platform::private_file(file).with_context(|| file.display().to_string())?;
     match f.try_lock() {
@@ -116,14 +86,15 @@ mod tests {
     use crate::testutil::{TempDir, paths};
 
     #[test]
-    fn reads_go_status() {
+    fn reads_times_with_offsets() {
         let cases = [
             (
                 "never ran",
-                r#"{"last_ok":"0001-01-01T00:00:00Z","last_run":"0001-01-01T00:00:00Z","error":"","running":false}"#,
+                r#"{"last_ok":null,"last_run":null,"error":"","running":false}"#,
                 None,
                 None,
             ),
+            ("fields absent", "{}", None, None),
             (
                 "local offset and nanoseconds",
                 r#"{"last_ok":"2026-11-13T12:00:00.123456789-05:00","last_run":"2026-11-13T18:00:01+01:00","error":"x","running":true}"#,
@@ -151,32 +122,32 @@ mod tests {
     }
 
     #[test]
-    fn writes_go_field_names_and_keeps_sets() {
+    fn write_round_trips_and_keeps_sets() {
         let tmp = TempDir::new();
         let file = tmp.path().join("status/public.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(
             &file,
-            r#"{"last_ok":"2026-11-13T12:00:00Z","last_run":"0001-01-01T00:00:00Z","error":"","running":false,"sets":[{"name":"kernel","state":"ok","time":"2026-11-13T12:00:00Z"}]}"#,
+            r#"{"last_ok":"2026-11-13T12:00:00Z","last_run":null,"error":"","running":false,"sets":[{"name":"kernel","state":"ok","time":"2026-11-13T12:00:00Z"}]}"#,
         )
         .unwrap();
         Status::read(&file).write(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            r#"{"last_ok":"2026-11-13T12:00:00Z","last_run":"0001-01-01T00:00:00Z","error":"","running":false,"sets":[{"name":"kernel","state":"ok","time":"2026-11-13T12:00:00Z"}]}"#
+            r#"{"last_ok":"2026-11-13T12:00:00Z","last_run":null,"error":"","running":false,"sets":[{"name":"kernel","state":"ok","time":"2026-11-13T12:00:00Z"}]}"#
         );
 
         Status::default().write(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            r#"{"last_ok":"0001-01-01T00:00:00Z","last_run":"0001-01-01T00:00:00Z","error":"","running":false}"#
+            r#"{"last_ok":null,"last_run":null,"error":"","running":false}"#
         );
     }
 
     #[test]
     fn lock_excludes_a_second_holder() {
         let tmp = TempDir::new();
-        let file = tmp.path().join("code-archive-github.lock");
+        let file = tmp.path().join("preserver-github.lock");
         let held = try_lock(&file).unwrap();
         assert!(held.is_some());
         assert!(try_lock(&file).unwrap().is_none());

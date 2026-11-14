@@ -18,7 +18,7 @@ pub(crate) struct Repo {
     pub branch: Option<String>,
 }
 
-/// The same pattern as the Go tool; the name becomes path segments on the drive and in the cache.
+/// The name becomes path segments on the drive and in the cache.
 fn valid_repo_name(name: &str) -> bool {
     let segment = |s: &str| {
         !s.is_empty()
@@ -87,7 +87,7 @@ fn run_git(cmd: &mut Command, what: &str) -> Result<Vec<u8>> {
 }
 
 /// A snapshot is due when the refs differ from the recorded state, or when the drive has none yet.
-/// `refs` and the state file compare as bytes without trailing newlines, as in the Go tool.
+/// `refs` and the state file compare as bytes without trailing newlines.
 fn needs_bundle(refs: &[u8], state: Option<&[u8]>, has_bundle: bool) -> bool {
     !(has_bundle && state.is_some_and(|s| trim_newlines(s) == refs))
 }
@@ -502,11 +502,7 @@ mod tests {
             bundles(&p.gh_dest().join("o/ok")),
             ["2026-11-13.bundle.age"]
         );
-        assert!(
-            !tmp.path()
-                .join("home/.cache/code-archive/escape.git")
-                .exists()
-        );
+        assert!(!tmp.path().join("home/.cache/preserver/escape.git").exists());
         assert!(!p.gh_dest().join("o/gone").exists());
     }
 

@@ -13,7 +13,6 @@ impl std::fmt::Display for NoDrive {
     }
 }
 
-/// Every name here is the Go code-archive layout, so existing state is picked up as is.
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
     pub cfg: PathBuf,
@@ -27,9 +26,6 @@ pub(crate) struct Paths {
     pub mirrors: PathBuf,
     pub runtime: PathBuf,
     pub mnt: PathBuf,
-    pub old_cfg: PathBuf,
-    pub old_state: PathBuf,
-    pub old_cache: PathBuf,
     user: String,
 }
 
@@ -48,18 +44,15 @@ impl Paths {
         let state = dir("XDG_STATE_HOME", ".local/state");
         let cache = dir("XDG_CACHE_HOME", ".cache");
         Ok(Self {
-            personal: cfg.join("code-archive/personal"),
-            drives_d: cfg.join("code-archive/drives.d"),
-            github: state.join("code-archive/github"),
-            status: state.join("code-archive/status"),
-            local_state: state.join("code-archive/local"),
-            queue: state.join("code-archive/queue"),
-            tofu: state.join("code-archive/tofu.json"),
-            mirrors: cache.join("code-archive/mirrors"),
-            old_cfg: cfg.join("gh-backup"),
-            old_state: state.join("gh-backup"),
-            old_cache: cache.join("gh-backup"),
-            cfg: cfg.join("code-archive"),
+            personal: cfg.join("preserver/personal"),
+            drives_d: cfg.join("preserver/drives.d"),
+            github: state.join("preserver/github"),
+            status: state.join("preserver/status"),
+            local_state: state.join("preserver/local"),
+            queue: state.join("preserver/queue"),
+            tofu: state.join("preserver/tofu.json"),
+            mirrors: cache.join("preserver/mirrors"),
+            cfg: cfg.join("preserver"),
             runtime: PathBuf::from(runtime),
             mnt: PathBuf::new(),
             user,
@@ -71,7 +64,7 @@ impl Paths {
     }
 
     pub(crate) fn archive(&self) -> PathBuf {
-        self.mnt.join("code-archive")
+        self.mnt.join("preserver")
     }
 
     pub(crate) fn gh_dest(&self) -> PathBuf {
@@ -87,7 +80,7 @@ impl Paths {
     }
 
     pub(crate) fn lock_file(&self, job: &str) -> PathBuf {
-        self.runtime.join(format!("code-archive-{job}.lock"))
+        self.runtime.join(format!("preserver-{job}.lock"))
     }
 
     /// Mounts the drive, or finds where it already is. The path always comes from udisks by id:
@@ -119,83 +112,68 @@ mod tests {
     const MNT: &str = "/run/media/u/0123abcd-0000-4000-8000-0123456789ab";
 
     #[test]
-    fn layout_matches_go() {
+    fn layout() {
         let mut p = Paths::resolve(lookup(&BASE)).unwrap();
         p.set_drive(&"0123abcd-0000-4000-8000-0123456789ab".parse().unwrap());
         let cases = [
-            ("cfg", p.cfg.clone(), "/home/u/.config/code-archive".into()),
+            ("cfg", p.cfg.clone(), "/home/u/.config/preserver".into()),
             (
                 "personal",
                 p.personal.clone(),
-                "/home/u/.config/code-archive/personal".into(),
+                "/home/u/.config/preserver/personal".into(),
             ),
             (
                 "drives.d",
                 p.drives_d.clone(),
-                "/home/u/.config/code-archive/drives.d".into(),
+                "/home/u/.config/preserver/drives.d".into(),
             ),
             (
                 "github",
                 p.github.clone(),
-                "/home/u/.local/state/code-archive/github".into(),
+                "/home/u/.local/state/preserver/github".into(),
             ),
             (
                 "status",
                 p.status.clone(),
-                "/home/u/.local/state/code-archive/status".into(),
+                "/home/u/.local/state/preserver/status".into(),
             ),
             (
                 "mirrors",
                 p.mirrors.clone(),
-                "/home/u/.cache/code-archive/mirrors".into(),
+                "/home/u/.cache/preserver/mirrors".into(),
             ),
             ("runtime", p.runtime.clone(), "/run/user/1000".into()),
             ("mnt", p.mnt.clone(), MNT.to_string()),
-            ("archive", p.archive(), format!("{MNT}/code-archive")),
+            ("archive", p.archive(), format!("{MNT}/preserver")),
             (
                 "gh_dest",
                 p.gh_dest(),
-                format!("{MNT}/code-archive/github-repos-personal"),
+                format!("{MNT}/preserver/github-repos-personal"),
             ),
             (
                 "local_state",
                 p.local_state.clone(),
-                "/home/u/.local/state/code-archive/local".into(),
+                "/home/u/.local/state/preserver/local".into(),
             ),
             (
                 "queue",
                 p.queue.clone(),
-                "/home/u/.local/state/code-archive/queue".into(),
+                "/home/u/.local/state/preserver/queue".into(),
             ),
             (
                 "local_dest",
                 p.local_dest(),
-                format!("{MNT}/code-archive/local-personal"),
-            ),
-            (
-                "old_cfg",
-                p.old_cfg.clone(),
-                "/home/u/.config/gh-backup".into(),
-            ),
-            (
-                "old_state",
-                p.old_state.clone(),
-                "/home/u/.local/state/gh-backup".into(),
-            ),
-            (
-                "old_cache",
-                p.old_cache.clone(),
-                "/home/u/.cache/gh-backup".into(),
+                format!("{MNT}/preserver/local-personal"),
             ),
             (
                 "status_file",
                 p.status_file("github"),
-                "/home/u/.local/state/code-archive/status/github.json".into(),
+                "/home/u/.local/state/preserver/status/github.json".into(),
             ),
             (
                 "lock_file",
                 p.lock_file("github"),
-                "/run/user/1000/code-archive-github.lock".into(),
+                "/run/user/1000/preserver-github.lock".into(),
             ),
         ];
         for (name, got, want) in cases {
@@ -213,10 +191,9 @@ mod tests {
             ("XDG_CACHE_HOME", "/k"),
         ]);
         let p = Paths::resolve(lookup(&vars)).unwrap();
-        assert_eq!(p.personal, Path::new("/c/code-archive/personal"));
-        assert_eq!(p.github, Path::new("/s/code-archive/github"));
-        assert_eq!(p.mirrors, Path::new("/k/code-archive/mirrors"));
-        assert_eq!(p.old_cache, Path::new("/k/gh-backup"));
+        assert_eq!(p.personal, Path::new("/c/preserver/personal"));
+        assert_eq!(p.github, Path::new("/s/preserver/github"));
+        assert_eq!(p.mirrors, Path::new("/k/preserver/mirrors"));
     }
 
     #[test]

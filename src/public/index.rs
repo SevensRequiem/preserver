@@ -28,7 +28,7 @@ td,th{text-align:left;padding:.2rem .6rem .2rem 0;border-bottom:1px solid var(--
 <p class="dim">Everything under <code>public/</code> is plaintext. Each version directory holds <code>SET.toml</code> (sources, versions, signer, license) and <code>SHA256SUMS</code>. Check a copy with <code>cd public/SET/VERSION &amp;&amp; sha256sum -c SHA256SUMS</code>. Upstream signatures sit next to their files.</p>
 "#;
 
-/// The Go tool's MIRRORS.toml, which git and repo mirrors keep next to their set.
+/// `MIRRORS.toml`, which git and repo mirrors keep next to their set.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Mirror {

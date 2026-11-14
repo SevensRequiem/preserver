@@ -175,7 +175,7 @@ impl Source {
     }
 }
 
-/// Safe as one path component: the Go tool's `nameRe`, and no leading dot.
+/// Safe as one path component: and no leading dot.
 pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('.')

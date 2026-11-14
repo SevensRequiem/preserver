@@ -4,7 +4,7 @@ use crate::personal::local;
 use crate::platform;
 use age::secrecy::SecretString;
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub(crate) fn check_target(dir: &Path) -> Result<()> {
@@ -76,14 +76,22 @@ pub(crate) fn restore_bundle(identities: &Identities, file: &Path, dir: &Path) -
     result
 }
 
+/// The locked key for a backup file: the one stored with the backup (the bundle's own tree, so
+/// an old drive or copy restores by itself), then the primary drive's, then the home copy.
+fn identity_file(paths: &Paths, file: &Path) -> PathBuf {
+    let drive = paths.gh_dest().join("identity.age");
+    file.ancestors()
+        .skip(1)
+        .take(4)
+        .map(|d| d.join("identity.age"))
+        .chain((!paths.mnt.as_os_str().is_empty()).then_some(drive))
+        .find(|f| f.is_file())
+        .unwrap_or_else(|| paths.personal.join("identity.age"))
+}
+
 pub(crate) fn run(paths: &Paths, file: &Path, dir: &Path) -> Result<()> {
     check_target(dir)?;
-    let on_drive = paths.gh_dest().join("identity.age");
-    let id_file = if !paths.mnt.as_os_str().is_empty() && on_drive.exists() {
-        on_drive
-    } else {
-        paths.personal.join("identity.age")
-    };
+    let id_file = identity_file(paths, file);
     let locked = std::fs::read(&id_file).with_context(|| id_file.display().to_string())?;
     let passphrase = SecretString::from(
         rpassword::prompt_password(format!("Restore password for {}: ", id_file.display()))
@@ -153,6 +161,41 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["repo"], "the plain bundle is removed");
+    }
+
+    #[test]
+    fn restores_a_bundle_from_outside_the_current_layout() {
+        let tmp = TempDir::new();
+        let id = x25519::Identity::generate();
+        let sealed = sealed_bundle(tmp.path(), id.to_public());
+        let old = tmp.path().join("drive/old-tool/github-repos-personal");
+        std::fs::create_dir_all(old.join("o/r")).unwrap();
+        let file = old.join("o/r/2026-01-01.bundle.age");
+        std::fs::rename(&sealed, &file).unwrap();
+        std::fs::write(old.join("identity.age"), "locked").unwrap();
+
+        let mut p = crate::testutil::paths(tmp.path());
+        p.mnt = tmp.path().join("drive");
+        assert_eq!(identity_file(&p, &file), old.join("identity.age"));
+
+        let ids: Identities = vec![Box::new(id)];
+        let out = tmp.path().join("out/repo");
+        restore_bundle(&ids, &file, &out).unwrap();
+        tgit(&out, &["fsck", "--strict"]);
+        assert!(out.join("f.txt").exists());
+    }
+
+    #[test]
+    fn identity_falls_back_to_the_drive_then_home() {
+        let tmp = TempDir::new();
+        let mut p = crate::testutil::paths(tmp.path());
+        let file = tmp.path().join("elsewhere/x.bundle.age");
+        assert_eq!(identity_file(&p, &file), p.personal.join("identity.age"));
+        std::fs::create_dir_all(p.gh_dest()).unwrap();
+        std::fs::write(p.gh_dest().join("identity.age"), "locked").unwrap();
+        assert_eq!(identity_file(&p, &file), p.gh_dest().join("identity.age"));
+        p.mnt = PathBuf::new();
+        assert_eq!(identity_file(&p, &file), p.personal.join("identity.age"));
     }
 
     #[test]

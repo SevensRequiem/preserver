@@ -93,7 +93,7 @@ impl Env {
     }
 
     fn set_dir(&self) -> PathBuf {
-        self.paths.mnt.join("code-archive/public/demo")
+        self.paths.mnt.join("preserver/public/demo")
     }
 
     /// The set's line in status/public.json.
@@ -215,7 +215,7 @@ fn full_sync_publishes_only_verified_files() {
     );
     assert_eq!(st["version"].as_str(), Some(versions[0].as_str()));
     assert!(st.get("detail").is_none());
-    let index = std::fs::read_to_string(env.paths.mnt.join("code-archive/INDEX.html")).unwrap();
+    let index = std::fs::read_to_string(env.paths.mnt.join("preserver/INDEX.html")).unwrap();
     assert!(index.contains("<h2 id=\"demo\">demo</h2>"), "{index}");
     assert!(
         index.contains("Demo &lt;set&gt; <span class=\"dim\">(MIT)</span>"),
@@ -277,7 +277,7 @@ fn tampered_file_fails_and_stays_invisible() {
     let st = env.status();
     assert_eq!(st["state"].as_str(), Some("failed"));
     assert!(st["detail"].as_str().unwrap().contains("bad signature"));
-    let index = std::fs::read_to_string(env.paths.mnt.join("code-archive/INDEX.html")).unwrap();
+    let index = std::fs::read_to_string(env.paths.mnt.join("preserver/INDEX.html")).unwrap();
     assert!(
         !index.contains("demo"),
         "the index lists only visible versions"

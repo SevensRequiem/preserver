@@ -31,7 +31,7 @@ fn preserver(root: &Path) -> Command {
 }
 
 fn write_config(root: &Path) {
-    let dir = root.join("home/.config/code-archive");
+    let dir = root.join("home/.config/preserver");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
@@ -55,7 +55,7 @@ fn missing_config_names_the_file() {
 #[test]
 fn bad_config_is_rejected_before_anything_runs() {
     let root = fresh_dir("badconfig");
-    let dir = root.join("home/.config/code-archive");
+    let dir = root.join("home/.config/preserver");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
@@ -101,14 +101,14 @@ fn tray_without_a_session_bus_fails_cleanly() {
 }
 
 fn local_status(root: &Path) -> String {
-    std::fs::read_to_string(root.join("home/.local/state/code-archive/status/local.json")).unwrap()
+    std::fs::read_to_string(root.join("home/.local/state/preserver/status/local.json")).unwrap()
 }
 
 #[test]
 fn local_only_without_folders_succeeds_without_the_drive() {
     let root = fresh_dir("nolocal");
     write_config(&root);
-    let personal = root.join("home/.config/code-archive/personal");
+    let personal = root.join("home/.config/preserver/personal");
     std::fs::create_dir_all(&personal).unwrap();
     std::fs::write(personal.join("recipient.txt"), "age1x\n").unwrap();
     let out = preserver(&root)
@@ -121,7 +121,7 @@ fn local_only_without_folders_succeeds_without_the_drive() {
     assert!(!status.contains(r#""last_ok":"0001"#), "{status}");
     assert!(
         !root
-            .join("home/.local/state/code-archive/status/github.json")
+            .join("home/.local/state/preserver/status/github.json")
             .exists(),
         "--local-only leaves GitHub alone"
     );
@@ -131,7 +131,7 @@ fn local_only_without_folders_succeeds_without_the_drive() {
 fn nightly_local_run_skips_quietly_when_the_drive_is_absent() {
     let root = fresh_dir("nodrive");
     write_config(&root);
-    let cfg = root.join("home/.config/code-archive");
+    let cfg = root.join("home/.config/preserver");
     let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
     text.push_str("[[local]]\nname = \"docs\"\npath = \"/nonexistent\"\n");
     std::fs::write(cfg.join("config.toml"), text).unwrap();
@@ -154,23 +154,6 @@ fn personal_without_init_fails() {
     let out = preserver(&root).arg("personal").output().unwrap();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("init"), "{}", stderr(&out));
-}
-
-#[test]
-fn migrate_dry_run_plans_without_moving() {
-    let root = fresh_dir("migrate");
-    write_config(&root);
-    let old = root.join("home/.config/gh-backup");
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join("recipient.txt"), "age1x\n").unwrap();
-    let out = preserver(&root)
-        .args(["migrate", "--dry-run"])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", stderr(&out));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("would move"), "{stdout}");
-    assert!(old.join("recipient.txt").exists());
 }
 
 #[test]
@@ -273,7 +256,7 @@ fn ssh_shim_becomes_ssh_with_its_options_first() {
     assert!(config.contains("controlpersist 60"), "{config}");
     assert!(
         config.contains(&format!(
-            "controlpath {}/code-archive-ssh-",
+            "controlpath {}/preserver-ssh-",
             root.join("run").display().to_string().to_lowercase()
         )),
         "{config}"

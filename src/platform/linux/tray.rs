@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
-const UNIT: &str = "code-archive-personal.service";
+const UNIT: &str = "preserver-personal.service";
 const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
 
 /// What the menu and the helper threads ask of the main loop, which owns every decision.
@@ -62,11 +62,11 @@ impl Tray {
 }
 
 impl ksni::Tray for Tray {
-    // A left click opens the menu, as the Go tray's ItemIsMenu did.
+    // A left click opens the menu.
     const MENU_ON_ACTIVATE: bool = true;
 
     fn id(&self) -> String {
-        "code-archive".into()
+        "preserver".into()
     }
 
     fn title(&self) -> String {
@@ -159,7 +159,7 @@ impl ksni::Tray for Tray {
     }
 }
 
-/// Starts the backup unit and waits for it, as Go did: the exit status is the only sign of a
+/// Starts the backup unit and waits for it: the exit status is the only sign of a
 /// run that failed before it wrote its status file.
 fn run_unit() -> bool {
     // The unit runs under the user manager, so hand it the session's display for ksshaskpass.

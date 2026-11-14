@@ -40,7 +40,7 @@ impl Auth {
     /// Links this binary into the runtime dir under the name git will start it by.
     /// For https it also asks `gh` for the token, which then lives only in the fetch's environment.
     pub(crate) fn new(transport: Transport, runtime: &Path) -> Result<Self> {
-        let dir = runtime.join("code-archive");
+        let dir = runtime.join("preserver");
         platform::private_dir_all(&dir).with_context(|| dir.display().to_string())?;
         let env = match transport {
             Transport::Ssh => {

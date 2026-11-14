@@ -1,4 +1,4 @@
-# preserver: design for the Rust rewrite of code-archive
+# preserver: design
 
 Crate versions and features were checked on crates.io. Dependency counts come from `cargo tree` on a scratch workspace with the exact versions and features listed below.
 
@@ -21,7 +21,7 @@ Crate versions and features were checked on crates.io. Dependency counts come fr
 | Windows scheduling | exec `schtasks.exe /Create /XML` with a generated task XML | No `windows` COM crate. Fixed system binary, no user data in args |
 | Drive events | udisks2 `InterfacesAdded` over zbus. Windows: `CM_Register_Notification` (needs no window) | Message-only windows don't get `WM_DEVICECHANGE` broadcasts |
 | par2 | exec `par2` when it is on PATH (Linux: dnf `par2cmdline`; Windows: user installs par2cmdline). Absent means skip with a status warning | The par2 crates are young (all under 17k downloads) |
-| Paths | **Keep every existing path and name** (`code-archive` on host and drive, `code-archive-*` units and lock names). Only the binary is renamed | No migration while no backup is running. Windows uses `%APPDATA%\code-archive` and `%LOCALAPPDATA%\code-archive` |
+| Paths | **preserver's own names**, one tree per XDG base: `~/.config/preserver`, `~/.local/state/preserver`, `~/.cache/preserver`, `$XDG_RUNTIME_DIR/preserver` (shims) and `preserver-<job>.lock` locks, units `preserver-*`, and `<drive>/preserver/` on the drive. Windows uses `%APPDATA%\preserver` and `%LOCALAPPDATA%\preserver` | A new app has no state to inherit. The formats below are its own and are documented here. Backups made by other tools stay where they are and still restore (see §4) |
 | Platform abstraction | **No trait.** `src/platform/{linux,windows}/` export identical free-function signatures under `cfg`, and CI type-checks both | Only one implementation is ever compiled per target. A trait would have one impl per build |
 
 ## 1. Crate list (for approval)
@@ -52,7 +52,7 @@ Common flags: exact `=` pins, `default-features = false` wherever listed. "Deps"
 | `clap` | 4.6.7 `["derive"]` | about 12 subcommands plus `queue` | clap-rs | 17 (21) | no | MIT/Apache-2.0 | It is the stack default |
 | `anyhow`, `thiserror` | 1.0.104, 2.0.21 | errors (bin and lib) | dtolnay | 1, 6 | no | MIT/Apache-2.0 | It is the convention |
 | `tracing` + `tracing-subscriber` | 0.1.44 + 0.3.23 `["fmt","std"]` | logging to the journal or console | tokio-rs | 15 | no | MIT | It is the stack default |
-| `jiff` | 0.2.43 | local-date names (`YYYY-MM-DD`), parsing Go's RFC 3339 timestamps, Windows tz | BurntSushi | 2 (5) | no | Unlicense/MIT | std has no local time zone |
+| `jiff` | 0.2.43 | local-date names (`YYYY-MM-DD`), parsing RFC 3339 timestamps, Windows tz | BurntSushi | 2 (5) | no | Unlicense/MIT | std has no local time zone |
 | `rpassword` | 7.5.5 | passphrase prompt (init, restore) on a tty or Windows console | conradkleinespel | 3 (4) | no | Apache-2.0 | — |
 | `rustix` (unix only) | 1.1.6 `["fs"]` | `statvfs` for the budget | bytecodealliance | 3 | build.rs, no C | Apache-2.0 WITH LLVM-exception/MIT | std has no statvfs. libc would need unsafe |
 | `ksni` (linux only) | 0.3.7, no default, `["blocking","async-io"]` | SNI tray | iovxw | 77 | no | Unlicense | Pinned to zbus 5, so we pin zbus 5 too |
@@ -128,13 +128,13 @@ AR_aarch64_unknown_linux_musl = "llvm-ar"
 
 ## 3. Module layout and core types
 
-It's one package, `preserver`, with `src/lib.rs` and a thin `src/main.rs`; no workspace, because there is only one bin and one lib. `catalog.toml` and `keys/` move into the repo. Keys are embedded with one `include_bytes!` per file in `keys.rs`. **The public repo has no host defaults.** The Go code hard-codes `primary_uuid` and the owner list. In preserver both are required in `~/.config/code-archive/config.toml` (see `config.example.toml`).
+It's one package, `preserver`, with `src/lib.rs` and a thin `src/main.rs`; no workspace, because there is only one bin and one lib. `catalog.toml` and `keys/` move into the repo. Keys are embedded with one `include_bytes!` per file in `keys.rs`. **The public repo has no host defaults.** Both `primary_uuid` and the owner list are required in `~/.config/preserver/config.toml` (see `config.example.toml`).
 
 ```
 src/main.rs            clap dispatch; argv0 == "preserver-ssh" -> ssh shim (§3.5)
 src/paths.rs           Paths: XDG on Linux / APPDATA+LOCALAPPDATA on Windows; ghDest/localDest/publicDir
-src/config.rs          Config, LocalFolder, Drive registry (drives.d/<id>.toml), validation (ports Go regexes)
-src/status.rs          Go-compatible status JSON (+ alerts[]); job locks via File::try_lock in runtime dir
+src/config.rs          Config, LocalFolder, Drive registry (drives.d/<id>.toml), validation
+src/status.rs          status JSON (+ alerts[]); job locks via File::try_lock in runtime dir
 src/catalog.rs         Catalog/Set/Source (+ kind "repo", format fedora|debian|alpine); catalog.toml embedded
 src/keys.rs            embedded keyrings; stored-key pin check
 src/crypt.rs           age: init (generate + scrypt-lock), encrypt_stream(recipient.txt), open_identity(passphrase)
@@ -148,7 +148,7 @@ src/public/{mod.rs (enqueue, budget, record), versioned.rs (staging/hardlinks/SE
 src/mirror/{generation.rs (stage -> verify -> swap -> prune, done.tsv), fedora.rs, debian.rs, deb822.rs, alpine.rs}
 src/clone.rs           tiers, FAT/exFAT rules, kit.tar, sync_tree (also replicas)
 src/scrub.rs           verify [--repair], rotating quarter, par2 exec
-src/tray_model.rs      platform-neutral tray state: labels, overdue (4 days), icon/status, menu items (unit-tested; ports tray.go logic)
+src/tray_model.rs      platform-neutral tray state: labels, overdue (4 days), icon/status, menu items (unit-tested)
 src/platform/mod.rs    cfg re-export
 src/platform/linux/{udisks.rs, notify.rs, tray.rs (ksni), fs.rs}
 src/platform/windows/{volumes.rs, devnotify.rs, tray.rs (Shell_NotifyIcon + balloons + TaskbarCreated re-add), tasks.rs (schtasks XML), fs.rs}
@@ -167,7 +167,7 @@ src/platform/windows/{volumes.rs, devnotify.rs, tray.rs (Shell_NotifyIcon + ball
 | `notify(Alert)` | org.freedesktop.Notifications with the "run" action | NIF_INFO balloon, where NIN_BALLOONUSERCLICK means run |
 | `open_path` | xdg-open | explorer.exe |
 | `ssh_program()`, `ssh_mux_args()` | `/usr/bin/ssh` + ControlMaster args, `SSH_ASKPASS=/usr/bin/ksshaskpass`, `SSH_ASKPASS_REQUIRE=force` | `%SystemRoot%\System32\OpenSSH\ssh.exe`, no mux args |
-| `install_schedule()` | none: units ship in `dist/systemd/`, installed by the environment repo | schtasks XML: `\code-archive\public` 03:00 StartWhenAvailable Priority 7, `local` nightly, `verify` weekly, `tray` LogonTrigger |
+| `install_schedule()` | none: units ship in `dist/systemd/`, installed by the environment repo | schtasks XML: `\preserver\public` 03:00 StartWhenAvailable Priority 7, `local` nightly, `verify` weekly, `tray` LogonTrigger |
 | `background_priority()` | none (the units set Nice and IOSchedulingClass=idle) | SetPriorityClass(PROCESS_MODE_BACKGROUND_BEGIN) |
 
 **`DriveId` newtype (an invariant).** It is normalized hex without dashes, upper case. udisks reports FAT as `XXXX-XXXX` and NTFS as a 16-hex serial, which are the same values Windows returns. So the same `drives.d/<id>.toml` matches on both OSes, and the existing ext4 UUID still works on Linux.
@@ -196,18 +196,18 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 
 | Aspect | Design |
 |---|---|
-| Store | `~/.local/state/code-archive/queue/<id>.json`, written only by the worker (tmp + rename). Control lives in `<id>.ctl`, written by the CLI and tray. New jobs are created with `O_EXCL` by anyone. The worker rescans every 1 s |
-| Single worker | `preserver queue run` holds `code-archive-queue.lock`. `public`, `clone` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running". A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued, as Go's `lockHeld` does |
+| Store | `~/.local/state/preserver/queue/<id>.json`, written only by the worker (tmp + rename). Control lives in `<id>.ctl`, written by the CLI and tray. New jobs are created with `O_EXCL` by anyone. The worker rescans every 1 s |
+| Single worker | `preserver queue run` holds `preserver-queue.lock`. `public`, `clone` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running". A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
 | Per-file state | The filesystem is the state: a final file exists only after verification. A partial is `<dest>.part` + `<dest>.part.json` (PartState). Repo generations add `.staging/<gen>/done.tsv` (append-only, fsync batched) |
-| Priority | `Job.priority` is the position in first-pass catalog order (`--first-pass`), or stable by `priority` then catalog order, as Go does. Within a job, items keep plan order |
+| Priority | `Job.priority` is the position in first-pass catalog order (`--first-pass`), or stable by `priority` then catalog order. Within a job, items keep plan order |
 | Concurrency | `downloads = 4` threads. Per-host semaphores default to 2, overridable in config `[hosts]` (e.g. `"huggingface.co" = 4`) |
 | Retry | Per item: backoff 5 s·2ⁿ with jitter, capped at 10 min, 6 tries per run. 4xx other than 408/429 is permanent. A 429/503 `Retry-After` pauses the whole host. After that the job is Failed, and the next timer run retries it |
 | Pause/resume/cancel | Applied at the next 64 KiB chunk. Pause keeps `.part` files. Cancel deletes the job's staging. `queue pause --all` writes a global ctl |
 | Unplug | A write error showing the mount is gone (ENOENT/EIO/ENODEV, or `is_mounted` false) puts every job on that drive into `Blocked(DriveAbsent)` without counting attempts. The tray's drive watcher resumes them on replug |
 | Bandwidth | One global token bucket (default `bandwidth_mbit = 80`, 0 = off, burst 256 KiB). It is taken before each body read in `net` and in the gix Http backend. It counts payload bytes, so the wire is about 2–3% above; TCP backpressure keeps the link honest. Personal ssh fetches are unthrottled, as now |
-| Resume | Segmented GETs, each with Range + If-Range (validator) and `timeout_recv_body` 10 min. A segment end is a checkpoint: `sync_data` the part, then write the sidecar atomically. On resume: truncate the part to `offset`, restore the hashers from the midstate, continue. 200 instead of 206 means restart from 0. A part without a sidecar (for example a leftover from the Go era) is re-hashed once. Without Range support it is a single stream with a size-derived timeout and no resume. BLAKE3 has no public midstate, so its sources re-hash on resume |
+| Resume | Segmented GETs, each with Range + If-Range (validator) and `timeout_recv_body` 10 min. A segment end is a checkpoint: `sync_data` the part, then write the sidecar atomically. On resume: truncate the part to `offset`, restore the hashers from the midstate, continue. 200 instead of 206 means restart from 0. A part without a sidecar is re-hashed once. Without Range support it is a single stream with a size-derived timeout and no resume. BLAKE3 has no public midstate, so its sources re-hash on resume |
 | Midstate | **Persist it.** `ResumableSha256/512` wrap `sha2::compress256/512`. Checkpoints sit on 64 MiB boundaries, so the state is just the words plus the length, and the sidecar carries a version number |
-| Visibility | Versioned sets work exactly as in Go: `<set>/.staging/<plan16>/`, hardlinks from the previous version (copy on exFAT/FAT), SET.toml + SHA256SUMS, rename into place, prune to `keep`. Repo mirrors follow §3.4 |
+| Visibility | Versioned sets: `<set>/.staging/<plan16>/`, hardlinks from the previous version (copy on exFAT/FAT), SET.toml + SHA256SUMS, rename into place, prune to `keep`. Repo mirrors follow §3.4 |
 | Progress | The worker rewrites `<id>.json` every 1 s. The tray polls every 2 s while a worker lock is held, otherwise hourly. `queue list [--watch]` |
 
 **Why JSON over rusqlite or redb:**
@@ -237,32 +237,44 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Step | Linux | Windows |
 |---|---|---|
 | List | exec `gh repo list --json …` (parity) | same, with gh.exe |
-| Fetch | **Phase 1:** exec `git fetch` as Go does, with `GIT_SSH=<runtime>/code-archive/preserver-ssh` (no shell, unlike Go's `GIT_SSH_COMMAND`) and `GIT_SSH_VARIANT=ssh`. **Phase 3:** gix fetch via `ssh::connect::Options { command: Some(shim), kind: Some(ProgramKind::Ssh), disallow_shell: true }`, refspecs `+refs/heads/*` and `+refs/tags/*`, prune, set HEAD | ssh.exe direct (Windows Hello handles PIN and touch) |
-| Shim | `preserver-ssh` is a symlink to the binary. main sees argv0, adds `-o ControlMaster=auto -o ControlPath=$XDG_RUNTIME_DIR/code-archive-ssh-%C -o ControlPersist=60`, sets SSH_ASKPASS*, then `exec`s /usr/bin/ssh. It exists because gix's Options can't carry extra args or env, and `set_var` is unsafe in edition 2024 | not needed |
+| Fetch | **Phase 1:** exec `git fetch` with `GIT_SSH=<runtime>/preserver/preserver-ssh` (no shell) and `GIT_SSH_VARIANT=ssh`. **Phase 3:** gix fetch via `ssh::connect::Options { command: Some(shim), kind: Some(ProgramKind::Ssh), disallow_shell: true }`, refspecs `+refs/heads/*` and `+refs/tags/*`, prune, set HEAD | ssh.exe direct (Windows Hello handles PIN and touch) |
+| Shim | `preserver-ssh` is a symlink to the binary. main sees argv0, adds `-o ControlMaster=auto -o ControlPath=$XDG_RUNTIME_DIR/preserver-ssh-%C -o ControlPersist=60`, sets SSH_ASKPASS*, then `exec`s /usr/bin/ssh. It exists because gix's Options can't carry extra args or env, and `set_var` is unsafe in edition 2024 | not needed |
 | Change detection | `<oid> <refname>\n` lines sorted by refname bytes (heads and tags only, unpeeled, the same as `for-each-ref`), compared byte-for-byte with the existing `.refs` file | same |
 | Bundle | exec `git -C mirror bundle create -q - --all`, stdout into the in-process age Encryptor, then `.tmp` and rename | needs Git for Windows |
 | Restore | Phase 1: in-process age decrypt, then exec `git clone` + `remote remove origin` (parity). Phase 4: native. Parse the v2/v3 header, `gix_pack::Bundle::write_to_directory` (index-pack), init, write refs + HEAD, check out with gix worktree-mutation. The kit and Windows then need no git | same |
 
 ## 4. CLI
 
+**On the drive** (`<drive>/preserver/`):
+
+| Path | Content |
+|---|---|
+| `github-repos-personal/<owner>/<repo>/` | `YYYY-MM-DD.bundle.age` snapshots and the `.refs` state; `identity.age` (locked key) and `recipient.txt` at the top |
+| `local-personal/<name>/YYYY-MM/` | `L0.tar.zst.age` and `Dnn.tar.zst.age` |
+| `public/<set>/` | mirrored public sets (`<version>/`, `SET.toml`, `.staging/`) |
+| `kit/` | recovery kit |
+| `.state/` | reserved for drive-side state |
+
+On the host: `~/.config/preserver/{config.toml,drives.d/,personal/{identity.age,recipient.txt}}`, `~/.local/state/preserver/{status/<job>.json,github/,local/,queue/,tofu.json}` and `~/.cache/preserver/mirrors/`.
+
+
 | Command | Notes |
 |---|---|
-| `init` | in-process keygen. The secret goes straight into the scrypt Encryptor (zeroized) and never touches disk unencrypted. Writes `identity.age` on the drive and at home, and `recipient.txt` |
+| `init [--import IDENTITY_AGE]` | in-process keygen. The secret goes straight into the scrypt Encryptor (zeroized) and never touches disk unencrypted. Writes `identity.age` on the drive and at home, and `recipient.txt`. With `--import` it copies an existing passphrase-locked identity instead: the restore password must unlock it (checked before anything is written), and `recipient.txt` is derived from the keys inside. Neither form replaces an identity that is already stored |
 | `personal [--local-only]` | github + local jobs, refs state, alerts |
-| `restore FILE DIR` | `.bundle.age` or `.tar.zst.age` (L0 then Dnn applies the manifest's deletions) |
+| `restore FILE DIR` | `.bundle.age` or `.tar.zst.age` (L0 then Dnn applies the manifest's deletions). FILE can be anywhere, for example a bundle of an older backup tree on a drive. The locked key is the `identity.age` found in the three directories above FILE, else the primary drive's, else the home copy |
 | `public [SET…] [--dry-run] [--first-pass]` | enqueue + run the worker |
 | `queue list [--watch] \| show ID \| pause [ID\|--all] \| resume [ID\|--all\|--drive ID] \| cancel ID \| retry ID \| prio ID N \| run` | new |
 | `clone DEST [--tier usb64\|disk1t\|full] [--sets …] [--once]` | phase 4 |
 | `verify [--repair]` | phase 4 |
-| `drives`, `open`, `tray` | parity |
+| `drives`, `open`, `tray` | list drives, open the archive folder, run the tray |
 | `install` | Windows only: Task Scheduler tasks + tray at logon |
-| dropped: `migrate` | the gh-backup migration is done, and paths are kept |
 | deferred: `kit` | the existing `kit/` stays. Later, add preserver binaries for 4 targets + `cargo vendor` source |
 
 **Local-folder format (new, because the `tar` crate can't write GNU `--listed-incremental` dumps):**
-- Same names: `<name>/YYYY-MM/{L0,Dnn}.tar.zst.age`.
+- Layout: `<name>/YYYY-MM/{L0,Dnn}.tar.zst.age`.
 - The first entry is `.preserver/manifest.tsv`: a header line (`preserver-manifest`, version, this archive's id, the id of its level 0 or `-`) and one line per path present (kind, mode, size, mtime ns, ctime ns, escaped path). Dnn holds the entries whose line differs from the L0 index.
-- The index is the L0's manifest, kept in `~/.local/state/code-archive/local/<name>/YYYY-MM.L0.idx`. A level 0 whose index is gone gets no differentials: the month's folder has to be moved aside. That includes a month the Go tool started.
+- The index is the L0's manifest, kept in `~/.local/state/preserver/local/<name>/YYYY-MM.L0.idx`. A level 0 whose index is gone gets no differentials: the month's folder has to be moved aside.
 - Restore takes modes and times from the manifest, never writes through a symlink, and skips (and reports, with a non-zero exit) symlinks whose target is absolute, climbs above the target directory, or has a `..` after a plain name (a link it passes through could lead out).
 - GNU tar can still extract the archives, just without applying deletions.
 
@@ -274,11 +286,11 @@ Every phase ends with `fmt`, `clippy -D warnings`, `test`, `cargo deny`, then a 
 |---|---|---|---|
 | **0** | Repo `preserver`: Cargo.toml (lints from rust.md, profiles, `panic="abort"`), rust-toolchain.toml, deny.toml (licenses MIT/Apache-2.0/ISC/BSD-3/Unicode-3.0/Unlicense/CC0/Apache-2.0-WITH-LLVM-exception; cc wrappers; rsa advisory note), `.cargo/config.toml`, CLAUDE.md. **Proof:** a stub that links ring + age + ureq for all musl targets and `x86_64-pc-windows-gnu`, and `cargo check` passes for msvc/gnullvm | root files | `coder`; CLAUDE.md by `writer` |
 | 0b | CI workflow (4 targets, pinned actions) | `.github/workflows/ci.yml` | `deploy` |
-| **1a** | paths, config (no defaults), status (Go-compatible: year-1 zero time means none), locks, crypt, github (exec git + shim), restore (exec git clone), drives + mount (udisks/zbus), `open`. Linux only; Windows `platform` stubs return `Unsupported` | `src/{paths,config,status,crypt}.rs`, `src/personal/{github,restore}.rs`, `src/git/ssh.rs`, `src/platform/linux/{udisks,fs}.rs` | `coder` |
-| 1a gate | (1) the first real run writes **zero** new bundles; (2) decrypt a Go-era `.bundle.age` with the existing `identity.age`; (3) the kit's Go `age` decrypts a new bundle under `env -i PATH=/nonexistent`; (4) restore of one repo matches `git fsck`. Point the systemd units at `preserver` | tests in `tests/personal.rs` | `test-writer`, then it is run by hand outside any sandbox (it touches real credentials and FIDO keys) |
+| **1a** | paths, config (no defaults), status (a null time means never), locks, crypt, github (exec git + shim), restore (exec git clone), drives + mount (udisks/zbus), `open`. Linux only; Windows `platform` stubs return `Unsupported` | `src/{paths,config,status,crypt}.rs`, `src/personal/{github,restore}.rs`, `src/git/ssh.rs`, `src/platform/linux/{udisks,fs}.rs` | `coder` |
+| 1a gate | (1) `init --import` of an existing locked identity keeps the key and derives the recipient; (2) a `.bundle.age` outside `<drive>/preserver/` restores with the identity stored next to it; (3) the `age` CLI decrypts a new bundle under `env -i PATH=/nonexistent`; (4) restore of one repo matches `git fsck` | tests in `tests/personal.rs` | `test-writer`, then it is run by hand outside any sandbox (it touches real credentials and FIDO keys) |
 | **1b** | tray_model + ksni tray + Linux notifications with action + reminder logic; local folders (tar + ruzstd + age, manifest, L0/Dnn) | `src/tray_model.rs`, `src/platform/linux/{tray,notify}.rs`, `src/personal/local.rs` | `coder` |
-| **2** | net (client, throttle, segmented download, sidecars, resumable hash), queue (job/store/sched), resolvers (port resolve.go), verify (sums, rpgp detached/clear/xz, pins, stored-key pin, minisign, TOFU), public (versioned, budget, index, dry-run), catalog + keys moved in | `src/net/*`, `src/queue/*`, `src/resolve/*`, `src/verify/*`, `src/public/*`, `catalog.toml`, `keys/*` | `coder` (the resumable hash, midstate and checkpoint protocol go to `novel-coder` if `coder` reports trouble) |
-| 2 gate | Port public_test.go (rustls test server with a checked-in test cert). Kill mid-download and resume with no full re-hash (assert bytes read). Pause and cancel from a second process. Bad signature never becomes visible. TOFU change raises an alert. Budget refusal. `keep` pruning. **Differential test: rpgp vs gpgv on every enabled signed source and all 11 keyrings.** Bandwidth ≤ 80 Mbit/s with `ip -s link` | `tests/*` | `test-writer`; then `security-auditor` on net, verify and resolve |
+| **2** | net (client, throttle, segmented download, sidecars, resumable hash), queue (job/store/sched), resolvers, verify (sums, rpgp detached/clear/xz, pins, stored-key pin, minisign, TOFU), public (versioned, budget, index, dry-run), catalog + keys moved in | `src/net/*`, `src/queue/*`, `src/resolve/*`, `src/verify/*`, `src/public/*`, `catalog.toml`, `keys/*` | `coder` (the resumable hash, midstate and checkpoint protocol go to `novel-coder` if `coder` reports trouble) |
+| 2 gate | Public tests on a rustls test server with a checked-in test cert. Kill mid-download and resume with no full re-hash (assert bytes read). Pause and cancel from a second process. Bad signature never becomes visible. TOFU change raises an alert. Budget refusal. `keep` pruning. **Differential test: rpgp vs gpgv on every enabled signed source and all 11 keyrings.** Bandwidth ≤ 80 Mbit/s with `ip -s link` | `tests/*` | `test-writer`; then `security-auditor` on net, verify and resolve |
 | **3** | gix mirror + ureq `Http` impl (pipe thread for POST bodies); move personal fetch to gix; generation swap; Fedora, then Alpine, then Debian walkers; deb822 parser (proptest); catalog `kind="repo"` + the rsync replacements + the 3 dry-run fixes | `src/git/{mirror,http}.rs`, `src/mirror/*`, `catalog.toml` | `coder` for the walkers; `chore` for the catalog edits |
 | 3 gate | Fixture repos (tiny Fedora/Debian/Alpine trees, signed with test keys); a tampered file is rejected; interrupted generation resumes; `dnf --repofrompath` and `apt` (podman debian container) install from the mirror; personal again writes 0 new bundles via gix | | `test-writer`, `security-auditor` |
 | **4** | clone (tiers, FAT 4 GiB rule, no symlinks, kit.tar), sync_tree for replicas + drive watcher in the tray, scrub + par2, native bundle restore | `src/{clone,scrub}.rs`, `src/git/bundle.rs` | `coder` |
@@ -302,14 +314,13 @@ Every phase ends with `fmt`, `clippy -D warnings`, `test`, `cargo deny`, then a 
 |---|---|
 | **Windows OpenSSH has no ControlMaster** | Confirmed: Win32-OpenSSH issue #405 is still in the backlog, and the options are accepted but silently do nothing. So there is one touch (and PIN, with verify-required) per fetched repo. Mitigation: a GraphQL pre-check (one `gh api graphql` lists every repo's head/tag oids) means only changed repos get fetched, but the first run is still N touches. FIDO on Windows goes through webauthn.dll (Windows Hello UI, no askpass). It needs OpenSSH ≥ 8.9 (I believe Windows 11 ships 9.5; check `ssh -V`) and the `id_*_sk` key handle file on that machine (or `ssh-keygen -K` for a resident key). I haven't verified this on hardware |
 | **gix bundles** | No create and no read in gix 0.90 (crate-status). So: exec `git bundle create`, which means Windows personal backups need Git for Windows until the native writer lands. gix-pack's pack *output* exists but has no delta compression for loose objects; copied packed entries keep their deltas. Treat the native writer as experimental |
-| **age compatibility** | `identity.age` header: `-> scrypt … 18`. The age crate decrypts scrypt stanzas, but its default max work factor is derived from the machine, so set `set_max_work_factor(22)` explicitly (2^18 means 256 MiB, fine even on an RPi). Then `IdentityFile::from_buffer` takes age-keygen's comment lines. Encrypting to `age1…` X25519 follows the same v1 spec as Go age 1.3.1. The output is **not byte-identical** (random file key and ephemeral share) but **is interoperable both ways**. Gate 1a proves both directions against real files |
+| **age compatibility** | `identity.age` header: `-> scrypt … 18`. The age crate decrypts scrypt stanzas, but its default max work factor is derived from the machine, so set `set_max_work_factor(22)` explicitly (2^18 means 256 MiB, fine even on an RPi). Then `IdentityFile::from_buffer` takes age-keygen's comment lines. Encrypting to `age1…` X25519 follows the same v1 spec as the age CLI. The output is **not byte-identical** (random file key and ephemeral share) but **is interoperable both ways**. Gate 1a proves both directions against real files |
 | rpgp vs gpgv semantics | v3 or ancient keys in gnu-keyring.gpg, SHA-1 binding signatures, expiry and revocation handling, subkey choice by issuer fingerprint. Parse each key separately, skip and log the ones that don't parse, never fail the whole keyring. The phase-2 differential test against gpgv decides |
 | ring + rust-lld for aarch64-musl | This is the usual recipe, but not yet proven on this host. Phase 0 proves it. Fallback: `zig cc` from dnf as CC and linker |
 | Fedora repodata unsigned | Trust rests on the TLS metalink (weaker than Debian or Alpine). Packages carry RPM signatures that dnf checks on use. Native RPM header verification is open question 6 |
 | Alpine format drift | apk-tools v3 index and package formats may appear. Check the real v3.24 index at phase 3. The walker refuses unknown signature names |
 | Debian by-hash and apt expectations | Create by-hash links. The phase-3 apt container test catches gaps |
 | ruzstd at level 1 | Measured in phase 1b on 1.2 GB of source code: 282 MB, against 185 MB for `zstd -1` and 163 MB for `zstd -3` (about 50% and 70% bigger). Its encoder also panics on I/O errors, so `local.rs` holds them back. Restore of anything made by GNU zstd works |
-| Go status JSON | Go zero time `0001-01-01T00:00:00Z` and local offsets. Parse leniently. Writing adds fields but removes none |
 | Windows long paths, exFAT | std handles long paths. There are no hardlinks on exFAT/FAT, so copy instead (`keep` then costs full size) |
 | Payload-only throttling | Measured overhead of about 2–3%. Lower the default to 78 if 80 on the wire is a hard limit |
 
@@ -324,6 +335,6 @@ Supersedes the open questions of the original report.
   - `https`: a token obtained from the `gh` CLI (`gh auth token`), handed to git through a credential helper on stdin or a GIT_ASKPASS-style mechanism. The token never appears in argv, a URL, a log or a file.
   - Selected by `transport = "ssh" | "https"` in `config.toml` and overridden per run by `--transport`. Tray selection arrives in phase 1b.
 - **zstd:** `ruzstd`. **TLS roots:** the OS store with an embedded fallback (relevant from phase 2).
-- **Compatibility:** every code-archive path, unit name, lock name and on-disk format is kept, so the Go-era state is picked up with zero new bundles. Only the binary is named `preserver`.
-- **No host defaults in the repo:** owners and the primary drive uuid come from `~/.config/code-archive/config.toml` (example: `docs/config.example.toml`). Nothing personal (drive uuid, email) in source or docs.
+- **Names:** every path, unit name, lock name and on-disk format is preserver's own. Nothing from an earlier tool is read or migrated; backups it wrote still restore, because `restore` takes the file path and finds the locked key next to it (see §4).
+- **No host defaults in the repo:** owners and the primary drive uuid come from `~/.config/preserver/config.toml` (example: `docs/config.example.toml`). Nothing personal (drive uuid, email) in source or docs.
 - **License:** MIT OR Apache-2.0.

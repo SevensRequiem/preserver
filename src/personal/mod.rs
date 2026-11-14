@@ -7,6 +7,7 @@ use crate::paths::{NoDrive, Paths};
 use crate::{crypt, platform, status};
 use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::{Context, Result, anyhow, bail};
+use std::path::Path;
 
 pub(crate) fn run(
     paths: &mut Paths,
@@ -44,31 +45,29 @@ pub(crate) fn run(
     }
 }
 
-/// Creates the key pair. The locked private key goes to the drive and to home, and the recipient
-/// to home last: its presence is what marks the setup as done.
-fn write_keys(paths: &Paths, passphrase: SecretString) -> Result<()> {
+/// Stores a locked private key and its recipient. The locked key goes to the drive and to home,
+/// and the recipient to home last: its presence is what marks the setup as done.
+fn write_keys(paths: &Paths, locked: &[u8], recipient: &str) -> Result<()> {
     let dest = paths.gh_dest();
     let identities = [
         dest.join("identity.age"),
         paths.personal.join("identity.age"),
     ];
-    // A new key cannot open old backups, so an existing one is never replaced.
+    // A different key cannot open existing backups, so a stored one is never replaced.
     if let Some(existing) = identities.iter().find(|f| f.exists()) {
         bail!(
             "{} already exists; restore recipient.txt from it instead of creating a new key",
             existing.display()
         );
     }
-    let (locked, public) = crypt::generate(passphrase)?;
-    let public = format!("{public}\n");
     for file in &identities {
-        platform::write_private(file, &locked).with_context(|| file.display().to_string())?;
+        platform::write_private(file, locked).with_context(|| file.display().to_string())?;
     }
     for file in [
         dest.join("recipient.txt"),
         paths.personal.join("recipient.txt"),
     ] {
-        platform::write_private(&file, public.as_bytes())
+        platform::write_private(&file, recipient.as_bytes())
             .with_context(|| file.display().to_string())?;
     }
     println!(
@@ -79,7 +78,19 @@ fn write_keys(paths: &Paths, passphrase: SecretString) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn init(paths: &mut Paths, cfg: &Config) -> Result<()> {
+/// Takes over an existing locked identity after checking that the password opens it.
+fn import_keys(paths: &Paths, file: &Path, passphrase: SecretString) -> Result<()> {
+    let locked = std::fs::read(file).with_context(|| file.display().to_string())?;
+    let recipient = crypt::recipients_of(&locked, passphrase)?;
+    write_keys(paths, &locked, &recipient)
+}
+
+fn generate_keys(paths: &Paths, passphrase: SecretString) -> Result<()> {
+    let (locked, public) = crypt::generate(passphrase)?;
+    write_keys(paths, &locked, &format!("{public}\n"))
+}
+
+pub(crate) fn init(paths: &mut Paths, cfg: &Config, import: Option<&Path>) -> Result<()> {
     let recipient = paths.personal.join("recipient.txt");
     if recipient.exists() {
         bail!("already initialised ({})", recipient.display());
@@ -87,6 +98,9 @@ pub(crate) fn init(paths: &mut Paths, cfg: &Config) -> Result<()> {
     paths.mount(&cfg.primary_uuid)?;
     let ask = |prompt: &str| rpassword::prompt_password(prompt).map(SecretString::from);
     let passphrase = ask("Restore password: ").context("read the password")?;
+    if let Some(file) = import {
+        return import_keys(paths, file, passphrase);
+    }
     if passphrase.expose_secret().is_empty() {
         bail!("the password is empty");
     }
@@ -94,7 +108,7 @@ pub(crate) fn init(paths: &mut Paths, cfg: &Config) -> Result<()> {
     if passphrase.expose_secret() != again.expose_secret() {
         bail!("the passwords differ");
     }
-    write_keys(paths, passphrase)
+    generate_keys(paths, passphrase)
 }
 
 #[cfg(test)]
@@ -107,7 +121,7 @@ mod tests {
     fn init_writes_keys_that_open_a_backup() {
         let tmp = TempDir::new();
         let p = paths(tmp.path());
-        write_keys(&p, SecretString::from("pw".to_string())).unwrap();
+        generate_keys(&p, SecretString::from("pw".to_string())).unwrap();
 
         let on_drive = std::fs::read(p.gh_dest().join("identity.age")).unwrap();
         let at_home = std::fs::read(p.personal.join("identity.age")).unwrap();
@@ -147,9 +161,34 @@ mod tests {
                 p.personal.join("identity.age")
             };
             platform::write_private(&existing, b"old key").unwrap();
-            assert!(write_keys(&p, SecretString::from("pw".to_string())).is_err());
+            assert!(generate_keys(&p, SecretString::from("pw".to_string())).is_err());
             assert_eq!(std::fs::read(&existing).unwrap(), b"old key");
             assert!(!p.personal.join("recipient.txt").exists());
+        }
+    }
+
+    #[test]
+    fn import_keeps_the_key_and_derives_the_recipient() {
+        let tmp = TempDir::new();
+        let p = paths(tmp.path());
+        let (locked, public) = crypt::generate(SecretString::from("pw".to_string())).unwrap();
+        let src = tmp.path().join("identity.age");
+        std::fs::write(&src, &locked).unwrap();
+
+        let wrong = import_keys(&p, &src, SecretString::from("nope".to_string()));
+        assert!(wrong.is_err());
+        assert!(
+            !p.personal.join("identity.age").exists(),
+            "nothing stored on a bad password"
+        );
+
+        import_keys(&p, &src, SecretString::from("pw".to_string())).unwrap();
+        for dir in [p.gh_dest(), p.personal.clone()] {
+            assert_eq!(std::fs::read(dir.join("identity.age")).unwrap(), locked);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("recipient.txt")).unwrap(),
+                format!("{public}\n")
+            );
         }
     }
 

@@ -1,5 +1,5 @@
-# Install as ~/.config/code-archive/config.toml (Linux) or
-# %APPDATA%\code-archive\config.toml (Windows). The repo ships no host defaults.
+# Install as ~/.config/preserver/config.toml (Linux) or
+# %APPDATA%\preserver\config.toml (Windows). The repo ships no host defaults.
 
 # GitHub owners (users or orgs) whose repositories are backed up. Required.
 owners = ["your-github-user", "your-org"]
@@ -17,7 +17,7 @@ bandwidth_mbit = 80
 # Percent of the drive kept free by the public-archive budget (0 to 90).
 reserve_percent = 10
 
-# Local folders, each backed up to <drive>/code-archive/local-personal/<name>/YYYY-MM/ as a full
+# Local folders, each backed up to <drive>/preserver/local-personal/<name>/YYYY-MM/ as a full
 # L0.tar.zst.age once a month and a differential Dnn.tar.zst.age on every later run. The name is
 # letters, digits, ".", "_" and "-"; the path is absolute. Symlinks are stored as links, and
 # sockets, FIFOs and devices are left out. Repeat the block for more folders.

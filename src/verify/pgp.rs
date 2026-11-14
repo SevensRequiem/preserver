@@ -1,4 +1,4 @@
-//! `OpenPGP` signature checks on rpgp, in place of the Go tool's `gpgv`.
+//! `OpenPGP` signature checks on rpgp.
 //!
 //! The verdict follows what `gpgv` reports as VALIDSIG with a zero exit: every signature in the
 //! file must verify under a key of the keyring, an expired key still counts (upstreams keep
@@ -483,7 +483,7 @@ mod tests {
     /// Name, keyring, signature, data.
     type Case<'a> = (&'a str, Vec<u8>, Vec<u8>, &'a [u8]);
 
-    /// gpgv's verdict the way the Go tool read it: exit status zero and a VALIDSIG line.
+    /// gpgv's verdict: exit status zero and a VALIDSIG line.
     fn gpgv(dir: &Path, ring: &[u8], sig: &[u8], data: &[u8]) -> bool {
         let (r, s, d) = (dir.join("ring.gpg"), dir.join("f.sig"), dir.join("f"));
         std::fs::write(&r, ring).unwrap();

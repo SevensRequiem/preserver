@@ -1,6 +1,6 @@
 use crate::config::{Config, Transport, load_drives};
 use crate::paths::Paths;
-use crate::{migrate, personal, platform, public, queue};
+use crate::{personal, platform, public, queue};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -21,8 +21,12 @@ pub enum Tier {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create the age key (asks for the restore password)
-    Init,
+    /// Create the age key (asks for the restore password), or take over an existing one
+    Init {
+        /// A passphrase-locked identity.age to copy instead of generating a new key
+        #[arg(long, value_name = "IDENTITY_AGE")]
+        import: Option<PathBuf>,
+    },
     /// Back up GitHub repositories and local folders
     Personal {
         #[arg(long)]
@@ -65,12 +69,6 @@ pub enum Command {
     Drives,
     /// Mount the backup drive and open the archive folder
     Open,
-    /// Move gh-backup state and the drive layout to code-archive
-    Migrate {
-        /// Print the steps only
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Run the tray icon
     Tray,
     /// Install scheduled tasks (Windows)
@@ -158,9 +156,9 @@ fn load() -> Result<(Paths, Config)> {
 /// Returns the failure of the subcommand, or "not implemented yet" for the ones of later phases.
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => {
+        Command::Init { import } => {
             let (mut paths, cfg) = load()?;
-            personal::init(&mut paths, &cfg)
+            personal::init(&mut paths, &cfg, import.as_deref())
         }
         Command::Personal {
             local_only,
@@ -188,13 +186,6 @@ pub fn run(cli: Cli) -> Result<()> {
             let archive = paths.archive();
             platform::private_dir_all(&archive)?;
             platform::open_path(&archive)
-        }
-        Command::Migrate { dry_run } => {
-            let (mut paths, cfg) = load()?;
-            if !dry_run {
-                paths.mount(&cfg.primary_uuid)?;
-            }
-            migrate::migrate(&paths, dry_run, &mut std::io::stdout())
         }
         Command::Tray => platform::run_tray(&Paths::from_env()?),
         Command::Queue { action } => queue::cli(&Paths::from_env()?, action),

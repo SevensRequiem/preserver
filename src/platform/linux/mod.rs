@@ -34,7 +34,7 @@ pub(crate) fn open_path(path: &Path) -> Result<()> {
 /// The options come first: everything the caller appends is git's.
 pub(crate) fn ssh_command(runtime: &Path) -> Command {
     let mut control = OsString::from("ControlPath=");
-    control.push(runtime.join("code-archive-ssh-%C"));
+    control.push(runtime.join("preserver-ssh-%C"));
     let mut cmd = Command::new("/usr/bin/ssh");
     cmd.args(["-o", "ControlMaster=auto", "-o"])
         .arg(control)
@@ -93,7 +93,7 @@ mod tests {
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=/run/user/1000/code-archive-ssh-%C",
+                "ControlPath=/run/user/1000/preserver-ssh-%C",
                 "-o",
                 "ControlPersist=60",
                 "-p",

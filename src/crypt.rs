@@ -7,7 +7,7 @@ use std::path::Path;
 
 pub(crate) type Identities = Vec<Box<dyn Identity + Send + Sync>>;
 
-/// Go age writes 18 and refuses more than 22 without a flag; the recovery kit decrypts with Go age.
+/// 18 is age's own default for passphrase files; 22 is the most `unlock` accepts when reading.
 const SCRYPT_WORK_FACTOR: u8 = 18;
 const SCRYPT_MAX_WORK_FACTOR: u8 = 22;
 
@@ -56,6 +56,24 @@ pub(crate) fn unlock(locked: &[u8], passphrase: SecretString) -> Result<Identiti
         .read_to_string(&mut text)?;
     let text = SecretString::from(text);
     Ok(IdentityFile::from_buffer(text.expose_secret().as_bytes())?.into_identities()?)
+}
+
+/// Opens a locked identity file to prove the passphrase fits, and returns the `recipient.txt`
+/// text for the keys inside.
+pub(crate) fn recipients_of(locked: &[u8], passphrase: SecretString) -> Result<String> {
+    let mut key = scrypt::Identity::new(passphrase);
+    key.set_max_work_factor(SCRYPT_MAX_WORK_FACTOR);
+    let mut text = String::new();
+    Decryptor::new_buffered(locked)?
+        .decrypt(std::iter::once(&key as &dyn Identity))
+        .context("wrong passphrase, or not a passphrase-locked age file")?
+        .read_to_string(&mut text)?;
+    let text = SecretString::from(text);
+    let mut out = Vec::new();
+    IdentityFile::from_buffer(text.expose_secret().as_bytes())?
+        .write_recipients_file(&mut out)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(String::from_utf8(out)?)
 }
 
 /// Generates a key pair and returns the passphrase-locked identity file and the public recipient.
@@ -118,6 +136,16 @@ mod tests {
             .read_to_end(&mut plain)
             .unwrap();
         assert_eq!(plain, b"payload");
+    }
+
+    #[test]
+    fn recipients_come_from_the_locked_identity() {
+        let (locked, public) = generate(secret("pw")).unwrap();
+        assert_eq!(
+            recipients_of(&locked, secret("pw")).unwrap(),
+            format!("{public}\n")
+        );
+        assert!(recipients_of(&locked, secret("nope")).is_err());
     }
 
     #[test]

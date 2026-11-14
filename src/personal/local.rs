@@ -580,7 +580,7 @@ fn read_manifest(entries: &mut Entries) -> Result<Manifest> {
     let first = entries.next().context("the archive is empty")??;
     if first.path_bytes().as_ref() != MANIFEST.as_bytes() {
         bail!(
-            "no manifest: an archive made by the Go tool is restored with \
+            "no manifest: an archive that preserver did not write is restored with \
              'age -d FILE | zstd -d | tar -x --listed-incremental=/dev/null -C DIR'"
         );
     }
@@ -1308,7 +1308,7 @@ mod tests {
             raw_entry(&mut tar, "./", tar::EntryType::Directory, "", b"");
             tar.into_inner().unwrap()
         };
-        let file = s.tmp.path().join("go.tar.zst.age");
+        let file = s.tmp.path().join("foreign.tar.zst.age");
         let mut sealed = crypt::encrypt(&s.recipients, File::create(&file).unwrap()).unwrap();
         sealed
             .write_all(&ruzstd::encoding::compress_to_vec(
