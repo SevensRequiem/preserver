@@ -70,9 +70,65 @@ fn bad_config_is_rejected_before_anything_runs() {
 #[test]
 fn later_phases_say_so() {
     let root = fresh_dir("phases");
+    let out = preserver(&root).arg("public").output().unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("phase 2"), "{}", stderr(&out));
+}
+
+#[test]
+fn tray_without_a_session_bus_fails_cleanly() {
+    // XDG_RUNTIME_DIR is the test's own, so there is no bus socket and no real tray is touched.
+    let root = fresh_dir("tray");
     let out = preserver(&root).arg("tray").output().unwrap();
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("phase 1b"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("start the tray"), "{}", stderr(&out));
+}
+
+fn local_status(root: &Path) -> String {
+    std::fs::read_to_string(root.join("home/.local/state/code-archive/status/local.json")).unwrap()
+}
+
+#[test]
+fn local_only_without_folders_succeeds_without_the_drive() {
+    let root = fresh_dir("nolocal");
+    write_config(&root);
+    let personal = root.join("home/.config/code-archive/personal");
+    std::fs::create_dir_all(&personal).unwrap();
+    std::fs::write(personal.join("recipient.txt"), "age1x\n").unwrap();
+    let out = preserver(&root)
+        .args(["personal", "--local-only"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = local_status(&root);
+    assert!(status.contains(r#""error":"""#), "{status}");
+    assert!(!status.contains(r#""last_ok":"0001"#), "{status}");
+    assert!(
+        !root
+            .join("home/.local/state/code-archive/status/github.json")
+            .exists(),
+        "--local-only leaves GitHub alone"
+    );
+}
+
+#[test]
+fn nightly_local_run_skips_quietly_when_the_drive_is_absent() {
+    let root = fresh_dir("nodrive");
+    write_config(&root);
+    let cfg = root.join("home/.config/code-archive");
+    let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+    text.push_str("[[local]]\nname = \"docs\"\npath = \"/nonexistent\"\n");
+    std::fs::write(cfg.join("config.toml"), text).unwrap();
+    std::fs::create_dir_all(cfg.join("personal")).unwrap();
+    std::fs::write(cfg.join("personal/recipient.txt"), "age1x\n").unwrap();
+    let out = preserver(&root)
+        .args(["personal", "--local-only"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("skipped"), "{}", stderr(&out));
+    let status = local_status(&root);
+    assert!(status.contains("backup drive is not connected"), "{status}");
 }
 
 #[test]

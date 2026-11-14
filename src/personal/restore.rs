@@ -1,12 +1,13 @@
 use crate::crypt::{self, Identities};
 use crate::paths::Paths;
+use crate::personal::local;
 use crate::platform;
 use age::secrecy::SecretString;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn check_target(dir: &Path) -> Result<()> {
+pub(crate) fn check_target(dir: &Path) -> Result<()> {
     match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
@@ -76,10 +77,6 @@ pub(crate) fn restore_bundle(identities: &Identities, file: &Path, dir: &Path) -
 }
 
 pub(crate) fn run(paths: &Paths, file: &Path, dir: &Path) -> Result<()> {
-    let name = file.to_string_lossy();
-    if name.ends_with(".tar.zst.age") {
-        bail!("local-folder archives are not implemented yet (phase 1b)");
-    }
     check_target(dir)?;
     let on_drive = paths.gh_dest().join("identity.age");
     let id_file = if !paths.mnt.as_os_str().is_empty() && on_drive.exists() {
@@ -93,8 +90,21 @@ pub(crate) fn run(paths: &Paths, file: &Path, dir: &Path) -> Result<()> {
             .context("read the password")?,
     );
     let identities = crypt::unlock(&locked, passphrase)?;
-    restore_bundle(&identities, file, dir)?;
+    let mut skipped = 0;
+    if file.to_string_lossy().ends_with(".tar.zst.age") {
+        let list = local::restore(&identities, file, dir)
+            .with_context(|| format!("restore stopped; {} is incomplete", dir.display()))?;
+        for entry in &list {
+            eprintln!("skipped: {entry}");
+        }
+        skipped = list.len();
+    } else {
+        restore_bundle(&identities, file, dir)?;
+    }
     println!("Restored into {}", dir.display());
+    if skipped > 0 {
+        bail!("{skipped} entries were not restored (see the skipped lines above)");
+    }
     Ok(())
 }
 

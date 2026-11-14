@@ -1,10 +1,14 @@
 mod fs;
+mod notify;
+mod tray;
 mod udisks;
 
 pub(crate) use fs::{
     is_mounted, link_self, private_dir_all, private_dir_new, private_file, private_file_new,
-    restrict_dir, sync_dir, sync_fs,
+    restrict_dir, set_mode, symlink, sync_dir, sync_fs,
 };
+pub(crate) use notify::notify;
+pub(crate) use tray::run_tray;
 pub(crate) use udisks::{list_filesystems, mount};
 
 use anyhow::{Context, Result, bail};
@@ -14,17 +18,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const ASKPASS: &str = "/usr/bin/ksshaskpass";
-
-pub(crate) fn notify(urgent: bool, title: &str, body: &str) {
-    let mut cmd = Command::new("notify-send");
-    cmd.args(["-a", "Code archive", "-i", "folder-git"]);
-    if urgent {
-        cmd.args(["-u", "critical"]);
-    }
-    if let Err(e) = cmd.arg("--").arg(title).arg(body).status() {
-        tracing::debug!("notify-send: {e}");
-    }
-}
 
 pub(crate) fn open_path(path: &Path) -> Result<()> {
     let status = Command::new("xdg-open")

@@ -74,6 +74,15 @@ pub(crate) fn try_lock(file: &Path) -> Result<Option<File>> {
     }
 }
 
+/// Whether a running job holds the lock right now.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the Windows tray arrives in phase 5")
+)]
+pub(crate) fn lock_held(file: &Path) -> bool {
+    matches!(try_lock(file), Ok(None))
+}
+
 /// Runs `f` under the job's lock and records the outcome in its status file.
 pub(crate) fn job(
     paths: &mut Paths,

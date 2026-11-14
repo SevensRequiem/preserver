@@ -261,8 +261,9 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 
 **Local-folder format (new, because the `tar` crate can't write GNU `--listed-incremental` dumps):**
 - Same names: `<name>/YYYY-MM/{L0,Dnn}.tar.zst.age`.
-- The first entry is `.preserver/manifest.tsv`, listing every path present plus the base. Dnn holds the files changed against the L0 index (size, mtime, ctime on unix).
-- The index lives in `~/.local/state/code-archive/local/<name>/YYYY-MM.L0.idx`.
+- The first entry is `.preserver/manifest.tsv`: a header line (`preserver-manifest`, version, this archive's id, the id of its level 0 or `-`) and one line per path present (kind, mode, size, mtime ns, ctime ns, escaped path). Dnn holds the entries whose line differs from the L0 index.
+- The index is the L0's manifest, kept in `~/.local/state/code-archive/local/<name>/YYYY-MM.L0.idx`. A level 0 whose index is gone gets no differentials: the month's folder has to be moved aside. That includes a month the Go tool started.
+- Restore takes modes and times from the manifest, never writes through a symlink, and skips (and reports, with a non-zero exit) symlinks whose target is absolute, climbs above the target directory, or has a `..` after a plain name (a link it passes through could lead out).
 - GNU tar can still extract the archives, just without applying deletions.
 
 ## 5. Phases and steps
@@ -307,7 +308,7 @@ Every phase ends with `fmt`, `clippy -D warnings`, `test`, `cargo deny`, then a 
 | Fedora repodata unsigned | Trust rests on the TLS metalink (weaker than Debian or Alpine). Packages carry RPM signatures that dnf checks on use. Native RPM header verification is open question 6 |
 | Alpine format drift | apk-tools v3 index and package formats may appear. Check the real v3.24 index at phase 3. The walker refuses unknown signature names |
 | Debian by-hash and apt expectations | Create by-hash links. The phase-3 apt container test catches gaps |
-| ruzstd at level 1 | Local archives come out maybe 5–10% bigger than zstd -3. Restore of anything made by GNU zstd works |
+| ruzstd at level 1 | Measured in phase 1b on 1.2 GB of source code: 282 MB, against 185 MB for `zstd -1` and 163 MB for `zstd -3` (about 50% and 70% bigger). Its encoder also panics on I/O errors, so `local.rs` holds them back. Restore of anything made by GNU zstd works |
 | Go status JSON | Go zero time `0001-01-01T00:00:00Z` and local offsets. Parse leniently. Writing adds fields but removes none |
 | Windows long paths, exFAT | std handles long paths. There are no hardlinks on exFAT/FAT, so copy instead (`keep` then costs full size) |
 | Payload-only throttling | Measured overhead of about 2–3%. Lower the default to 78 if 80 on the wire is a hard limit |

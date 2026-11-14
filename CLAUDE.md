@@ -38,3 +38,14 @@ N is 90% of cores. In the Claude sandbox set `CARGO_HOME=$TMPDIR/cargo` and `CAR
 - `migrate` is kept (ported from Go) although the design table lists it as dropped.
 - A test must not check that a job lock is free again after dropping it: a child another test thread is spawning shares the flock until it execs.
 - In the Claude sandbox cargo cannot run inside the repo (it walks up to an unreadable `~/.cargo/config.toml`): rsync the tree to `$TMPDIR/pbuild` and build there; `rustfmt --edition 2024 src/lib.rs src/main.rs tests/cli.rs` works in place. The system D-Bus is blocked there too, so `drives`, `open` and mounting are only verifiable outside it.
+
+## Phase 1b notes
+
+- `tray_model.rs` is the whole tray logic as a pure function (status files + lock state in, icon/tooltip/menu labels out). `platform/linux/tray.rs` only maps it onto ksni and owns one loop: menu clicks and helper threads send it a `Cmd`, it refreshes hourly, on every command and when the menu opens. ksni re-registers by itself when the watcher restarts (`service.rs`, `NameOwnerChanged`).
+- "Back up personal now" runs `systemctl --user start code-archive-personal.service` and waits for it on a thread, as Go did: the exit status is the only sign of a run that died before writing its status file.
+- The transport menu edits the `transport` line of `config.toml` in place (`config::with_transport`) and re-parses the result: every other setting must be unchanged or nothing is written. No TOML writer, so comments survive.
+- Notifications go over zbus (`platform/linux/notify.rs`), no `notify-send`. The overdue reminder is shown once per day per tray process, not persisted, as in Go.
+- Local folders (`personal/local.rs`): tar on a thread -> pipe -> ruzstd -> age -> `.tmp`, fsync, rename, fsync dir. ruzstd only has its fastest level and unwraps I/O results, hence the `Held` adapters. Format details are in `docs/design.md` section 4.
+- `restore` of a `Dnn` reads the `L0.tar.zst.age` next to it; of an `L0`, just that. Go-era `.tar.zst.age` files have no manifest and are restored with GNU tar (the error says how).
+- Cut-over: a month whose L0 the Go tool wrote has no `.idx`, so `personal --local-only` fails for that folder until its month directory is moved aside or the month ends.
+- The sandbox blocks unix sockets: the tray is checked outside it against a private `dbus-daemon --config-file` (no service dirs, or Notify hangs on activation) with HOME and XDG_RUNTIME_DIR in a scratch dir. Never test against the session bus.

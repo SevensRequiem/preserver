@@ -1,11 +1,12 @@
 pub(crate) mod github;
+pub(crate) mod local;
 pub(crate) mod restore;
 
 use crate::config::{Config, Transport};
-use crate::paths::Paths;
+use crate::paths::{NoDrive, Paths};
 use crate::{crypt, platform, status};
 use age::secrecy::{ExposeSecret, SecretString};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub(crate) fn run(
     paths: &mut Paths,
@@ -13,24 +14,34 @@ pub(crate) fn run(
     local_only: bool,
     transport: Transport,
 ) -> Result<()> {
-    if local_only {
-        bail!("local folders are not implemented yet (phase 1b)");
-    }
     let recipient = paths.personal.join("recipient.txt");
     if std::fs::metadata(&recipient).map_or(true, |m| m.len() == 0) {
         bail!("run 'preserver init' first");
     }
-    let result = status::job(paths, "github", |p| github::run(p, cfg, transport));
-    let result = result.and_then(|()| {
-        if cfg.local.is_empty() {
-            return Ok(());
+    let github = if local_only {
+        Ok(())
+    } else {
+        status::job(paths, "github", |p| github::run(p, cfg, transport))
+    };
+    // The folders are backed up even when GitHub failed: the two have nothing in common.
+    let local = status::job(paths, "local", |p| local::run(p, cfg));
+    let result = match (github, local) {
+        (Err(github), Err(local)) => Err(anyhow!("{github:#}; local folders: {local:#}")),
+        (github, local) => github.and(local),
+    };
+    match result {
+        // The nightly run finds the drive unplugged most days: no notification for that. The failure
+        // is still in the status file, so the tray shows it until a run finds the drive.
+        Err(e) if local_only && e.is::<NoDrive>() => {
+            tracing::warn!("local backup skipped: {e:#}");
+            Ok(())
         }
-        bail!("local folders are configured but not implemented yet (phase 1b); they were not backed up")
-    });
-    if let Err(e) = &result {
-        platform::notify(true, "Personal backup failed", &format!("{e:#}"));
+        Err(e) => {
+            platform::notify(true, "Personal backup failed", &format!("{e:#}"));
+            Err(e)
+        }
+        Ok(()) => Ok(()),
     }
-    result
 }
 
 /// Creates the key pair. The locked private key goes to the drive and to home, and the recipient

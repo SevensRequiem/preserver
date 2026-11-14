@@ -31,7 +31,7 @@ pub enum Command {
         #[arg(long, value_enum)]
         transport: Option<Transport>,
     },
-    /// Decrypt a .bundle.age into DIR
+    /// Restore a .bundle.age (git repo) or a .tar.zst.age (local folder; a Dnn needs its L0 next to it) into DIR. Symlinks with an absolute target or one that climbs out of DIR are not recreated: they are listed and the exit status is non-zero
     Restore { file: PathBuf, dir: PathBuf },
     /// Mirror the public archive sets
     Public {
@@ -196,7 +196,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             migrate::migrate(&paths, dry_run, &mut std::io::stdout())
         }
-        Command::Tray => bail!("not implemented yet (phase 1b)"),
+        Command::Tray => platform::run_tray(&Paths::from_env()?),
         Command::Public { .. } | Command::Queue { .. } => bail!("not implemented yet (phase 2)"),
         Command::Clone { .. } | Command::Verify { .. } => bail!("not implemented yet (phase 4)"),
         Command::Install => bail!("not implemented yet (phase 5)"),

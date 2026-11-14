@@ -59,6 +59,22 @@ pub(crate) fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the linux fn; NTFS modes come in phase 5"
+)]
+pub(crate) fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn symlink(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub(crate) fn run_tray(_paths: &crate::paths::Paths) -> Result<()> {
+    Err(unsupported().into())
+}
+
 pub(crate) fn ssh_master(_runtime: &Path) -> io::Result<()> {
     Err(unsupported())
 }

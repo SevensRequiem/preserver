@@ -11,6 +11,15 @@ pub enum Transport {
     Https,
 }
 
+impl Transport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Https => "https",
+        }
+    }
+}
+
 /// A filesystem id as udisks reports it: hex digits and dashes (ext4 UUID, FAT `XXXX-XXXX`, NTFS serial).
 /// The spelling from the config is kept, because it names the mount point and the drives.d file.
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +146,78 @@ impl Config {
         }
         Ok(c)
     }
+}
+
+/// Returns the config text with the top-level `transport` set and every other byte as it was.
+/// Only that one line is edited (no TOML writer, which would drop the comments), so the result
+/// is re-parsed: it must read as the new transport with all other settings unchanged.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the Windows tray arrives in phase 5")
+)]
+pub(crate) fn with_transport(text: &str, transport: Transport) -> Result<String> {
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let top = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let is_key = |l: &String| {
+        l.trim_start()
+            .strip_prefix("transport")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let assignment = format!("transport = \"{}\"", transport.as_str());
+    if let Some(line) = lines[..top].iter_mut().find(|l| is_key(l)) {
+        let (key, rest) = line.split_once('=').unwrap_or_default();
+        let value = rest.trim_start();
+        let after = value
+            .chars()
+            .next()
+            .filter(|q| matches!(q, '"' | '\''))
+            .and_then(|q| value[1..].split_once(q))
+            .map(|(_, after)| after)
+            .context("the transport line in config.toml is not a plain string")?;
+        *line = format!("{key}= \"{}\"{after}", transport.as_str());
+    } else {
+        // After the last top-level key, so a comment block above the first table stays with it.
+        let at = lines[..top]
+            .iter()
+            .rposition(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .map_or(0, |i| i + 1);
+        if at > 0 && !lines[at - 1].ends_with('\n') {
+            lines[at - 1].push('\n');
+        }
+        lines.insert(at, format!("{assignment}\n"));
+    }
+    let new = lines.concat();
+
+    let others = |text: &str| -> Result<toml::Table> {
+        let mut table: toml::Table = toml::from_str(text)?;
+        table.remove("transport");
+        Ok(table)
+    };
+    if Config::parse(&new).ok().map(|c| c.transport) != Some(transport)
+        || others(text)? != others(&new)?
+    {
+        bail!("cannot set the transport without touching other settings; edit config.toml by hand");
+    }
+    Ok(new)
+}
+
+/// Writes the transport choice to `config.toml` in `dir`.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the Windows tray arrives in phase 5")
+)]
+pub(crate) fn save_transport(dir: &Path, transport: Transport) -> Result<()> {
+    // The file may be a symlink into a dotfiles checkout: the rename must replace its target.
+    let file = std::fs::canonicalize(dir.join("config.toml"))?;
+    let text = std::fs::read_to_string(&file)?;
+    let new = with_transport(&text, transport)?;
+    if new != text {
+        crate::platform::write_private(&file, new.as_bytes())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +361,109 @@ mod tests {
         for (name, text) in cases {
             assert!(Config::parse(&text).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn transport_edit_keeps_everything_else() {
+        let full = format!(
+            "# header comment\nowners = [\"a\"] # mine\n{UUID}\n# how to reach GitHub\n  transport = 'ssh'   # was ssh\nbandwidth_mbit = 5\n\n# folders\n[[local]]\nname = \"x\"\npath = \"/x\"\n"
+        );
+        let cases = [
+            (
+                "replaces the value, keeps indent and comment",
+                full.clone(),
+                full.replace(
+                    "transport = 'ssh'   # was ssh",
+                    "transport = \"https\"   # was ssh",
+                ),
+            ),
+            (
+                "inserts after the last top-level key",
+                format!(
+                    "owners = [\"a\"]\n{UUID}\n# folders\n[[local]]\nname = \"x\"\npath = \"/x\"\n"
+                ),
+                format!(
+                    "owners = [\"a\"]\n{UUID}transport = \"https\"\n\n# folders\n[[local]]\nname = \"x\"\npath = \"/x\"\n"
+                ),
+            ),
+            (
+                "inserts when the file has no final newline",
+                "owners = []\nprimary_uuid = \"0123-abcd\"".to_string(),
+                "owners = []\nprimary_uuid = \"0123-abcd\"\ntransport = \"https\"\n".to_string(),
+            ),
+            (
+                "a transport key inside a table is not the setting",
+                format!("owners = []\n{UUID}[extra]\ntransport = \"ssh\"\n"),
+                format!("owners = []\n{UUID}transport = \"https\"\n[extra]\ntransport = \"ssh\"\n"),
+            ),
+            (
+                "multi-line array before it",
+                format!("owners = [\n  \"a\",\n  \"b\",\n]\n{UUID}transport=\"ssh\"\n"),
+                format!("owners = [\n  \"a\",\n  \"b\",\n]\n{UUID}transport= \"https\"\n"),
+            ),
+        ];
+        for (name, before, want) in cases {
+            let got = with_transport(&before, Transport::Https).unwrap();
+            assert_eq!(got, want, "{name}");
+            assert_eq!(
+                Config::parse(&got).unwrap().transport,
+                Transport::Https,
+                "{name}"
+            );
+            assert_eq!(
+                with_transport(&got, Transport::Https).unwrap(),
+                got,
+                "{name}: setting it again changes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_edit_refuses_what_it_cannot_do_safely() {
+        let cases = [
+            ("invalid config", "owners = [\n".to_string()),
+            ("missing required keys", "bandwidth_mbit = 1\n".to_string()),
+            (
+                "value is not a string",
+                format!("owners = []\n{UUID}transport = 5\n"),
+            ),
+            (
+                "the line sits inside a multi-line string",
+                format!("owners = []\n{UUID}note = \"\"\"\ntransport = \"ssh\"\n\"\"\"\n"),
+            ),
+        ];
+        for (name, text) in cases {
+            assert!(with_transport(&text, Transport::Https).is_err(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_transport_rewrites_the_file_behind_a_symlink() {
+        let tmp = TempDir::new();
+        let real = tmp.path().join("dotfiles/config.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let text = format!("# mine\nowners = [\"a\"]\n{UUID}reserve_percent = 20\n");
+        std::fs::write(&real, &text).unwrap();
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        std::os::unix::fs::symlink(&real, cfg.join("config.toml")).unwrap();
+
+        save_transport(&cfg, Transport::Https).unwrap();
+        assert!(cfg.join("config.toml").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            format!("{text}transport = \"https\"\n")
+        );
+        let c = Config::load(&cfg).unwrap();
+        assert_eq!((c.transport, c.reserve_percent), (Transport::Https, 20));
+
+        save_transport(&cfg, Transport::Ssh).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            format!("{text}transport = \"ssh\"\n")
+        );
+        assert!(save_transport(&tmp.path().join("absent"), Transport::Ssh).is_err());
     }
 
     #[test]

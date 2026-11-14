@@ -3,6 +3,16 @@ use crate::platform;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+/// The error of a failed mount; the nightly local run treats it as "skip", not as a failure.
+#[derive(Debug)]
+pub(crate) struct NoDrive(String);
+
+impl std::fmt::Display for NoDrive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backup drive is not connected ({})", self.0)
+    }
+}
+
 /// Every name here is the Go code-archive layout, so existing state is picked up as is.
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
@@ -11,6 +21,7 @@ pub(crate) struct Paths {
     pub drives_d: PathBuf,
     pub github: PathBuf,
     pub status: PathBuf,
+    pub local_state: PathBuf,
     pub mirrors: PathBuf,
     pub runtime: PathBuf,
     pub mnt: PathBuf,
@@ -39,6 +50,7 @@ impl Paths {
             drives_d: cfg.join("code-archive/drives.d"),
             github: state.join("code-archive/github"),
             status: state.join("code-archive/status"),
+            local_state: state.join("code-archive/local"),
             mirrors: cache.join("code-archive/mirrors"),
             old_cfg: cfg.join("gh-backup"),
             old_state: state.join("gh-backup"),
@@ -62,6 +74,10 @@ impl Paths {
         self.archive().join("github-repos-personal")
     }
 
+    pub(crate) fn local_dest(&self) -> PathBuf {
+        self.archive().join("local-personal")
+    }
+
     pub(crate) fn status_file(&self, job: &str) -> PathBuf {
         self.status.join(format!("{job}.json"))
     }
@@ -74,8 +90,7 @@ impl Paths {
     /// it may differ from the expected place (udisks prefers the label), and another device can
     /// sit at the expected place.
     pub(crate) fn mount(&mut self, id: &DriveId) -> Result<()> {
-        self.mnt =
-            platform::mount(id).with_context(|| format!("backup drive is not connected ({id})"))?;
+        self.mnt = platform::mount(id).map_err(|e| e.context(NoDrive(id.to_string())))?;
         Ok(())
     }
 }
@@ -137,6 +152,16 @@ mod tests {
                 "gh_dest",
                 p.gh_dest(),
                 format!("{MNT}/code-archive/github-repos-personal"),
+            ),
+            (
+                "local_state",
+                p.local_state.clone(),
+                "/home/u/.local/state/code-archive/local".into(),
+            ),
+            (
+                "local_dest",
+                p.local_dest(),
+                format!("{MNT}/code-archive/local-personal"),
             ),
             (
                 "old_cfg",
