@@ -1,11 +1,97 @@
+use crate::catalog::valid_name;
 use crate::config::DriveId;
+use anyhow::{Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobKind {
-    Set { set: String },
+    Set {
+        set: String,
+    },
+    /// `preserver copy`: the archive from the primary (`Job::drive`) to `target`.
+    Copy {
+        target: Target,
+        /// Resolved: catalog sets, `personal`, `kit`.
+        sets: Vec<String>,
+        /// The most the copy may take on the target, in bytes.
+        #[serde(default)]
+        size: Option<u64>,
+        /// The `copy.toml` rule that made the job.
+        #[serde(default)]
+        rule: Option<String>,
+    },
+}
+
+/// Where a copy goes: a drive (by filesystem id, wherever it is mounted) or a plain directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum Target {
+    Drive {
+        id: DriveId,
+        /// Relative to the drive's mount point; empty for its root.
+        #[serde(default)]
+        subdir: String,
+        /// Shown to people only; the id decides.
+        #[serde(default)]
+        label: String,
+    },
+    Dir {
+        path: PathBuf,
+    },
+}
+
+impl Target {
+    /// One key per place, so a second `copy` to it reuses its rule and job.
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Self::Drive { id, subdir, .. } => format!("drive:{}/{subdir}", id.key()),
+            Self::Dir { path } => format!("dir:{}", path.display()),
+        }
+    }
+
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Self::Drive { id, subdir, label } => {
+                let base = if label.is_empty() {
+                    id.to_string()
+                } else {
+                    label.clone()
+                };
+                if subdir.is_empty() {
+                    base
+                } else {
+                    format!("{base}/{subdir}")
+                }
+            }
+            Self::Dir { path } => path.display().to_string(),
+        }
+    }
+
+    /// Job files and `copy.toml` can be edited by hand: a subdir must stay on its drive.
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Drive { subdir, label, .. } => {
+                let ok = subdir.is_empty()
+                    || Path::new(subdir).components().all(
+                        |c| matches!(c, Component::Normal(n) if n.to_str().is_some_and(valid_name)),
+                    );
+                if !ok {
+                    bail!("bad subdirectory {subdir:?}: relative names only, no '..'");
+                }
+                if label.chars().any(char::is_control) {
+                    bail!("bad label {label:?}");
+                }
+            }
+            Self::Dir { path } if !path.is_absolute() => {
+                bail!("{} is not an absolute path", path.display());
+            }
+            Self::Dir { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 /// Which daemon lane runs a job. A lane resets, applies and saves only its own jobs, so two
@@ -13,12 +99,14 @@ pub(crate) enum JobKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lane {
     Download,
+    Copy,
 }
 
 impl JobKind {
     pub(crate) fn lane(&self) -> Lane {
         match self {
             Self::Set { .. } => Lane::Download,
+            Self::Copy { .. } => Lane::Copy,
         }
     }
 }

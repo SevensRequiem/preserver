@@ -3,7 +3,7 @@ use crate::config::{self, Config, Transport};
 use crate::paths::Paths;
 use crate::queue::Store;
 use crate::status::{Status, lock_held};
-use crate::tray_model::{Inputs, Job, Model, model};
+use crate::tray_model::{CopyItem, Inputs, Job, Model, model};
 use anyhow::{Context, Result};
 use ksni::blocking::TrayMethods;
 use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
@@ -23,6 +23,9 @@ enum Cmd {
     Transport(Transport),
     /// Pause (true) or resume the whole queue through `all.ctl`.
     QueuePause(bool),
+    /// Cancel a copy job, or retry a stopped one, through its `.ctl`.
+    CopyCancel(String),
+    CopyRetry(String),
     Quit,
 }
 
@@ -156,6 +159,7 @@ impl ksni::Tray for Tray {
                 .into(),
             );
         }
+        items.extend(m.copies.iter().map(copy_menu));
         items.push(MenuItem::Separator);
         if let Some(current) = m.transport {
             let group = RadioGroup {
@@ -296,8 +300,59 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
                     tracing::error!("pause the queue: {e:#}");
                 }
             }
+            Ok(Cmd::CopyCancel(id)) => {
+                let store = Store::new(paths.queue.clone());
+                if let Err(e) = store.edit_control(Some(&id), |c| c.cancel = true) {
+                    tracing::error!("cancel copy {id}: {e:#}");
+                }
+            }
+            Ok(Cmd::CopyRetry(id)) => {
+                let store = Store::new(paths.queue.clone());
+                let retry = store.edit_control(Some(&id), |c| {
+                    c.retry += 1;
+                    c.pause = false;
+                });
+                if let Err(e) = retry {
+                    tracing::error!("retry copy {id}: {e:#}");
+                }
+            }
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+/// A copy job's entry: its line, and cancel and retry under it.
+fn copy_menu(c: &CopyItem) -> MenuItem<Tray> {
+    let (cancel, retry) = (c.id.clone(), c.id.clone());
+    let mut submenu: Vec<MenuItem<Tray>> = vec![
+        StandardItem {
+            label: "Cancel".into(),
+            icon_name: "process-stop".into(),
+            activate: Box::new(move |tray: &mut Tray| {
+                tray.send(Cmd::CopyCancel(cancel.clone()));
+            }),
+            ..Default::default()
+        }
+        .into(),
+    ];
+    if c.retry {
+        submenu.push(
+            StandardItem {
+                label: "Retry".into(),
+                icon_name: "view-refresh".into(),
+                activate: Box::new(move |tray: &mut Tray| {
+                    tray.send(Cmd::CopyRetry(retry.clone()));
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+    SubMenu {
+        label: c.label.clone(),
+        submenu,
+        ..Default::default()
+    }
+    .into()
 }

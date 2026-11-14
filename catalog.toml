@@ -1,4 +1,7 @@
-# Sets run in this order with --first-pass. priority is the clone tier: 0 USB core, 1 the 1 TB disk, 2 full.
+# Sets run in this order with --first-pass. Otherwise they run by priority, lowest first; `preserver copy`
+# fills a smaller target in the same order and drops the highest numbers first.
+# A [[set.variant]] names a subset of the sources that `preserver copy` takes when the whole set does not
+# fit. Every set also has an implicit "full" variant with all its sources, unless one is named "full".
 # estimate and est are GB. Sizes marked (E) are guesses.
 # keep is how many set versions stay visible. Unchanged files are hard links, so it only costs what changed.
 # A disabled source needs a todo that says what is missing.
@@ -87,7 +90,7 @@ license = "n/a"
 [[set]]
 name = "specs"
 title = "Specifications and references"
-priority = 0
+priority = 10
 estimate = 5
 use = "ISA manuals, ABIs, language drafts and reference docs. Intel, AMD and POSIX material is free to read but not for redistribution."
 
@@ -253,7 +256,7 @@ todo = "uefi.org/specifications lists the newest UEFI and ACPI PDFs on a page: n
 [[set]]
 name = "books"
 title = "Free CS books"
-priority = 0
+priority = 40
 estimate = 1
 use = "Books whose licences allow copying (Crafting Interpreters, Pro Git, SICP, OSTEP-style free texts). Check the licence column in SET.toml before sharing a copy."
 
@@ -362,7 +365,7 @@ todo = "OSTEP, Mogensen, Wirth, Beej, Modern C, Dive into Systems, Kuphaldt, Tar
 [[set]]
 name = "toolchains"
 title = "Compilers and language runtimes, source and bootstrap binaries"
-priority = 0
+priority = 30
 estimate = 10
 use = "Source and bootstrap tarballs for GCC alternatives, Go, Rust, Zig, Node, musl, LLVM and Perl."
 
@@ -527,7 +530,7 @@ license = "Apache-2.0"
 [[set]]
 name = "kernel"
 title = "Linux kernel, firmware, microcode"
-priority = 0
+priority = 20
 estimate = 1.5
 keep = 2
 use = "Stable and longterm kernel tarballs (signature over the uncompressed tar), linux-firmware and Intel microcode."
@@ -582,7 +585,7 @@ license = "Intel-redistributable"
 [[set]]
 name = "gnu"
 title = "GNU, latest release of each package"
-priority = 1
+priority = 130
 estimate = 12
 keep = 1
 
@@ -596,7 +599,7 @@ todo = "phase 3 (two-level https listing): needs rsync --list-only, then the new
 [[set]]
 name = "lfs"
 title = "Linux From Scratch and BLFS"
-priority = 0
+priority = 110
 estimate = 12
 
 [[set.source]]
@@ -620,7 +623,7 @@ todo = "package URLs come from parsing the BLFS book; full tier only"
 [[set]]
 name = "bootstrap"
 title = "Bootstrappable builds"
-priority = 0
+priority = 50
 estimate = 3
 
 [[set.source]]
@@ -647,7 +650,7 @@ todo = "walk steps/manifest then steps/*/sources for the pinned sha256 values: n
 [[set]]
 name = "isos"
 title = "Installer and rescue images"
-priority = 0
+priority = 70
 estimate = 60
 keep = 1
 use = "Fedora 45, Debian 13, Alpine and Ventoy images. Write one to a stick, or copy ISOs onto a Ventoy stick."
@@ -806,10 +809,18 @@ sums = "sha256.txt"
 license = "GPL-3.0 plus binary blobs"
 est = 0.22
 
+[[set.variant]]
+name = "netinst"
+sources = ["fedora-netinst", "debian-netinst", "ventoy"]
+
+[[set.variant]]
+name = "live"
+sources = ["fedora-netinst", "debian-netinst", "ventoy", "fedora-workstation", "debian-live", "alpine-x86_64"]
+
 [[set]]
 name = "own-deps"
 title = "Offline dependency mirrors for my own repos"
-priority = 0
+priority = 120
 estimate = 10
 
 [[set.source]]
@@ -821,7 +832,7 @@ todo = "a local job (GOMODCACHE go mod download all, cargo vendor) over the repo
 [[set]]
 name = "ai-runtimes"
 title = "ggml runtimes, ollama and front ends"
-priority = 0
+priority = 90
 estimate = 12
 keep = 2
 use = "llama.cpp (source plus bNNNN binaries), whisper.cpp, ollama, opencode and VSCodium. Chat with llama-server's built-in web UI; code with opencode against its /v1 endpoint. For prebuilt ROCm binaries on the RX 6700 XT set HSA_OVERRIDE_GFX_VERSION=10.3.0."
@@ -921,10 +932,14 @@ kind = "http"
 enabled = false
 todo = "redistrib_N.json lists archives with sha256: needs a cuda extractor. Full tier only"
 
+[[set.variant]]
+name = "core"
+sources = ["llama-cpp-bin", "opencode", "crush"]
+
 [[set]]
 name = "system-src"
 title = "Graphics, bootloaders, ARM boot"
-priority = 0
+priority = 60
 estimate = 1
 
 [[set.source]]
@@ -974,7 +989,7 @@ license = "BSD-3/Broadcom"
 [[set]]
 name = "ai-models"
 title = "GGUF models, small set"
-priority = 0
+priority = 100
 estimate = 22
 keep = 1
 use = "Run with llama-server --models-dir. Ollama can import any of these with a Modelfile whose FROM is the local .gguf. The default chat model fits a 12 GB card."
@@ -1051,10 +1066,18 @@ repo = "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF"
 assets = ["*Q8_0.gguf"]
 todo = "the model card states no licence: confirm before archiving"
 
+[[set.variant]]
+name = "small"
+sources = ["qwen35-0.8b", "qwen35-2b"]
+
+[[set.variant]]
+name = "medium"
+sources = ["qwen35-0.8b", "qwen35-2b", "qwen35-4b", "whisper"]
+
 [[set]]
 name = "kiwix"
 title = "Offline knowledge (ZIM), small set"
-priority = 0
+priority = 80
 estimate = 46
 keep = 1
 use = "Open with kiwix-serve --library or kiwix-desktop. kiwix-tools binaries are in this set."
@@ -1128,10 +1151,18 @@ pattern = '^kiwix-tools_linux-(?:x86_64|aarch64)-(\d+\.\d+\.\d+)\.tar\.gz$'
 license = "GPL-3.0"
 est = 0.04
 
+[[set.variant]]
+name = "mini"
+sources = ["wikipedia-mini", "distro-wikis", "devdocs", "kiwix-tools"]
+
+[[set.variant]]
+name = "no-se"
+sources = ["wikipedia-mini", "distro-wikis", "devdocs", "kiwix-tools", "wikibooks", "wikiversity"]
+
 [[set]]
 name = "repo-alpine"
 title = "Alpine v3.24 mirror (x86_64 and aarch64)"
-priority = 1
+priority = 160
 estimate = 135
 use = "Point apk at this tree as a repository. Packages are signed by the Alpine keys; apk checks APKINDEX on use."
 
@@ -1161,7 +1192,7 @@ todo = "Alpine ships no source mirror: needs a resolver that reads each APKBUILD
 [[set]]
 name = "repo-debian"
 title = "Debian 13 mirror (amd64, all, source)"
-priority = 1
+priority = 180
 estimate = 250
 keep = 1
 
@@ -1184,7 +1215,7 @@ todo = "phase 3"
 [[set]]
 name = "repo-fedora"
 title = "Fedora 45 mirror (x86_64 and source)"
-priority = 1
+priority = 170
 estimate = 311
 keep = 1
 use = "Use as a dnf baseurl. Fedora's own signatures on the packages and repodata are checked by dnf on use."
@@ -1212,7 +1243,7 @@ license = "various-free"
 [[set]]
 name = "kiwix-large"
 title = "Offline knowledge (ZIM), large set"
-priority = 1
+priority = 150
 estimate = 275
 keep = 1
 
@@ -1246,10 +1277,22 @@ sums = "{file}.sha256"
 license = "CC-BY-SA"
 est = 107
 
+[[set.variant]]
+name = "nopic"
+sources = ["wikipedia-nopic"]
+
+[[set.variant]]
+name = "nopic-so"
+sources = ["wikipedia-nopic", "stackoverflow"]
+
+[[set.variant]]
+name = "full"
+sources = ["wikipedia-maxi", "stackoverflow"]
+
 [[set]]
 name = "maps"
 title = "Offline maps"
-priority = 1
+priority = 140
 estimate = 138
 keep = 1
 use = "Planet basemap is a PMTiles file: serve it with the pmtiles CLI and MapLibre, or cut a smaller one with pmtiles extract."
@@ -1296,10 +1339,18 @@ url = "https://github.com/protomaps/basemaps-assets"
 est = 0.1
 license = "OFL/CC0"
 
+[[set.variant]]
+name = "viewer"
+sources = ["pmtiles-cli", "maplibre-gl-js", "basemaps-assets"]
+
+[[set.variant]]
+name = "na"
+sources = ["pmtiles-cli", "maplibre-gl-js", "basemaps-assets", "geofabrik-na"]
+
 [[set]]
 name = "ai-models-large"
 title = "GGUF models, large set"
-priority = 2
+priority = 190
 estimate = 148
 keep = 1
 
@@ -1367,10 +1418,18 @@ repo = "leejet/Z-Image-Turbo-GGUF"
 assets = ["*.gguf"]
 todo = "needs several repos per model (Z-Image-Turbo + ae.sft from FLUX.1-schnell + Qwen3-4B-Instruct-2507; FLUX.2-klein-4B + VAE) per sd.cpp docs, and licences to check (FLUX VAEs may be gated)"
 
+[[set.variant]]
+name = "one"
+sources = ["gpt-oss-20b"]
+
+[[set.variant]]
+name = "two"
+sources = ["gpt-oss-20b", "qwen3-coder-30b"]
+
 [[set]]
 name = "extras"
 title = "Full-tier extras"
-priority = 2
+priority = 200
 estimate = 224
 keep = 1
 
@@ -1400,3 +1459,7 @@ pattern = '^gutenberg_en_all_(\d{4}-\d{2})\.zim$'
 sums = "{file}.sha256"
 license = "public-domain"
 est = 206
+
+[[set.variant]]
+name = "no-gutenberg"
+sources = ["linux-git", "llvm-bin"]

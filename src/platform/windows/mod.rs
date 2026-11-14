@@ -113,3 +113,26 @@ pub(crate) fn exec(mut cmd: Command) -> io::Error {
         Err(e) => e,
     }
 }
+
+pub(crate) fn fs_type(_path: &Path) -> io::Result<String> {
+    Err(unsupported())
+}
+
+pub(crate) fn block_size(_path: &Path) -> io::Result<u64> {
+    Err(unsupported())
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the linux fn; read-back on Windows comes in phase 5"
+)]
+pub(crate) fn drop_cache(_f: &File) -> io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
+    if std::fs::symlink_metadata(path)?.is_symlink() {
+        return Err(io::Error::other("refusing a symlink"));
+    }
+    File::open(path)
+}

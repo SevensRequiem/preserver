@@ -67,13 +67,23 @@ N is 90% of cores. In the Claude sandbox set `CARGO_HOME=$TMPDIR/cargo` and `CAR
 ## Daemon notes
 
 - `daemon.rs`: `preserver daemon` holds `preserver-daemon.lock` for life (a second one logs "waiting for the running daemon to exit" and blocks, so an overlapping restart is no crash loop) and writes `status/daemon.json` once. Main runs the event loop, one thread per lane runs passes, the udisks watcher wakes main. No socket: control stays `.ctl` in, job JSON and `status/*.json` out.
-- Lanes: `JobKind::lane()`. A worker resets, applies controls to and writes only its own lane's jobs, so two lanes never write the same job file. Only `Lane::Download` exists; the copy lane is step 5.
+- Lanes: `JobKind::lane()`. A worker resets, applies controls to and writes only its own lane's jobs, so two lanes never write the same job file. `Lane::Download` runs under `preserver-queue.lock`, `Lane::Copy` under `preserver-copy-queue.lock`.
 - `Pass { retry_failed, retry_blocked }`: `FRESH` for CLI runs, `TICK` for the 30 s tick (requeues only crashed `Running` jobs), drive events and the hourly sweep also requeue `Blocked`. `runnable()` decides whether a pass would do anything, so an idle tick loads nothing and writes no status. Coalesced passes OR their flags.
 - `daemon_pass` only `try_lock`s the queue: a CLI run already holding it wins and the daemon tries again next tick. Lock order is queue, then public (`status::job`). `enqueue` without the lock bumps `retry` in a stopped job's ctl; a retry now requeues `Blocked` as well as `Failed`.
 - The watcher is one `MessageIterator` with one match rule (udisks signals under `/org/freedesktop/UDisks2`, filtered by `is_drive_signal`); it reconnects every 30 s and warns once per failure streak. Its end-to-end test runs only outside the sandbox against a private bus: `PRESERVER_DBUS_TEST=1` on the test binary with `DBUS_SESSION_BUS_ADDRESS` and `DBUS_SYSTEM_BUS_ADDRESS` unset, filter `watcher_sees_a_plug_in`.
 - The tray shows the daemon and queue lines and a pause item (writes `all.ctl`), and polls every 5 s while a job runs, 60 s while one waits, hourly otherwise.
 - Mounting from the user service goes through polkit with `auth.no_user_interaction`; not yet checked on a real session. Windows has no drive events yet (`watch_drives` warns), and restart-on-failure for the `\preserver\daemon` task XML is phase 5.
 - The AR wrapper for the `aarch64-pc-windows-msvc` clippy gate must accept lowercase `-out:` too: cc-rs passes that form.
+
+## Copy notes
+
+- `copy/`: `plan.rs` is pure (inputs in, `Plan` out, unit-tested at 16G/32G/128G/2T and shrinking); `exec.rs` writes (stage, read back, rename); `rules.rs` owns `copy.toml`; `mod.rs` scans both trees, runs a job, and is the lane, the scheduler and the CLI. Design in `docs/design.md` §3.6.
+- The lane's lock order is `copy-queue`, then `copy` (`status::job`). `record` writes `status/copy.json` (one `sets` entry per rule or one-off job id) before it removes Done and Canceled jobs: `schedule` reads the last run from there, so a rule never looks as if it never ran.
+- A job runs `execute` on a scoped thread; the lane thread polls the job's ctl every second and sets `Prog::stop`, which `copy_file` checks per 1 MiB chunk. A run that finds the primary pruned under it (`Vanished`) plans once more. A missing primary or target is `Blocked` without an attempt.
+- `.state/copy.json` on the target marks the tree as a copy's (and holds the personal size/mtime and kit fingerprint); without it a non-empty `preserver/` is refused. It is written before anything else so an interrupted first run resumes.
+- The Env seam (`mount`, `fstype`, `free`, `cluster`, `say`) lets the end-to-end tests in `copy/tests.rs` fake both drives in a temp dir; nothing there touches udisks. The `public --list` CLI test points `DBUS_SYSTEM_BUS_ADDRESS` at a missing socket for the same reason.
+- clippy's `allow-unwrap-in-tests` only recognizes a literal `#[cfg(test)]` on the module: gate a unix-only test file with `#![cfg(unix)]` inside it, not `#[cfg(all(test, unix))]`.
+- Not done: Windows `fs_type`/`block_size` return Unsupported (the drive's udisks/volume fstype is used first, else the copy is planned as "other"); a canceled job that never ran leaves an old stage until the next copy to that target clears it; an interrupted in-place replacement (no room for both versions) leaves that set absent until the next run.
 
 ## Install and release
 

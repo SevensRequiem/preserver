@@ -1,7 +1,7 @@
 //! What the tray shows, as a pure function of the status files and job locks.
 
 use crate::config::Transport;
-use crate::queue::{self, JobState};
+use crate::queue::{self, JobKind, JobState};
 use crate::status::Status;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -82,8 +82,17 @@ pub(crate) struct Model {
     pub queue_paused: bool,
     /// The pause or resume item, shown while there is something to pause or resume.
     pub pause_label: Option<&'static str>,
+    /// Copy jobs that have not finished, each with what can be done to it.
+    pub copies: Vec<CopyItem>,
     /// How soon to read the files again: often while a job moves, hourly when idle.
     pub poll: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyItem {
+    pub id: String,
+    pub label: String,
+    pub retry: bool,
 }
 
 impl Model {
@@ -127,6 +136,36 @@ fn daemon_label(job: &Job, tz: &TimeZone) -> String {
         Some(_) => "Daemon: not running".to_string(),
         None => "Daemon: never started".to_string(),
     }
+}
+
+/// Pending, running, blocked and failed copy jobs. Every one can be canceled; a stopped one
+/// can be retried.
+fn copies(jobs: &[queue::Job]) -> Vec<CopyItem> {
+    jobs.iter()
+        .filter(|j| !matches!(j.state, JobState::Done | JobState::Canceled))
+        .filter_map(|j| {
+            let JobKind::Copy { target, .. } = &j.kind else {
+                return None;
+            };
+            let p = &j.progress;
+            let state = match j.state {
+                JobState::Running { .. } if p.bytes_total > 0 => {
+                    format!("{}%", p.bytes_done.min(p.bytes_total) * 100 / p.bytes_total)
+                }
+                JobState::Running { .. } => "copying".to_string(),
+                JobState::Blocked(_) => "waiting for the drive".to_string(),
+                s => s.to_string(),
+            };
+            Some(CopyItem {
+                id: j.id.clone(),
+                label: format!("Copy to {}: {state}", target.name()),
+                retry: matches!(
+                    j.state,
+                    JobState::Failed | JobState::Blocked(_) | JobState::Paused
+                ),
+            })
+        })
+        .collect()
 }
 
 /// The queue line and the poll interval, both from the job states.
@@ -181,6 +220,15 @@ pub(crate) fn model(i: &Inputs) -> Model {
         Some(github.clone())
     } else if !local.is_empty() {
         Some(format!("local folders: {local}"))
+    } else if let Some((j, target)) = i.jobs.iter().find_map(|j| match &j.kind {
+        JobKind::Copy { target, .. } if j.state == JobState::Failed => Some((j, target)),
+        _ => None,
+    }) {
+        Some(format!(
+            "copy to {}: {}",
+            target.name(),
+            j.error.as_deref().unwrap_or("failed")
+        ))
     } else {
         i.start_failure.clone()
     };
@@ -214,6 +262,7 @@ pub(crate) fn model(i: &Inputs) -> Model {
         },
         queue_label,
         queue_paused: i.queue_paused,
+        copies: copies(&i.jobs),
         poll,
     }
 }
@@ -621,6 +670,55 @@ mod tests {
             assert_eq!(m.queue_paused, paused, "{name}");
             assert_eq!(m.poll, Duration::from_secs(poll), "{name}");
         }
+    }
+
+    fn copy_job(state: &str, progress: &str, error: &str) -> queue::Job {
+        serde_json::from_str(&format!(
+            r#"{{"id":"4-5-6","kind":{{"copy":{{"target":{{"dir":{{"path":"/media/stick"}}}},"sets":["personal"]}}}},"priority":10,"state":{state},"attempts":1,"drive":"0123-ABCD","created":"2026-11-13T00:00:00Z","updated":"2026-11-13T00:00:00Z","progress":{progress},"error":{error}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn copy_jobs_get_items_and_a_failure_shows() {
+        let mut i = inputs(ok_at("2026-11-13T00:00:00Z"));
+        i.jobs = vec![
+            copy_job(
+                r#"{"running":{"pid":7}}"#,
+                r#"{"bytes_done":25,"bytes_total":100}"#,
+                "null",
+            ),
+            copy_job(r#"{"blocked":"drive_absent"}"#, "{}", "null"),
+            copy_job(r#""done""#, "{}", "null"),
+            queued(r#""failed""#),
+        ];
+        let m = model(&i);
+        let labels: Vec<_> = m
+            .copies
+            .iter()
+            .map(|c| (c.label.as_str(), c.retry))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("Copy to /media/stick: 25%", false),
+                ("Copy to /media/stick: waiting for the drive", true)
+            ]
+        );
+        assert_eq!(
+            m.state,
+            State::Ok,
+            "a failed download is the queue line's business"
+        );
+
+        i.jobs.push(copy_job(r#""failed""#, "{}", r#""disk full""#));
+        let m = model(&i);
+        assert_eq!(m.state, State::Failed);
+        assert_eq!(
+            m.tooltip,
+            "Last run failed: copy to /media/stick: disk full"
+        );
+        assert!(m.copies.last().unwrap().retry);
     }
 
     #[test]

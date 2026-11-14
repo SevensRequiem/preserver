@@ -2,8 +2,8 @@
 //! it under `public/<set>/.staging/`, downloads what is missing, and only after every file
 //! has verified renames the stage into place as a new version.
 
-mod index;
-mod versioned;
+pub(crate) mod index;
+pub(crate) mod versioned;
 
 use crate::catalog::{Catalog, Set, Source};
 use crate::config::{Config, DriveId};
@@ -137,7 +137,9 @@ impl Public<'_> {
     /// The worker's planner: what a set job has to download. A set that needs nothing (no
     /// usable source, over budget, unchanged) is recorded here and plans no files.
     pub(crate) fn plan(&self, job: &Job, root: &Path) -> Result<Vec<Fetch>> {
-        let JobKind::Set { set: name } = &job.kind;
+        let JobKind::Set { set: name } = &job.kind else {
+            bail!("not a set job");
+        };
         let set = self
             .cat
             .sets
@@ -190,7 +192,9 @@ impl Public<'_> {
     /// Called by the worker when a job stops. A job whose downloads all arrived is verified
     /// and published here; a verification failure turns it into a failed job.
     pub(crate) fn settle(&self, job: &mut Job, root: &Path) {
-        let JobKind::Set { set } = &job.kind;
+        let JobKind::Set { set } = &job.kind else {
+            return;
+        };
         let staged = self.staged().remove(&job.id);
         match job.state {
             JobState::Done => {
@@ -272,10 +276,10 @@ fn enqueue(store: &Store, sets: &[&Set], drive: &DriveId, tidy: bool) -> Result<
     let mut ids = Vec::new();
     for (i, set) in sets.iter().enumerate() {
         let mut waiting = None;
-        for j in jobs.iter().filter(|j| {
-            let JobKind::Set { set: s } = &j.kind;
-            *s == set.name
-        }) {
+        for j in jobs
+            .iter()
+            .filter(|j| matches!(&j.kind, JobKind::Set { set: s } if *s == set.name))
+        {
             if !matches!(j.state, JobState::Done | JobState::Canceled) {
                 waiting.get_or_insert(j);
             } else if tidy {
@@ -381,10 +385,9 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
         work(&public(&cat, paths, &cfg, &dl), &store, &dl, pass)?;
         let mut errs = Vec::new();
         for j in store.jobs()? {
-            if j.kind.lane() != Lane::Download {
+            let JobKind::Set { set } = &j.kind else {
                 continue;
-            }
-            let JobKind::Set { set } = &j.kind;
+            };
             match j.state {
                 // Nobody waits on the result here, unlike run(): the worker tidies up.
                 JobState::Done | JobState::Canceled => store.remove(&j.id)?,
@@ -401,6 +404,67 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
         notify(true, "Public sync had failures", &trunc(&msg, 600));
         bail!(msg)
     })
+}
+
+/// `preserver public --list`: the sets in priority order with their variants, estimated and,
+/// when the primary is connected, measured in its newest version.
+pub(crate) fn list(paths: &mut Paths, cfg: &Config) -> Result<()> {
+    let cat = Catalog::embedded()?;
+    let root = match paths.mount(&cfg.primary_uuid) {
+        Ok(()) => Some(paths.mnt.clone()),
+        Err(e) => {
+            println!("note: {e:#}, so sizes are estimates only");
+            None
+        }
+    };
+    print!("{}", list_text(&cat, root.as_deref())?);
+    Ok(())
+}
+
+fn list_text(cat: &Catalog, root: Option<&Path>) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for set in cat.select(&[], false)? {
+        let dir = root.map(|r| Public::public_dir(r).join(&set.name));
+        let newest = dir
+            .as_deref()
+            .and_then(|d| versioned::version_dirs(d).into_iter().next());
+        let _ = writeln!(
+            out,
+            "{:<16} priority {:>3}  keep {}  estimate {:>7.1} GB  newest {}",
+            set.name,
+            set.priority,
+            set.keep,
+            set.estimate,
+            newest.as_deref().unwrap_or("-")
+        );
+        // Bytes per source in the newest version: its files sit under `<version>/<source>/`.
+        let mut measured = HashMap::new();
+        if let (Some(dir), Some(v)) = (&dir, &newest) {
+            for src in &set.sources {
+                let mut files = Vec::new();
+                if versioned::regular_files(&dir.join(v).join(&src.name), "", &mut files).is_ok() {
+                    measured.insert(src.name.as_str(), files.iter().map(|(_, n)| n).sum::<u64>());
+                }
+            }
+        }
+        for v in set.variants() {
+            let bytes = newest.is_some().then(|| {
+                v.sources
+                    .iter()
+                    .filter_map(|s| measured.get(s.as_str()))
+                    .sum::<u64>()
+            });
+            let _ = writeln!(
+                out,
+                "    {:<14} estimate {:>7.1} GB  measured {}",
+                v.name,
+                set.estimate_of(&v),
+                bytes.map_or_else(|| "-".to_string(), gb)
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// `preserver public [SET...] [--dry-run] [--first-pass]`.

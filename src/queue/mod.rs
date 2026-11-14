@@ -7,10 +7,8 @@ use crate::config::Config;
 use crate::paths::Paths;
 use crate::public;
 use anyhow::{Result, bail};
-#[cfg(test)]
-pub(crate) use job::BlockReason;
-pub(crate) use job::{Job, JobKind, JobState, Lane};
-pub(crate) use sched::{Pass, Worker, runnable};
+pub(crate) use job::{BlockReason, Job, JobKind, JobState, Lane, Progress, Target};
+pub(crate) use sched::{Halt, Pass, Worker, apply_control, halt_requested, reset, runnable};
 use std::time::Duration;
 pub(crate) use store::Store;
 
@@ -21,9 +19,12 @@ fn print(jobs: &[Job]) {
     );
     for j in jobs {
         let p = &j.progress;
-        let JobKind::Set { set } = &j.kind;
+        let what = match &j.kind {
+            JobKind::Set { set } => format!("set {set}"),
+            JobKind::Copy { target, .. } => format!("copy -> {}", target.name()),
+        };
         println!(
-            "{:<28} {:<24} {:>4} {:>5}/{:<5} {:>7}/{:<8}  set {set}{}",
+            "{:<28} {:<24} {:>4} {:>5}/{:<5} {:>7}/{:<8}  {what}{}",
             j.id,
             j.state.to_string(),
             j.priority,
@@ -67,7 +68,11 @@ pub(crate) fn cli(paths: &Paths, action: QueueAction) -> Result<()> {
         }
         QueueAction::Resume { id, all, drive } => {
             if let Some(d) = drive {
-                for j in store.jobs()?.iter().filter(|j| j.drive.matches(&d)) {
+                let on = |j: &Job| {
+                    j.drive.matches(&d)
+                        || matches!(&j.kind, JobKind::Copy { target: Target::Drive { id, .. }, .. } if id.matches(&d))
+                };
+                for j in store.jobs()?.iter().filter(|j| on(j)) {
                     store.edit_control(Some(&j.id), |c| c.pause = false)?;
                 }
                 return Ok(());

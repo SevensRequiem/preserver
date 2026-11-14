@@ -1,6 +1,7 @@
 mod catalog;
 pub mod cli;
 mod config;
+mod copy;
 mod crypt;
 mod daemon;
 mod git;

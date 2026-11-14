@@ -1,8 +1,8 @@
 use crate::config::{Config, Transport, load_drives};
 use crate::paths::Paths;
-use crate::{daemon, personal, platform, public, queue};
+use crate::{copy, daemon, personal, platform, public, queue};
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -10,13 +10,6 @@ use std::path::PathBuf;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum Tier {
-    Usb64,
-    Disk1t,
-    Full,
 }
 
 #[derive(Debug, Subcommand)]
@@ -42,6 +35,9 @@ pub enum Command {
         sets: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// List the catalog sets with their sizes and what the primary holds
+        #[arg(long, conflicts_with_all = ["sets", "dry_run", "first_pass"])]
+        list: bool,
         #[arg(long)]
         first_pass: bool,
     },
@@ -50,15 +46,29 @@ pub enum Command {
         #[command(subcommand)]
         action: QueueAction,
     },
-    /// Copy the archive to another drive
-    Clone {
-        dest: PathBuf,
-        #[arg(long, value_enum)]
-        tier: Option<Tier>,
-        #[arg(long, value_delimiter = ',')]
+    /// Copy the archive to another drive or a directory, fitted to its free space
+    Copy {
+        /// A directory, a filesystem id, or a filesystem label
+        #[arg(required_unless_present_any = ["list", "remove"])]
+        target: Option<String>,
+        /// Keep copying every hh:mm:ss (a rule in copy.toml)
+        #[arg(short = 't', value_name = "HH:MM:SS")]
+        every: Option<String>,
+        /// Catalog sets, personal and kit; -name leaves one out (personal is in unless -personal)
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         sets: Vec<String>,
+        /// Use at most this much of the target, e.g. 32G
         #[arg(long)]
-        once: bool,
+        size: Option<String>,
+        /// Print the plan and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// List copy rules and copy jobs
+        #[arg(long, conflicts_with_all = ["target", "remove"])]
+        list: bool,
+        /// Remove a copy rule (by id) or cancel a copy job
+        #[arg(long, value_name = "ID", conflicts_with = "target")]
+        remove: Option<String>,
     },
     /// Verify archive checksums
     Verify {
@@ -71,7 +81,7 @@ pub enum Command {
     Open,
     /// Run the tray icon
     Tray,
-    /// Run the background service: the download queue, and later copy rules, woken by drive events
+    /// Run the background service: the download queue, and copy rules, woken by drive events
     Daemon,
     /// Install scheduled tasks (Windows)
     Install,
@@ -196,11 +206,39 @@ pub fn run(cli: Cli) -> Result<()> {
             sets,
             dry_run,
             first_pass,
+            list,
         } => {
             let (mut paths, cfg) = load()?;
+            if list {
+                return public::list(&mut paths, &cfg);
+            }
             public::run(&mut paths, &cfg, &sets, dry_run, first_pass)
         }
-        Command::Clone { .. } | Command::Verify { .. } => bail!("not implemented yet (phase 4)"),
+        Command::Copy {
+            target,
+            every,
+            sets,
+            size,
+            dry_run,
+            list,
+            remove,
+        } => {
+            let (mut paths, cfg) = load()?;
+            copy::cli(
+                &mut paths,
+                &cfg,
+                copy::Args {
+                    target,
+                    every,
+                    sets,
+                    size,
+                    dry_run,
+                    list,
+                    remove,
+                },
+            )
+        }
+        Command::Verify { .. } => bail!("not implemented yet (phase 4)"),
         Command::Install => bail!("not implemented yet (phase 5)"),
     }
 }

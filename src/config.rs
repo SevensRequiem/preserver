@@ -22,7 +22,7 @@ impl Transport {
 
 /// A filesystem id as udisks reports it: hex digits and dashes (ext4 UUID, FAT `XXXX-XXXX`, NTFS serial).
 /// The spelling from the config is kept, because it names the mount point and the drives.d file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub(crate) struct DriveId(String);
 
@@ -31,16 +31,22 @@ impl DriveId {
         &self.0
     }
 
+    /// Upper case without dashes: the same for every spelling of one id.
+    pub(crate) fn key(&self) -> String {
+        norm(&self.0)
+    }
+
     /// Compares without dashes and case, so one id matches however the OS spells it.
     pub(crate) fn matches(&self, other: &str) -> bool {
-        let norm = |s: &str| {
-            s.chars()
-                .filter(|c| *c != '-')
-                .map(|c| c.to_ascii_uppercase())
-                .collect::<String>()
-        };
         norm(&self.0) == norm(other)
     }
+}
+
+fn norm(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
 }
 
 impl std::str::FromStr for DriveId {

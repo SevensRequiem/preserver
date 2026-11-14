@@ -71,6 +71,9 @@ pub(crate) struct SetFile {
     pub version: String,
     pub fetched: String,
     pub plan: String,
+    /// Set on a copy that holds only some of the sources (`preserver copy`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub variant: String,
     pub bytes: u64,
     #[serde(rename = "source")]
     pub sources: Vec<SetSource>,
@@ -134,7 +137,7 @@ pub(crate) fn read_set_file(path: &Path) -> SetFile {
 }
 
 /// `SHA256SUMS` as a map from relative path to hash.
-fn read_sums(path: &Path) -> HashMap<String, String> {
+pub(crate) fn read_sums(path: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -205,7 +208,7 @@ pub(crate) enum Prepared {
 }
 
 /// Deletes the stages of older plans; `stage_root` has been checked to be a plain directory.
-fn clear_other_stages(stage_root: &Path, keep: &str) {
+pub(crate) fn clear_other_stages(stage_root: &Path, keep: &str) {
     for e in std::fs::read_dir(stage_root)
         .into_iter()
         .flatten()
@@ -343,7 +346,7 @@ pub(crate) fn regular_files(dir: &Path, rel: &str, out: &mut Vec<(String, u64)>)
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut f = File::open(path).with_context(|| path.display().to_string())?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];

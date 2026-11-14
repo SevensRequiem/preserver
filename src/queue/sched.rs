@@ -245,8 +245,64 @@ pub(crate) fn runnable(store: &Store, lane: Lane, pass: Pass) -> Result<bool> {
         }))
 }
 
+/// Applies the job's control to an idle job; true when something changed. Shared by both lanes.
+pub(crate) fn apply_control(store: &Store, job: &mut Job) -> bool {
+    if matches!(job.state, JobState::Done | JobState::Canceled) {
+        return false;
+    }
+    let c = store.control(Some(&job.id));
+    let before = (job.state, job.priority, job.retry_seen);
+    if let Some(p) = c.priority {
+        job.priority = p;
+    }
+    if c.retry > job.retry_seen {
+        job.retry_seen = c.retry;
+        job.attempts = 0;
+        if matches!(job.state, JobState::Failed | JobState::Blocked(_)) {
+            job.state = JobState::Queued;
+        }
+    }
+    job.state = match job.state {
+        _ if c.cancel => JobState::Canceled,
+        JobState::Queued | JobState::Blocked(_) if c.pause => JobState::Paused,
+        JobState::Paused if !c.pause => JobState::Queued,
+        s => s,
+    };
+    before != (job.state, job.priority, job.retry_seen)
+}
+
+/// Puts a lane's stopped jobs back in the queue as `pass` says. The caller holds the lane lock,
+/// so a job left Running is a crashed worker's.
+pub(crate) fn reset(store: &Store, lane: Lane, pass: Pass) -> Result<()> {
+    for mut job in store.jobs()?.into_iter().filter(|j| j.kind.lane() == lane) {
+        let requeue = match job.state {
+            JobState::Running { .. } => true,
+            JobState::Blocked(_) => pass.retry_blocked,
+            JobState::Failed => pass.retry_failed,
+            _ => false,
+        };
+        if requeue {
+            job.state = JobState::Queued;
+            store.save(&mut job)?;
+        }
+    }
+    Ok(())
+}
+
+/// What the controls ask of a running job.
+pub(crate) fn halt_requested(store: &Store, id: &str) -> Option<Halt> {
+    let c = store.control(Some(id));
+    if c.cancel {
+        Some(Halt::Cancel)
+    } else if c.pause || store.control(None).pause {
+        Some(Halt::Pause)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Halt {
+pub(crate) enum Halt {
     Pause,
     Cancel,
 }
@@ -274,23 +330,12 @@ impl Worker<'_> {
     /// Runs queued jobs until none is runnable. The caller holds the queue lock, so a job left
     /// Running is a crashed worker's; `pass` says whether Blocked and Failed get another try.
     pub(crate) fn run(&self, pass: Pass) -> Result<()> {
-        for mut job in self.jobs()? {
-            let requeue = match job.state {
-                JobState::Running { .. } => true,
-                JobState::Blocked(_) => pass.retry_blocked,
-                JobState::Failed => pass.retry_failed,
-                _ => false,
-            };
-            if requeue {
-                job.state = JobState::Queued;
-                self.store.save(&mut job)?;
-            }
-        }
+        reset(self.store, Lane::Download, pass)?;
         loop {
             let paused = self.store.control(None).pause;
             let mut jobs = self.jobs()?;
             for job in &mut jobs {
-                if self.apply(job) {
+                if apply_control(self.store, job) {
                     self.store.save(job)?;
                 }
             }
@@ -303,32 +348,6 @@ impl Worker<'_> {
                 _ => return Ok(()),
             }
         }
-    }
-
-    /// Applies the job's control to an idle job; true when something changed.
-    fn apply(&self, job: &mut Job) -> bool {
-        if matches!(job.state, JobState::Done | JobState::Canceled) {
-            return false;
-        }
-        let c = self.store.control(Some(&job.id));
-        let before = (job.state, job.priority, job.retry_seen);
-        if let Some(p) = c.priority {
-            job.priority = p;
-        }
-        if c.retry > job.retry_seen {
-            job.retry_seen = c.retry;
-            job.attempts = 0;
-            if matches!(job.state, JobState::Failed | JobState::Blocked(_)) {
-                job.state = JobState::Queued;
-            }
-        }
-        job.state = match job.state {
-            _ if c.cancel => JobState::Canceled,
-            JobState::Queued | JobState::Blocked(_) if c.pause => JobState::Paused,
-            JobState::Paused if !c.pause => JobState::Queued,
-            s => s,
-        };
-        before != (job.state, job.priority, job.retry_seen)
     }
 
     fn run_job(&self, mut job: Job) -> Result<()> {
@@ -367,13 +386,8 @@ impl Worker<'_> {
             }
             let mut last = (Instant::now(), 0);
             while !pool.wait(Duration::from_secs(1)) {
-                let c = self.store.control(Some(&job.id));
-                if c.cancel {
-                    halt = Some(Halt::Cancel);
-                } else if c.pause || self.store.control(None).pause {
-                    halt = Some(Halt::Pause);
-                }
-                if halt.is_some() {
+                if let Some(h) = halt_requested(self.store, &job.id) {
+                    halt = Some(h);
                     pool.halt();
                 }
                 let bytes = done.load(Ordering::Relaxed);

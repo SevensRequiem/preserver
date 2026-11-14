@@ -28,6 +28,68 @@ pub(crate) struct Set {
     pub keep: usize,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
+    /// Subsets `preserver copy` falls back to on a small target; see `Set::variants`.
+    #[serde(default, rename = "variant")]
+    pub variants: Vec<Variant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Variant {
+    pub name: String,
+    pub sources: Vec<String>,
+}
+
+/// `preserver copy --sets` takes these besides the catalog sets.
+pub(crate) const RESERVED: [&str; 2] = ["personal", "kit"];
+
+impl Set {
+    /// The listed variants plus an implicit "full" with every source, unless one is named so.
+    pub(crate) fn variants(&self) -> Vec<Variant> {
+        let mut v = self.variants.clone();
+        if !v.iter().any(|x| x.name == "full") {
+            v.push(Variant {
+                name: "full".into(),
+                sources: self.sources.iter().map(|s| s.name.clone()).collect(),
+            });
+        }
+        v
+    }
+
+    /// GB: the sources' estimates, or the set's own for a variant with every source.
+    pub(crate) fn estimate_of(&self, v: &Variant) -> f64 {
+        if v.sources.len() == self.sources.len() {
+            return self.estimate;
+        }
+        self.sources
+            .iter()
+            .filter(|s| v.sources.contains(&s.name))
+            .map(|s| s.est)
+            .sum()
+    }
+
+    fn validate_variants(&self) -> Result<()> {
+        let mut names = HashSet::new();
+        for v in &self.variants {
+            if !valid_name(&v.name) || !names.insert(&v.name) {
+                bail!("bad or duplicate variant {:?}", v.name);
+            }
+            if v.sources.is_empty() {
+                bail!("variant {} names no sources", v.name);
+            }
+            if let Some(s) = v
+                .sources
+                .iter()
+                .find(|s| !self.sources.iter().any(|x| x.name == **s))
+            {
+                bail!(
+                    "variant {} names {s:?}, which is no source of the set",
+                    v.name
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `Http` and `Hf` produce versioned files. `Git` and `Repo` update a mirror in place.
@@ -207,8 +269,11 @@ impl Catalog {
         let mut c: Self = toml::from_str(text).context("catalog")?;
         let mut seen = HashSet::new();
         for set in &mut c.sets {
-            if !valid_name(&set.name) || !seen.insert(set.name.clone()) {
-                bail!("catalog: bad or duplicate set {:?}", set.name);
+            if !valid_name(&set.name)
+                || RESERVED.contains(&set.name.as_str())
+                || !seen.insert(set.name.clone())
+            {
+                bail!("catalog: bad, reserved or duplicate set {:?}", set.name);
             }
             if set.keep == 0 {
                 set.keep = 2;
@@ -221,6 +286,8 @@ impl Catalog {
                     bail!("catalog: duplicate source {}/{}", set.name, src.name);
                 }
             }
+            set.validate_variants()
+                .with_context(|| format!("catalog: {}", set.name))?;
         }
         Ok(c)
     }
@@ -418,5 +485,98 @@ mod tests {
         assert_eq!(names(c.select(&pick, true).unwrap()), ["c", "b"]);
         assert_eq!(names(c.select(&pick, false).unwrap()), ["b", "c"]);
         assert!(c.select(&["nope".to_string()], false).is_err());
+    }
+
+    #[test]
+    fn variants() {
+        let base = "[[set]]\nname = \"s\"\ntitle = \"t\"\npriority = 0\nestimate = 9\n\
+            [[set.source]]\nname = \"a\"\nkind = \"git\"\nurl = \"u\"\nest = 1\n\
+            [[set.source]]\nname = \"b\"\nkind = \"git\"\nurl = \"u\"\nest = 2\n";
+        let with = |v: &str| format!("{base}{v}");
+        let c = Catalog::parse(&with(
+            "[[set.variant]]\nname = \"small\"\nsources = [\"a\"]\n",
+        ))
+        .unwrap();
+        let v = c.sets[0].variants();
+        let names: Vec<_> = v.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["small", "full"]);
+        assert_eq!(v[1].sources, ["a", "b"]);
+        assert!((c.sets[0].estimate_of(&v[0]) - 1.0).abs() < f64::EPSILON);
+        assert!((c.sets[0].estimate_of(&v[1]) - 9.0).abs() < f64::EPSILON);
+
+        let explicit = Catalog::parse(&with(
+            "[[set.variant]]\nname = \"full\"\nsources = [\"b\"]\n",
+        ))
+        .unwrap();
+        let v = explicit.sets[0].variants();
+        assert_eq!(v.len(), 1, "an explicit full replaces the implicit one");
+        assert_eq!(v[0].sources, ["b"]);
+
+        let cases = [
+            (
+                "unknown field",
+                "[[set.variant]]\nname = \"x\"\nsources = [\"a\"]\nsize = 1\n",
+                "catalog",
+            ),
+            (
+                "unknown source",
+                "[[set.variant]]\nname = \"x\"\nsources = [\"zz\"]\n",
+                "no source of the set",
+            ),
+            (
+                "no sources",
+                "[[set.variant]]\nname = \"x\"\nsources = []\n",
+                "names no sources",
+            ),
+            (
+                "duplicate",
+                "[[set.variant]]\nname = \"x\"\nsources = [\"a\"]\n[[set.variant]]\nname = \"x\"\nsources = [\"b\"]\n",
+                "duplicate variant",
+            ),
+            (
+                "bad name",
+                "[[set.variant]]\nname = \"../x\"\nsources = [\"a\"]\n",
+                "bad or duplicate variant",
+            ),
+        ];
+        for (name, v, want) in cases {
+            let err = format!("{:#}", Catalog::parse(&with(v)).unwrap_err());
+            assert!(err.contains(want), "{name}: {err}");
+        }
+        for reserved in RESERVED {
+            let err = Catalog::parse(&one_set(reserved, 0)).unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{reserved}: {err}");
+        }
+    }
+
+    #[test]
+    fn embedded_priorities_are_a_total_order_and_variants_resolve() {
+        let c = Catalog::embedded().unwrap();
+        let mut prios: Vec<u32> = c.sets.iter().map(|s| s.priority).collect();
+        prios.sort_unstable();
+        prios.dedup();
+        assert_eq!(prios.len(), c.sets.len(), "every set has its own priority");
+        let order: Vec<&str> = c
+            .select(&[], false)
+            .unwrap()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(&order[..4], ["keys", "specs", "kernel", "toolchains"]);
+        assert_eq!(order.last(), Some(&"extras"));
+        let kiwix = c.sets.iter().find(|s| s.name == "kiwix").unwrap();
+        let names: Vec<String> = kiwix.variants().into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["mini", "no-se", "full"]);
+        let large = c.sets.iter().find(|s| s.name == "kiwix-large").unwrap();
+        let full = large
+            .variants()
+            .into_iter()
+            .find(|v| v.name == "full")
+            .unwrap();
+        assert_eq!(
+            full.sources,
+            ["wikipedia-maxi", "stackoverflow"],
+            "no maxi and nopic together"
+        );
     }
 }

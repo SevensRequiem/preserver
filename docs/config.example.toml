@@ -24,3 +24,7 @@ reserve_percent = 10
 [[local]]
 name = "documents"
 path = "/home/you/Documents"
+
+# Copies to other drives are not configured here. 'preserver copy TARGET -t 24:00:00' keeps a
+# rule in copy.toml next to this file, which the daemon runs; 'copy --list' and 'copy --remove'
+# manage the rules. That file is written by preserver: edit it only through those commands.

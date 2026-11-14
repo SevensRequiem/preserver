@@ -70,9 +70,58 @@ fn bad_config_is_rejected_before_anything_runs() {
 #[test]
 fn later_phases_say_so() {
     let root = fresh_dir("phases");
-    let out = preserver(&root).args(["clone", "/x"]).output().unwrap();
+    let out = preserver(&root).args(["verify"]).output().unwrap();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("phase 4"), "{}", stderr(&out));
+}
+
+#[test]
+fn copy_rules_are_checked_before_any_drive_is_touched() {
+    let root = fresh_dir("copy");
+    write_config(&root);
+    let run = |args: &[&str]| preserver(&root).arg("copy").args(args).output().unwrap();
+
+    let out = run(&["--list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no copy rules"));
+
+    let out = run(&[".", "-t", "1:60:00"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("1:60:00"), "{}", stderr(&out));
+
+    let out = run(&[".", "--sets", "nope"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("nope"), "{}", stderr(&out));
+
+    let out = run(&["--remove", "000000000000"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no rule"), "{}", stderr(&out));
+
+    let out = run(&[]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn public_list_without_the_drive_shows_estimates() {
+    let root = fresh_dir("publist");
+    write_config(&root);
+    // A bus address that leads nowhere: the test never talks to the real udisks.
+    let out = preserver(&root)
+        .env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!("unix:path={}", root.join("no-bus").display()),
+        )
+        .args(["public", "--list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("estimates only"), "{text}");
+    assert!(text.contains("priority"), "{text}");
+    assert!(
+        text.find("keys").unwrap() < text.find("extras").unwrap(),
+        "{text}"
+    );
 }
 
 #[test]

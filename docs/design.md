@@ -146,7 +146,7 @@ src/resolve/{mod.rs (Item, dispatch, name/URL checks), listing.rs, github.rs, js
 src/verify/{mod.rs (verify_item, TOFU), sums.rs (findSum port), pgp.rs, minisign.rs}
 src/public/{mod.rs (enqueue, budget, record), versioned.rs (staging/hardlinks/SET.toml/SHA256SUMS/prune), index.rs (INDEX.html), dry_run.rs}
 src/mirror/{generation.rs (stage -> verify -> swap -> prune, done.tsv), fedora.rs, debian.rs, deb822.rs, alpine.rs}
-src/clone.rs           tiers, FAT/exFAT rules, kit.tar, sync_tree (also replicas)
+src/copy/{mod.rs (scan, run, lane, CLI), plan.rs (auto-fit, FAT/exFAT/NTFS limits), exec.rs (stage, read back, kit.tar), rules.rs (copy.toml, due)}
 src/scrub.rs           verify [--repair], rotating quarter, par2 exec
 src/tray_model.rs      platform-neutral tray state: labels, overdue (4 days), icon/status, menu items (unit-tested)
 src/platform/mod.rs    cfg re-export
@@ -183,7 +183,8 @@ enum Expect { None, Sha256([u8; 32]), Sha512([u8; 64]), Both([u8; 32], [u8; 64])
 struct Job { id: JobId, kind: JobKind, priority: u32, state: JobState, attempts: u32, next_try: Option<Timestamp>,
              drive: DriveId, created: Timestamp, updated: Timestamp, progress: Progress, error: Option<String> }
 enum JobKind { Personal { github: bool, local: bool }, Set { set: String }, Mirror { set: String, source: String },
-               Clone { dest: PathBuf, tier: Option<Tier>, sets: Vec<String>, once: bool }, Scrub { repair: bool } }
+               Copy { target: Target /* Drive { id, subdir, label } | Dir { path } */, sets: Vec<String>, size: Option<u64>, rule: Option<String> },
+               Scrub { repair: bool } }
 enum JobState { Queued, Blocked(BlockReason /* DriveAbsent | Budget */), Running { pid: u32 }, Paused, Done, Failed, Canceled }
 struct Control { pause: bool, cancel: bool, priority: Option<u32> }          // <id>.ctl, written by CLI/tray only
 struct Progress { phase: Phase, files_done: u64, files_total: u64, bytes_done: u64, bytes_total: u64, rate_bps: u64, current: Vec<String> }
@@ -197,7 +198,7 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Aspect | Design |
 |---|---|
 | Store | `~/.local/state/preserver/queue/<id>.json`, written only by the worker (tmp + rename). Control lives in `<id>.ctl`, written by the CLI and tray. New jobs are created with `O_EXCL` by anyone. The worker rescans every 1 s |
-| Lanes and daemon | Each job kind belongs to a lane (`Lane::Download` now, copy in step 5); a worker resets and writes only its own lane's jobs. `preserver daemon` (user service) runs one thread per lane and takes the lane lock for one pass at a time: a 30 s tick (crashed jobs only), a drive event or the hourly sweep (also `Blocked`). `public`, `clone` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running", and a stopped job they name gets a `retry` in its ctl. A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
+| Lanes and daemon | Each job kind belongs to a lane (`Lane::Download`, `Lane::Copy`); a worker resets and writes only its own lane's jobs. `preserver daemon` (user service) runs one thread per lane and takes the lane lock for one pass at a time: a 30 s tick (crashed jobs only), a drive event or the hourly sweep (also `Blocked`). `public`, `copy` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running", and a stopped job they name gets a `retry` in its ctl. A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
 | Per-file state | The filesystem is the state: a final file exists only after verification. A partial is `<dest>.part` + `<dest>.part.json` (PartState). Repo generations add `.staging/<gen>/done.tsv` (append-only, fsync batched) |
 | Priority | `Job.priority` is the position in first-pass catalog order (`--first-pass`), or stable by `priority` then catalog order. Within a job, items keep plan order |
 | Concurrency | `downloads = 4` threads. Per-host semaphores default to 2, overridable in config `[hosts]` (e.g. `"huggingface.co" = 4`) |
@@ -243,6 +244,19 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Bundle | exec `git -C mirror bundle create -q - --all`, stdout into the in-process age Encryptor, then `.tmp` and rename | needs Git for Windows |
 | Restore | Phase 1: in-process age decrypt, then exec `git clone` + `remote remove origin` (parity). Phase 4: native. Parse the v2/v3 header, `gix_pack::Bundle::write_to_directory` (index-pack), init, write refs + HEAD, check out with gix worktree-mutation. The kit and Windows then need no git | same |
 
+### 3.6 Copy to other drives (`preserver copy`)
+
+| Aspect | Design |
+|---|---|
+| What | `<primary>/preserver/` (personal trees, `kit/`, `public/<set>/`) onto another drive (by filesystem id, wherever it mounts, plus a subdirectory) or a plain directory, into `<target>/preserver/`. Jobs run in `Lane::Copy`, so a copy never waits on downloads. An absent drive is `Blocked(DriveAbsent)` and runs on the next drive event |
+| Sets | `--sets` takes catalog names plus `personal` and `kit`; `-name` leaves one out. Without a positive name everything goes; `personal` is in unless `-personal`. Rules keep the tokens and resolve them per job, so a set added to the catalog later comes along |
+| Auto-fit | Re-planned on every run from the target's free space (or `--size`, counting what already sits on the target), less a 5% reserve. Personal files must fit or the copy fails. Then the kit, then sets greedily in catalog `priority` order: each takes its biggest variant (`[[set.variant]]`, a filter on sources; an implicit `full` has them all) that still fits, a set that fits none is dropped and lower ones still get their chance. When room shrinks, the lowest priorities go first. Sets on the target that the copy did not select stay and count as used. `--dry-run` prints the plan and writes nothing |
+| Writing | Each set version is staged in `public/<set>/.staging/<version>~<variant>/`, hard linked from the old version where the filesystem has links, every file read back (`fadvise DONTNEED` first) and checked against the primary's SHA256SUMS, given its own SET.toml (with `variant`) and SHA256SUMS, then renamed into place; the old version goes after. An interrupted run leaves the old version whole and the next run resumes the stage. Without room for both side by side, the old version is moved aside and its files reused (in place) |
+| Filesystems | FAT32: files over 4 GiB are skipped and listed. FAT, exFAT and NTFS: names Windows refuses or that differ only in case are skipped; the kit goes as one `kit.tar` (read back by hash) since links do not survive. Footprints round up to the cluster size |
+| Safety | A non-empty `preserver/` without `.state/copy.json` (the primary, someone's other archive) is refused, as is a target inside the primary or the other way round. Links on the primary are never followed; kit links that leave the kit are left out. Personal files are only added and replaced, never deleted |
+| Rules | `-t HH:MM:SS` keeps a rule in `~/.config/preserver/copy.toml` (id: 12 hex of the target's hash). The daemon's main loop calls `copy::schedule` every tick: a rule whose last run (`status/copy.json`) is an interval old gets a job, a failed one gets a retry an interval later |
+| Tray | Each unfinished copy job gets a menu entry with Cancel and, when stopped, Retry. A failed copy turns the icon to failed |
+
 ## 4. CLI
 
 **On the drive** (`<drive>/preserver/`):
@@ -265,7 +279,8 @@ On the host: `~/.config/preserver/{config.toml,drives.d/,personal/{identity.age,
 | `restore FILE DIR` | `.bundle.age` or `.tar.zst.age` (L0 then Dnn applies the manifest's deletions). FILE can be anywhere, for example a bundle of an older backup tree on a drive. The locked key is the `identity.age` found in the three directories above FILE, else the primary drive's, else the home copy |
 | `public [SET…] [--dry-run] [--first-pass]` | enqueue + run the worker |
 | `queue list [--watch] \| show ID \| pause [ID\|--all] \| resume [ID\|--all\|--drive ID] \| cancel ID \| retry ID \| prio ID N \| run` | new |
-| `clone DEST [--tier usb64\|disk1t\|full] [--sets …] [--once]` | phase 4 |
+| `public --list` | the sets by priority with their variants, estimated and, with the primary connected, measured |
+| `copy TARGET [-t HH:MM:SS] [--sets a,b,-c] [--size 32G] [--dry-run]`, `copy --list`, `copy --remove ID` | copy to a drive (id or label) or a directory, fitted to its room (§3.6); `-t` keeps a rule the daemon runs; `--remove` takes a rule id or cancels a copy job |
 | `verify [--repair]` | phase 4 |
 | `drives`, `open`, `tray` | list drives, open the archive folder, run the tray |
 | `install` | Windows only: Task Scheduler tasks + tray at logon |
@@ -293,8 +308,8 @@ Every phase ends with `fmt`, `clippy -D warnings`, `test`, `cargo deny`, then a 
 | 2 gate | Public tests on a rustls test server with a checked-in test cert. Kill mid-download and resume with no full re-hash (assert bytes read). Pause and cancel from a second process. Bad signature never becomes visible. TOFU change raises an alert. Budget refusal. `keep` pruning. **Differential test: rpgp vs gpgv on every enabled signed source and all 11 keyrings.** Bandwidth ≤ 80 Mbit/s with `ip -s link` | `tests/*` | `test-writer`; then `security-auditor` on net, verify and resolve |
 | **3** | gix mirror + ureq `Http` impl (pipe thread for POST bodies); move personal fetch to gix; generation swap; Fedora, then Alpine, then Debian walkers; deb822 parser (proptest); catalog `kind="repo"` + the rsync replacements + the 3 dry-run fixes | `src/git/{mirror,http}.rs`, `src/mirror/*`, `catalog.toml` | `coder` for the walkers; `chore` for the catalog edits |
 | 3 gate | Fixture repos (tiny Fedora/Debian/Alpine trees, signed with test keys); a tampered file is rejected; interrupted generation resumes; `dnf --repofrompath` and `apt` (podman debian container) install from the mirror; personal again writes 0 new bundles via gix | | `test-writer`, `security-auditor` |
-| **4** | clone (tiers, FAT 4 GiB rule, no symlinks, kit.tar), sync_tree for replicas + drive watcher in the tray, scrub + par2, native bundle restore | `src/{clone,scrub}.rs`, `src/git/bundle.rs` | `coder` |
-| 4 gate | clone usb64 to a FAT32 loop image in $TMPDIR; `sha256sum -c` passes on the copy; native restore equals `git clone` for every backed-up repo | | `test-writer` |
+| **4** | sync_tree for replicas, scrub + par2, native bundle restore (copy with auto-fit, the FAT 4 GiB rule and kit.tar came with the daemon work, §3.6) | `src/scrub.rs`, `src/git/bundle.rs` | `coder` |
+| 4 gate | copy to a 16G FAT32 loop image in $TMPDIR; `sha256sum -c` passes on the copy; native restore equals `git clone` for every backed-up repo | | `test-writer` |
 | **5** | Windows: paths, volumes/serials, CM notifications, Shell_NotifyIcon tray + balloons + TaskbarCreated, schtasks XML install, background priority, OpenSSH path; GraphQL ref pre-check (open question 1) | `src/platform/windows/*` | `coder` |
 | 5 gate | CI on windows-2025 and windows-11-arm runs the full suite; a manual run on a Windows machine with a FIDO key | | `test-writer`, `reviewer` before tagging v1 |
 | later | native bundle writer: gix-pack `count::objects` + `iter_from_counts(Mode::PackCopyAndBaseObjects, allow_thin_pack=false)` + v2 header, verified by native index-pack before rename, switched on only after its object set equals `git bundle` output on all repos | `src/git/bundle.rs` | `novel-coder` |

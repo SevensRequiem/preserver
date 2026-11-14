@@ -133,6 +133,7 @@ fn catalog(keep: usize, sources: Vec<Source>) -> Catalog {
             priority: 0,
             estimate: 0.001,
             keep,
+            variants: Vec::new(),
             sources,
         }],
     }
@@ -735,4 +736,30 @@ fn a_symlink_on_the_drive_is_refused_and_nothing_behind_it_is_touched() {
     std::os::unix::fs::symlink(&victim, env.set_dir()).unwrap();
     assert_eq!(env.sync(&cat).state, JobState::Failed);
     assert_eq!(files(&victim), ["keep/file"]);
+}
+
+#[test]
+fn list_measures_the_newest_version_per_variant() {
+    let tmp = TempDir::new();
+    let cat = Catalog::embedded().unwrap();
+    let text = list_text(&cat, None).unwrap();
+    assert!(
+        text.find("keys").unwrap() < text.find("extras").unwrap(),
+        "{text}"
+    );
+    assert!(
+        text.contains("netinst") && text.contains("measured -"),
+        "{text}"
+    );
+
+    let v = Public::public_dir(tmp.path()).join("isos/2026-11-01");
+    std::fs::create_dir_all(&v).unwrap();
+    std::fs::write(v.join("SET.toml"), "").unwrap();
+    let text = list_text(&cat, Some(tmp.path())).unwrap();
+    let isos = text
+        .lines()
+        .skip_while(|l| !l.starts_with("isos"))
+        .collect::<Vec<_>>();
+    assert!(isos[0].contains("newest 2026-11-01"), "{text}");
+    assert!(isos[1].contains("measured 0"), "{text}");
 }

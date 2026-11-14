@@ -88,6 +88,44 @@ pub(crate) fn disk_free(path: &Path) -> io::Result<(u64, u64)> {
     ))
 }
 
+/// The filesystem type of `path`, from its superblock magic: `vfat`, `exfat`, `ntfs3`, or
+/// `fuseblk` (ntfs-3g and other FUSE drivers, treated like NTFS), or `other` for the rest, which
+/// all keep POSIX names and links. A drive target prefers the name udisks reports.
+pub(crate) fn fs_type(path: &Path) -> io::Result<String> {
+    let magic = u64::try_from(rustix::fs::statfs(path)?.f_type).unwrap_or_default();
+    Ok(match magic {
+        0x4d44 => "vfat",
+        0x2011_bab0 => "exfat",
+        0x7366_746e => "ntfs3",
+        0x6573_5546 => "fuseblk",
+        _ => "other",
+    }
+    .to_string())
+}
+
+/// The allocation unit: the cluster size on FAT and exFAT.
+pub(crate) fn block_size(path: &Path) -> io::Result<u64> {
+    Ok(rustix::fs::statvfs(path)?.f_bsize.max(512))
+}
+
+/// Evicts the file's clean pages, so the next read comes from the device, not the page cache.
+pub(crate) fn drop_cache(f: &File) -> io::Result<()> {
+    Ok(rustix::fs::fadvise(
+        f,
+        0,
+        None,
+        rustix::fs::Advice::DontNeed,
+    )?)
+}
+
+/// Opens a file for reading, refusing a symlink as the last component.
+pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -644,7 +644,7 @@ fn shown(path: &Path) -> String {
 /// Whether a symlink at `rel` with this target points outside the restore directory. A `..` after
 /// a plain name is refused: it resolves against whatever the name is (another link may lead out),
 /// not against the text before it. Only a leading run of `..` no deeper than `rel` is allowed.
-fn escapes(rel: &Path, target: &Path) -> bool {
+pub(crate) fn escapes(rel: &Path, target: &Path) -> bool {
     let mut up = rel.components().count() - 1;
     let mut leading = true;
     for c in target.components() {
