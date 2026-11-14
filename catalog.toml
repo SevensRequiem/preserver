@@ -574,6 +574,7 @@ pattern = '^linux-firmware-(\d{8})\.tar\.xz$'
 sig = ".sign"
 sig_over = "xz"
 keyring = "kernel"
+signers = ["4CDE8575E547BF835FE15807A31B6BD72486CFD6"]
 license = "various-redistributable"
 est = 0.65
 
