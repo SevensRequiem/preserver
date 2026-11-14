@@ -64,7 +64,15 @@ impl Public<'_> {
             clippy::cast_sign_loss,
             reason = "a catalog estimate in GB, far below u64::MAX bytes"
         )]
-        let need = (set.estimate * 1e9) as u64;
+        let estimate = (set.estimate * 1e9) as u64;
+        // A resumed job's stage holds part of the set already. A stage of an older plan is
+        // deleted by prepare(), so its bytes come back as free space.
+        let mut staged = Vec::new();
+        let stage = Self::public_dir(root).join(&set.name).join(".staging");
+        if stage.is_dir() {
+            versioned::regular_files(&stage, "", &mut staged)?;
+        }
+        let need = estimate.saturating_sub(staged.iter().map(|(_, len)| len).sum());
         if free < reserve || need > free - reserve {
             bail!(
                 "budget: needs about {}, {} free above the {}% reserve",

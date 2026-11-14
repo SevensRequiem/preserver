@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -219,6 +219,7 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
 
     let mut slots = Vec::new();
     let mut fetches: Vec<Fetch> = Vec::new();
+    let mut side_links = Vec::new();
     for (si, (src, items)) in by.iter().enumerate() {
         std::fs::create_dir_all(stage.join(&src.name))?;
         for it in items {
@@ -238,13 +239,9 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
                 .filter(|_| link_or_copy(&prior_dir.join(&src.name).join(&it.name), &dst))
                 .map(|(p, sum)| (p.verify.clone(), sum.clone()));
             if carried.is_some() {
-                // Its signature and sums files come along, where the previous version kept them.
                 for url in &sides {
-                    let to = side(&dst, url);
                     let from = side(&prior_dir.join(&src.name).join(&it.name), url);
-                    if !to.exists() && from.is_file() {
-                        link_or_copy(&from, &to);
-                    }
+                    side_links.push((from, side(&dst, url)));
                 }
             } else {
                 if !dst.exists() {
@@ -275,6 +272,13 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
             });
         }
     }
+    // A carried file's signature and sums files come along, unless a changed file shares
+    // the path: that one needs the current sums file, not the previous version's.
+    for (from, to) in side_links {
+        if !to.exists() && from.is_file() && !fetches.iter().any(|f| f.dest == to) {
+            link_or_copy(&from, &to);
+        }
+    }
     let staged = Staged {
         set: set.clone(),
         sources: by.iter().map(|(s, _)| (*s).clone()).collect(),
@@ -286,7 +290,7 @@ pub(crate) fn prepare(set: &Set, dir: &Path, by: &[(&Source, Vec<Item>)]) -> Res
     Ok(Prepared::Staged(Box::new(staged), fetches))
 }
 
-fn regular_files(dir: &Path, rel: &str, out: &mut Vec<(String, u64)>) -> Result<()> {
+pub(crate) fn regular_files(dir: &Path, rel: &str, out: &mut Vec<(String, u64)>) -> Result<()> {
     for e in std::fs::read_dir(dir).with_context(|| dir.display().to_string())? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
@@ -346,6 +350,32 @@ fn fill_sums(stage: &Path, known: &HashMap<String, String>, sf: &mut SetFile) ->
 }
 
 impl Staged {
+    /// Only the plan's files and their side files go public: a crash can leave download
+    /// bookkeeping, or an earlier attempt's SET.toml and SHA256SUMS, in the stage.
+    fn drop_strays(&self) -> Result<()> {
+        let mut wanted = HashSet::new();
+        for slot in &self.slots {
+            let dst = self.stage.join(&slot.rel);
+            let it = &slot.item;
+            for url in [&it.sig_url, &it.sums_url, &it.sums_sig_url]
+                .into_iter()
+                .flatten()
+            {
+                wanted.insert(side(&dst, url));
+            }
+            wanted.insert(dst);
+        }
+        let mut present = Vec::new();
+        regular_files(&self.stage, "", &mut present)?;
+        for (rel, _) in present {
+            let path = self.stage.join(&rel);
+            if !wanted.contains(&path) {
+                std::fs::remove_file(&path).with_context(|| path.display().to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies every downloaded file and, only if all pass, makes the stage the newest
     /// version and prunes to `keep`. A file that fails is deleted with its signature and sums
     /// files, so the next run fetches them again; the rest of the stage is kept.
@@ -425,7 +455,11 @@ impl Staged {
             });
         }
         sf.entries = entries;
+        self.drop_strays()?;
         fill_sums(&self.stage, &known, &mut sf)?;
+        // Copies (FAT, exFAT) and directory entries must be on the disk before the previous
+        // version, which may hold the only durable copy of a carried file, is pruned.
+        platform::sync_fs(&self.stage).with_context(|| self.stage.display().to_string())?;
         let dest = self.dir.join(&version);
         std::fs::rename(&self.stage, &dest).with_context(|| dest.display().to_string())?;
         platform::sync_dir(&self.dir)?;

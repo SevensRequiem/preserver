@@ -260,7 +260,29 @@ impl Downloader {
     pub(crate) fn fetch(&self, f: &Fetch, stop: &AtomicBool, done: &AtomicU64) -> Result<(), Fail> {
         let side = f.sidecar();
         let mut part = Self::open(f, &side)?;
+        // This call's share of `done` is always `part.offset` (open, copy and reset keep it so).
+        // A failed call takes its share back, since the retry's open counts the resumed bytes
+        // again. A stop ends the run, and its count is what the paused job shows.
         done.fetch_add(part.offset, Ordering::Relaxed);
+        let r = self.transfer(f, &mut part, &side, stop, done);
+        let share = part.offset;
+        let r = r.and_then(|()| Self::finish(f, part, &side));
+        if let Err(e) = &r
+            && !matches!(e, Fail::Stopped)
+        {
+            done.fetch_sub(share, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn transfer(
+        &self,
+        f: &Fetch,
+        part: &mut Part,
+        side: &Path,
+        stop: &AtomicBool,
+        done: &AtomicU64,
+    ) -> Result<(), Fail> {
         // False once the server has shown it can't be resumed: then one plain GET, no checkpoints.
         let mut ranged = true;
         let mut restarts = 0;
@@ -268,7 +290,7 @@ impl Downloader {
             if part.total == Some(part.offset) {
                 break;
             }
-            let resp = self.request(f, &part, ranged)?;
+            let resp = self.request(f, part, ranged)?;
             let status = resp.status().as_u16();
             let head = resp.headers().clone();
             let mut body = resp.into_body().into_reader();
@@ -277,13 +299,13 @@ impl Downloader {
                     let validator = Validator::from_headers(&head);
                     let Some((first, last, total)) = content_range(&head) else {
                         // No usable Content-Range (or an unknown total): resuming is guesswork.
-                        part.reset(&side, done)?;
+                        part.reset(side, done)?;
                         ranged = false;
                         continue;
                     };
                     // Without a validator, segments of two versions could be spliced.
                     if first != part.offset || (part.offset == 0 && validator.is_none()) {
-                        part.reset(&side, done)?;
+                        part.reset(side, done)?;
                         ranged = false;
                         continue;
                     }
@@ -294,7 +316,7 @@ impl Downloader {
                         if restarts > 2 {
                             return Err(retry(format!("{}: server keeps changing", f.url)));
                         }
-                        part.reset(&side, done)?;
+                        part.reset(side, done)?;
                         continue;
                     }
                     if let Some(s) = f.size.filter(|s| *s != total) {
@@ -302,14 +324,14 @@ impl Downloader {
                     }
                     part.validator = validator;
                     part.total = Some(total);
-                    self.copy(&mut body, &mut part, Some(last - first + 1), stop, done)?;
+                    self.copy(&mut body, part, Some(last - first + 1), stop, done)?;
                     if part.offset < total {
-                        Self::checkpoint(f, &part, &side)?;
+                        Self::checkpoint(f, part, side)?;
                     }
                 }
                 200 => {
                     if part.offset > 0 {
-                        part.reset(&side, done)?;
+                        part.reset(side, done)?;
                     }
                     let len: Option<u64> = head
                         .get("content-length")
@@ -319,7 +341,13 @@ impl Downloader {
                     {
                         return Err(retry(format!("{}: {n} bytes, expected {s}", f.url)));
                     }
-                    self.copy(&mut body, &mut part, len, stop, done)?;
+                    // A ranged request's timeout covers one segment. A server that ignores
+                    // Range sends the whole file, which gets a plain GET timed by its size.
+                    if ranged && len.is_none_or(|n| n > self.checkpoint) {
+                        ranged = false;
+                        continue;
+                    }
+                    self.copy(&mut body, part, len, stop, done)?;
                     if let Some(s) = f.size.filter(|s| part.offset > *s) {
                         return Err(retry(format!(
                             "{}: more than the expected {s} bytes",
@@ -330,7 +358,7 @@ impl Downloader {
                 }
                 416 if ranged && part.offset == 0 => ranged = false,
                 416 => {
-                    part.reset(&side, done)?;
+                    part.reset(side, done)?;
                     return Err(retry(format!("{}: range rejected, restarting", f.url)));
                 }
                 408 | 429 | 500..=599 => {
@@ -342,7 +370,7 @@ impl Downloader {
                 _ => return Err(Fail::Permanent(format!("{}: HTTP {status}", f.url))),
             }
         }
-        Self::finish(f, part, &side)
+        Ok(())
     }
 
     /// Opens the part, resuming from its sidecar when the sidecar fits; anything else restarts.
@@ -483,6 +511,7 @@ impl Downloader {
         p.file.sync_data().map_err(Fail::Disk)?;
         drop(p.file);
         std::fs::rename(f.part(), &f.dest).map_err(Fail::Disk)?;
+        remove(&suffixed(side, ".tmp"))?;
         remove(side)
     }
 
@@ -607,13 +636,13 @@ mod tests {
     }
 
     /// Runs `f` once with a server that drops the connection at 2.5 MiB, leaving a part whose
-    /// last checkpoint is 2 MiB, plus trailing junk such as a killed process leaves.
-    fn interrupted(srv: &Server, d: &Downloader, f: &Fetch) {
+    /// last checkpoint is 2 MiB, plus trailing junk such as a killed process leaves. The
+    /// failed call gives back what it added to `done`.
+    fn interrupted(srv: &Server, d: &Downloader, f: &Fetch, done: &AtomicU64) {
         srv.set(|b| b.die_at = Some(5 * CP / 2));
-        let err = d
-            .fetch(f, &AtomicBool::new(false), &AtomicU64::new(0))
-            .unwrap_err();
+        let err = d.fetch(f, &AtomicBool::new(false), done).unwrap_err();
         assert!(matches!(err, Fail::Retry { .. }), "{err}");
+        assert_eq!(done.load(Ordering::Relaxed), 0);
         assert_eq!(sidecar(f).offset, 2 * CP);
         let mut part = OpenOptions::new().append(true).open(f.part()).unwrap();
         part.write_all(b"junk past the checkpoint").unwrap();
@@ -627,9 +656,10 @@ mod tests {
         let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
         let d = dl(0);
         let f = fetch(&srv, tmp.path(), "a.iso", &data);
-        interrupted(&srv, &d, &f);
-
+        // One counter for both calls, as the worker's pool shares one across retries.
         let done = AtomicU64::new(0);
+        interrupted(&srv, &d, &f, &done);
+
         d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), data);
         assert!(!f.part().exists() && !f.sidecar().exists());
@@ -648,16 +678,20 @@ mod tests {
         let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
         let d = dl(0);
         let f = fetch(&srv, tmp.path(), "b.tar", &data);
-        interrupted(&srv, &d, &f);
+        let done = AtomicU64::new(0);
+        interrupted(&srv, &d, &f, &done);
 
         srv.set(|b| b.ranges = false);
-        d.fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
-            .unwrap();
+        d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        // The whole file in answer to a segment request is not read under the segment's
+        // timeout: it is asked for again with a plain GET.
         let hits = srv.hits();
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-3145727"));
         assert_eq!(hits[0].status, 200);
-        assert_eq!(srv.served(), data.len() as u64);
+        assert_eq!((hits[1].range.as_deref(), hits[1].status), (None, 200));
+        assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
     }
 
     #[test]
@@ -668,7 +702,7 @@ mod tests {
         let srv = Server::start("127.0.0.1", Behaviour::new(old.clone()));
         let d = dl(0);
         let f = fetch(&srv, tmp.path(), "c.img", &old);
-        interrupted(&srv, &d, &f);
+        interrupted(&srv, &d, &f, &AtomicU64::new(0));
 
         srv.set(|b| {
             b.body.clone_from(&new);
@@ -694,7 +728,7 @@ mod tests {
         let srv = Server::start("127.0.0.1", Behaviour::new(old.clone()));
         let d = dl(0);
         let f = fetch(&srv, tmp.path(), "d.img", &old);
-        interrupted(&srv, &d, &f);
+        interrupted(&srv, &d, &f, &AtomicU64::new(0));
 
         // A server that ignores If-Range would splice the new version onto the old bytes.
         srv.set(|b| {
@@ -722,10 +756,10 @@ mod tests {
         let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
         let mut f = fetch(&srv, tmp.path(), "e.bin", &data);
         f.expect = Expect::Sha512([0; 64]);
-        let err = dl(0)
-            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
-            .unwrap_err();
+        let done = AtomicU64::new(0);
+        let err = dl(0).fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        assert_eq!(done.load(Ordering::Relaxed), 0);
         assert!(!f.dest.exists() && !f.part().exists());
     }
 

@@ -546,3 +546,117 @@ fn dry_run_lists_what_would_be_fetched() {
     );
     assert!(env.store.jobs().unwrap().is_empty());
 }
+
+#[test]
+fn a_changed_file_is_checked_against_the_current_sums_file() {
+    let env = Env::new();
+    let a = b"unchanged\n".to_vec();
+    let sums = |b: &[u8]| {
+        format!(
+            "{}  a.bin\n{}  b.bin\n",
+            hex(&Sha256::digest(&a)),
+            hex(&Sha256::digest(b))
+        )
+    };
+    // The unchanged file comes first, so its link of the old SUMS would be in place first.
+    let src = Source {
+        sums: "SUMS".into(),
+        urls: vec![env.srv.url("d/a.bin"), env.srv.url("d/b.bin")],
+        ..env.fixed("s", "d/a.bin")
+    };
+    let cat = catalog(2, vec![src]);
+    for round in 1..=2u8 {
+        let b = vec![round; 100];
+        env.routes(&[
+            ("d/a.bin", &a),
+            ("d/b.bin", &b),
+            ("d/SUMS", sums(&b).as_bytes()),
+        ]);
+        let job = env.sync(&cat);
+        assert_eq!(job.state, JobState::Done, "round {round}: {:?}", job.error);
+    }
+    let versions = version_dirs(&env.set_dir());
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    let new = env.set_dir().join(&versions[0]);
+    assert_eq!(
+        std::fs::read_to_string(new.join("s/SUMS")).unwrap(),
+        sums(&[2; 100])
+    );
+    let sf = read_set_file(&new.join("SET.toml"));
+    assert!(sf.entries.iter().all(|e| e.verify == "sums"), "{sf:?}");
+}
+
+#[test]
+fn a_resumed_stage_counts_toward_the_budget_and_leftovers_stay_private() {
+    let env = Env::new();
+    let big = crate::net::testserver::body(100 << 10, 9);
+    let data = b"the real release\n".to_vec();
+    let sig = env.key.sign(&data);
+    // A bad signature fails the job but leaves the plan (and so the stage) as it is.
+    env.routes(&[
+        ("d/x.bin", &big),
+        ("d/r.bin", &data),
+        ("d/r.bin.sig", &env.key.sign(b"other")),
+    ]);
+    let mut cat = catalog(
+        2,
+        vec![env.fixed("big", "d/x.bin"), env.signed("bad", "d/r.bin")],
+    );
+    assert_eq!(env.sync(&cat).state, JobState::Failed);
+
+    // What a crash leaves behind: bookkeeping and an earlier attempt's set files.
+    let staging = env.set_dir().join(".staging");
+    let stage = std::fs::read_dir(&staging)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(stage.join("big/x.bin").is_file());
+    for stray in [
+        "SET.toml",
+        "SHA256SUMS",
+        "big/x.bin.part.json",
+        "big/x.bin.part.json.tmp",
+    ] {
+        std::fs::write(stage.join(stray), b"stale").unwrap();
+    }
+
+    // 100 GB free above the reserve and an estimate 50 kB over it: the 100 KiB already
+    // staged makes it fit.
+    env.routes(&[("d/x.bin", &big), ("d/r.bin", &data), ("d/r.bin.sig", &sig)]);
+    #[expect(clippy::cast_precision_loss, reason = "test arithmetic")]
+    let estimate = (100 * GB + 50_000) as f64 / 1e9;
+    cat.sets[0].estimate = estimate;
+    let served = env.srv.served();
+    let job = env.sync_with(&cat, (200 * GB, 1000 * GB));
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(env.status()["state"].as_str(), Some("ok"));
+    assert!(
+        env.srv.served() - served < big.len() as u64,
+        "the staged file is not fetched again"
+    );
+
+    let versions = version_dirs(&env.set_dir());
+    let dir = env.set_dir().join(&versions[0]);
+    assert_eq!(
+        files(&dir),
+        [
+            "SET.toml",
+            "SHA256SUMS",
+            "bad/r.bin",
+            "bad/r.bin.sig",
+            "big/x.bin"
+        ]
+    );
+    let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+    assert_eq!(sums.lines().count(), 4, "{sums}");
+    for l in sums.lines() {
+        let (h, rel) = l.split_once("  ").unwrap();
+        assert_eq!(
+            h,
+            hex(&Sha256::digest(std::fs::read(dir.join(rel)).unwrap())),
+            "{rel}"
+        );
+    }
+}
