@@ -33,8 +33,8 @@ pub(crate) struct Inputs {
     pub jobs: Vec<queue::Job>,
     /// `all.ctl` pauses the whole queue.
     pub queue_paused: bool,
-    /// The tray itself asked systemd for a run that has not finished.
-    pub starting: bool,
+    /// Runs the tray (or the GUI) started as children that have not exited, one entry each.
+    pub starting: Vec<Command>,
     /// Why the run the tray asked for did not start or exited non-zero.
     pub start_failure: Option<String>,
     pub today: Date,
@@ -269,10 +269,17 @@ fn commands(i: &Inputs) -> Vec<CommandItem> {
             .iter()
             .any(|j| matches!(j.state, JobState::Running { .. }) && f(j))
     };
-    let personal =
-        i.starting || i.github.running() || running(|j| matches!(j.kind, JobKind::Github { .. }));
-    let local = i.starting || i.local.running() || running(|j| j.kind == JobKind::Local);
-    let public = i.public.running() || running(|j| matches!(j.kind, JobKind::Set { .. }));
+    let starts = |c: &Command| i.starting.contains(c);
+    let personal = starts(&Command::Personal)
+        || i.github.running()
+        || running(|j| matches!(j.kind, JobKind::Github { .. }));
+    let local = starts(&Command::Personal)
+        || starts(&Command::Local)
+        || i.local.running()
+        || running(|j| j.kind == JobKind::Local);
+    let public = starts(&Command::Public)
+        || i.public.running()
+        || running(|j| matches!(j.kind, JobKind::Set { .. }));
     let mut out = vec![
         CommandItem {
             cmd: Command::Personal,
@@ -293,10 +300,11 @@ fn commands(i: &Inputs) -> Vec<CommandItem> {
     out.extend(i.rules.iter().map(|(id, target)| CommandItem {
         cmd: Command::CopyRule(id.clone()),
         label: format!("Copy now: {target}"),
-        enabled: !i.jobs.iter().any(|j| {
-            matches!(j.state, JobState::Running { .. })
-                && matches!(&j.kind, JobKind::Copy { rule: Some(r), .. } if r == id)
-        }),
+        enabled: !starts(&Command::CopyRule(id.clone()))
+            && !i.jobs.iter().any(|j| {
+                matches!(j.state, JobState::Running { .. })
+                    && matches!(&j.kind, JobKind::Copy { rule: Some(r), .. } if r == id)
+            }),
     }));
     out
 }
@@ -308,8 +316,12 @@ fn queue(jobs: &[queue::Job]) -> (Option<String>, Duration) {
         (count(|s| matches!(s, JobState::Running { .. })), "running"),
         (count(|s| *s == JobState::Queued), "waiting"),
         (
-            count(|s| matches!(s, JobState::Blocked(_))),
+            count(|s| matches!(s, JobState::Blocked(r) if *r != BlockReason::NeedsTouch)),
             "waiting for drive",
+        ),
+        (
+            count(|s| *s == JobState::Blocked(BlockReason::NeedsTouch)),
+            "waiting for your key",
         ),
         (count(|s| *s == JobState::Paused), "paused"),
         (count(|s| *s == JobState::Failed), "failed"),
@@ -321,7 +333,7 @@ fn queue(jobs: &[queue::Job]) -> (Option<String>, Duration) {
         .collect::<Vec<_>>();
     let poll = if parts[0].0 > 0 {
         Duration::from_secs(5)
-    } else if parts[1..4].iter().any(|(n, _)| *n > 0) {
+    } else if parts[1..5].iter().any(|(n, _)| *n > 0) {
         Duration::from_secs(60)
     } else {
         Duration::from_secs(3600)
@@ -338,6 +350,25 @@ fn queue(jobs: &[queue::Job]) -> (Option<String>, Duration) {
     }
     let label = (!label.is_empty()).then(|| format!("Queue: {}", label.join(", ")));
     (label, poll)
+}
+
+/// How soon the GUI's status page reads the queue again: every second while a job moves, every
+/// 5 s while one waits, a minute otherwise.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) fn refresh_interval(jobs: &[queue::Job]) -> Duration {
+    let any = |f: fn(&JobState) -> bool| jobs.iter().any(|j| f(&j.state));
+    Duration::from_secs(if any(|s| matches!(s, JobState::Running { .. })) {
+        1
+    } else if any(|s| {
+        matches!(
+            s,
+            JobState::Queued | JobState::Blocked(_) | JobState::Paused
+        )
+    }) {
+        5
+    } else {
+        60
+    })
 }
 
 pub(crate) fn model(i: &Inputs) -> Model {
@@ -375,7 +406,10 @@ pub(crate) fn model(i: &Inputs) -> Model {
     } else {
         i.start_failure.clone()
     };
-    let (state, tooltip) = if i.starting || i.github.running() || i.local.running() {
+    let personal_start = [Command::Personal, Command::Local]
+        .iter()
+        .any(|c| i.starting.contains(c));
+    let (state, tooltip) = if personal_start || i.github.running() || i.local.running() {
         (State::Running, "Backing up…".to_string())
     } else if let Some(failure) = failure {
         (State::Failed, format!("Last run failed: {failure}"))
@@ -438,7 +472,7 @@ mod tests {
             daemon: Job::default(),
             jobs: Vec::new(),
             queue_paused: false,
-            starting: false,
+            starting: Vec::new(),
             start_failure: None,
             today: date(2026, 11, 13),
             tz: TimeZone::UTC,
@@ -563,7 +597,7 @@ mod tests {
             ),
             (
                 "started by the tray",
-                |i, _, _| i.starting = true,
+                |i, _, _| i.starting = vec![Command::Personal],
                 State::Running,
             ),
         ];
@@ -578,6 +612,37 @@ mod tests {
                 assert_eq!(m.tooltip, "Backing up…", "{name}");
             }
         }
+    }
+
+    #[test]
+    fn a_started_run_greys_out_only_its_own_commands() {
+        let rule = Command::CopyRule("abc123abc123".into());
+        let enabled = |starting: Vec<Command>| {
+            let mut i = inputs(job(r#"{"last_ok":"2026-11-13T08:00:00Z"}"#, false));
+            i.has_local = true;
+            i.rules = vec![("abc123abc123".into(), "stick".into())];
+            i.starting = starting;
+            let m = model(&i);
+            let on: Vec<bool> = m.commands.iter().map(|c| c.enabled).collect();
+            (on, m.state == State::Running)
+        };
+        assert_eq!(enabled(vec![]), (vec![true; 4], false));
+        assert_eq!(
+            enabled(vec![Command::Public]),
+            (vec![true, true, false, true], false)
+        );
+        assert_eq!(
+            enabled(vec![rule.clone()]),
+            (vec![true, true, true, false], false)
+        );
+        assert_eq!(
+            enabled(vec![Command::Local]),
+            (vec![true, false, true, true], true)
+        );
+        assert_eq!(
+            enabled(vec![Command::Personal, rule]),
+            (vec![false, false, true, false], true)
+        );
     }
 
     #[test]
@@ -755,7 +820,7 @@ mod tests {
             Option<&'a str>,
             u64,
         );
-        let cases: [Case; 6] = [
+        let cases: [Case; 8] = [
             ("empty", &[], false, None, None, 3600),
             (
                 "only finished",
@@ -783,6 +848,22 @@ mod tests {
                 ],
                 false,
                 Some("Queue: 2 waiting, 1 waiting for drive, 1 paused"),
+                Some("Pause queue"),
+                60,
+            ),
+            (
+                "the key is not the drive",
+                &[r#"{"blocked":"needs_touch"}"#, r#"{"blocked":"unmounted"}"#],
+                false,
+                Some("Queue: 1 waiting for drive, 1 waiting for your key"),
+                Some("Pause queue"),
+                60,
+            ),
+            (
+                "paused only",
+                &[r#""paused""#],
+                false,
+                Some("Queue: 1 paused"),
                 Some("Pause queue"),
                 60,
             ),
@@ -1029,6 +1110,26 @@ mod tests {
             let mut i = inputs(Job::default());
             i.transport = t;
             assert_eq!(model(&i).transport, t);
+        }
+    }
+
+    #[test]
+    fn gui_refresh_interval() {
+        let cases: [(&[&str], u64); 6] = [
+            (&[], 60),
+            (&[r#""done""#, r#""failed""#], 60),
+            (&[r#""queued""#], 5),
+            (&[r#"{"blocked":"needs_touch"}"#], 5),
+            (&[r#""paused""#, r#""failed""#], 5),
+            (&[r#""queued""#, r#"{"running":{"pid":7}}"#], 1),
+        ];
+        for (states, secs) in cases {
+            let jobs: Vec<_> = states.iter().map(|s| queued(s)).collect();
+            assert_eq!(
+                refresh_interval(&jobs),
+                Duration::from_secs(secs),
+                "{states:?}"
+            );
         }
     }
 }

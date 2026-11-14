@@ -16,6 +16,7 @@ const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
 enum Cmd {
     Run(Command),
     RunEnded {
+        cmd: Command,
         ok: bool,
     },
     Open,
@@ -31,19 +32,23 @@ enum Cmd {
 struct Tray {
     paths: Paths,
     tx: Sender<Cmd>,
-    /// Runs the tray started that have not ended.
-    starting: usize,
+    /// Runs the tray started that have not ended, one entry each.
+    starting: Vec<Command>,
     start_failure: Option<String>,
     model: Model,
 }
 
-fn read(paths: &Paths, starting: bool, start_failure: Option<String>) -> Model {
+fn read(paths: &Paths, starting: Vec<Command>, start_failure: Option<String>) -> Model {
     model(&actions::snapshot(paths, starting, start_failure))
 }
 
 impl Tray {
     fn refresh(&mut self) {
-        self.model = read(&self.paths, self.starting > 0, self.start_failure.clone());
+        self.model = read(
+            &self.paths,
+            self.starting.clone(),
+            self.start_failure.clone(),
+        );
     }
 
     fn send(&self, cmd: Cmd) {
@@ -185,10 +190,8 @@ impl ksni::Tray for Tray {
 }
 
 fn open_folder() {
-    let opened = std::env::current_exe()
-        .and_then(|exe| Process::new(exe).arg("open").stdin(Stdio::null()).status());
-    if !opened.is_ok_and(|s| s.success()) {
-        tracing::error!("open the archive folder failed");
+    if let Err(e) = actions::open_archive() {
+        tracing::error!("open the archive folder: {e:#}");
     }
 }
 
@@ -240,10 +243,10 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
     import_session();
     let (tx, rx) = channel();
     let tray = Tray {
-        model: read(paths, false, None),
+        model: read(paths, Vec::new(), None),
         paths: paths.clone(),
         tx: tx.clone(),
-        starting: 0,
+        starting: Vec::new(),
         start_failure: None,
     };
     // The unit may start before the panel does; ksni registers once the watcher appears, and
@@ -298,7 +301,7 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
         match rx.recv_timeout(poll) {
             Ok(Cmd::Run(cmd)) => {
                 handle.update(|t| {
-                    t.starting += 1;
+                    t.starting.push(cmd.clone());
                     t.start_failure = None;
                 });
                 // Off this thread: a foreground run lasts as long as the backup, and a mount
@@ -308,12 +311,14 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
                     let ok = actions::run(&paths, &cmd)
                         .inspect_err(|e| tracing::error!("run {cmd:?}: {e:#}"))
                         .is_ok();
-                    let _ = tx.send(Cmd::RunEnded { ok });
+                    let _ = tx.send(Cmd::RunEnded { cmd, ok });
                 });
             }
-            Ok(Cmd::RunEnded { ok }) => {
+            Ok(Cmd::RunEnded { cmd, ok }) => {
                 handle.update(|t| {
-                    t.starting = t.starting.saturating_sub(1);
+                    if let Some(at) = t.starting.iter().position(|c| *c == cmd) {
+                        t.starting.remove(at);
+                    }
                     if !ok {
                         t.start_failure =
                             Some("see journalctl --user -u preserver-tray.service".into());
@@ -337,7 +342,7 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
 fn queue_cmd(paths: &Paths, cmd: Cmd) {
     match cmd {
         Cmd::Transport(transport) => {
-            if let Err(e) = config::save_transport(&paths.cfg, transport) {
+            if let Err(e) = config::save_transport(paths, transport) {
                 tracing::error!("set the transport: {e:#}");
                 notify(true, "GitHub transport not changed", &format!("{e:#}"));
             }

@@ -122,12 +122,29 @@ impl Store {
             j.state,
             JobState::Failed | JobState::Blocked(_) | JobState::Paused
         ) {
-            self.edit_control(Some(&j.id), |c| {
-                c.retry += 1;
-                c.pause = false;
-            })?;
+            self.retry(&j, true)?;
         }
         Ok(j.id)
+    }
+
+    /// Asks the worker to run a stopped job again (and, with `unpause`, to unpause it), unless
+    /// it has not acted on an earlier ask yet. Rewriting the ctl wakes the daemon, whose
+    /// scheduler would ask again on every wake-up until the lane gets to the job.
+    pub(crate) fn retry(&self, job: &Job, unpause: bool) -> Result<bool> {
+        let c = self.control(Some(&job.id));
+        let pending = c.retry > job.retry_seen;
+        if pending && !(unpause && c.pause) {
+            return Ok(false);
+        }
+        self.edit_control(Some(&job.id), |c| {
+            if !pending {
+                c.retry += 1;
+            }
+            if unpause {
+                c.pause = false;
+            }
+        })?;
+        Ok(true)
     }
 
     /// Forgets a finished job. Worker only, like `save`.
@@ -253,6 +270,7 @@ mod tests {
         {
             let mut j = store.job(&first).unwrap();
             j.state = state;
+            j.retry_seen = store.control(Some(&first)).retry;
             store.save(&mut j).unwrap();
             store
                 .edit_control(Some(&first), |c| c.pause = true)
@@ -264,6 +282,22 @@ mod tests {
                 (u32::try_from(n).unwrap() + 1, false)
             );
         }
+
+        // A retry the worker has not seen yet is not asked again; a pause after it is undone.
+        assert_eq!(store.enqueue(&gh(None), &drive, 1, false).unwrap(), first);
+        assert_eq!(store.control(Some(&first)).retry, 3);
+        let mut j = store.job(&first).unwrap();
+        assert!(!store.retry(&j, false).unwrap());
+        store
+            .edit_control(Some(&first), |c| c.pause = true)
+            .unwrap();
+        assert!(store.retry(&j, true).unwrap());
+        let ctl = store.control(Some(&first));
+        assert_eq!((ctl.retry, ctl.pause), (3, false));
+        j.retry_seen = 3;
+        store.save(&mut j).unwrap();
+        assert!(store.retry(&j, false).unwrap());
+        assert_eq!(store.control(Some(&first)).retry, 4);
 
         let mut j = store.job(&first).unwrap();
         j.state = JobState::Done;

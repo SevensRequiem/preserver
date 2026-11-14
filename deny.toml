@@ -1,6 +1,9 @@
 [graph]
+# The GUI tree (feature "gui") is checked too.
+all-features = true
 targets = [
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-gnu",
@@ -34,6 +37,8 @@ confidence-threshold = 0.9
 # Mozilla's root store as data; only this crate may use the data license.
 exceptions = [
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    # egui's bundled fonts (Ubuntu-Light, Hack, emoji-icon-font); the texts ship in dist/licenses/.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
 ]
 
 [bans]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=preserver
+Comment=Backups and archive mirroring
+Exec=preserver-gui
+Icon=folder-git
+Terminal=false
+Categories=Utility;Archiving;
+StartupWMClass=preserver

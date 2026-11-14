@@ -1,0 +1,9 @@
+preserver-gui embeds egui's default fonts (crate epaint_default_fonts 0.37.0): Hack-Regular,
+Ubuntu-Light and egui-icons. Their licenses:
+
+Hack-Regular.txt                 Hack-Regular (MIT, Bitstream Vera License)
+UFL.txt                          Ubuntu-Light (Ubuntu Font Licence 1.0)
+Ubuntu-Light-copyright.txt       Ubuntu-Light's copyright notice, which the licence asks to keep with it
+emoji-icon-font-mit-license.txt  emoji-icon-font and its subset egui-icons (MIT)
+OFL.txt                          NotoEmoji-Regular (SIL Open Font License 1.1), embedded only with
+                                 epaint's monochrome_emoji_fonts feature, which preserver leaves off

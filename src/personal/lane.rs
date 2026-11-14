@@ -70,7 +70,7 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
     real_env(false, &|s| tracing::info!("{}", s.trim_end()), |e| {
         work(paths, &store, e, pass)
     })?;
-    record(&store, start)
+    record(paths, &store, start)
 }
 
 /// `preserver personal` in this process, under the lane lock the caller holds: runs the lane
@@ -94,7 +94,7 @@ pub(crate) fn foreground(paths: &Paths, ids: &[String]) -> Result<()> {
             s => println!("{what}: {s} (job {id})"),
         }
     }
-    record(&store, start)?;
+    record(paths, &store, start)?;
     if errs.is_empty() {
         return Ok(());
     }
@@ -272,15 +272,28 @@ fn outcome(job: &mut Job, result: Result<()>, halt: Option<Halt>, env: &Env) -> 
 }
 
 /// After a pass: notifies about the jobs that failed since `start` and forgets finished ones.
-/// The outcome stays in `status/github.json` and `status/local.json`.
-pub(crate) fn record(store: &Store, start: Timestamp) -> Result<()> {
+/// The outcome stays in `status/github.json` and `status/local.json`. A canceled job counts
+/// as a run there, so the schedule does not queue again the occurrence a person dismissed.
+pub(crate) fn record(paths: &Paths, store: &Store, start: Timestamp) -> Result<()> {
     let mut errs = Vec::new();
     for j in store.jobs()? {
         if j.kind.lane() != Lane::Personal {
             continue;
         }
         match j.state {
-            JobState::Done | JobState::Canceled => store.remove(&j.id)?,
+            JobState::Done => store.remove(&j.id)?,
+            JobState::Canceled => {
+                let name = if j.kind == JobKind::Local {
+                    "local"
+                } else {
+                    "github"
+                };
+                let file = paths.status_file(name);
+                let mut st = status::Status::read(&file);
+                st.last_run = Some(Timestamp::now());
+                st.write(&file)?;
+                store.remove(&j.id)?;
+            }
             JobState::Failed if j.updated >= start => errs.push(format!(
                 "{}: {}",
                 label(&j.kind),
@@ -385,7 +398,7 @@ mod tests {
                     .is_dir()
             );
         }
-        record(&r.store, start).unwrap();
+        record(&r.paths, &r.store, start).unwrap();
         assert!(r.store.job(&id).is_err(), "done jobs are removed");
     }
 
@@ -436,5 +449,13 @@ mod tests {
         r.run(r.mounted(), &[], false);
         assert_eq!(r.store.job(&id).unwrap().state, JobState::Canceled);
         assert!(!r.paths.status_file("local").exists());
+        let before = Timestamp::now();
+        record(&r.paths, &r.store, before).unwrap();
+        assert!(r.store.job(&id).is_err(), "canceled jobs are removed");
+        let st = status::Status::read(&r.paths.status_file("local"));
+        assert!(
+            st.last_run.is_some_and(|t| t >= before) && st.last_ok.is_none(),
+            "the dismissed run counts for the schedule: {st:?}"
+        );
     }
 }

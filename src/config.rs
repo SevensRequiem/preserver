@@ -1,3 +1,5 @@
+use crate::paths::Paths;
+use crate::platform;
 use crate::schedule::Schedule;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -82,6 +84,10 @@ impl std::fmt::Display for DriveId {
 pub(crate) struct LocalFolder {
     pub name: String,
     pub path: PathBuf,
+    /// Where the folder's data comes from (reserved for `pull`): offsite targets will skip
+    /// folders whose origin is their own provider.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +132,12 @@ fn valid_owner(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+fn valid_origin(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn valid_folder_name(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -162,81 +174,59 @@ impl Config {
             if !f.path.is_absolute() {
                 bail!("local folder {:?} needs an absolute path", f.name);
             }
+            if let Some(o) = f.origin.as_deref().filter(|o| !valid_origin(o)) {
+                bail!(
+                    "bad origin {o:?} for local folder {:?}: use a-z, 0-9 and -",
+                    f.name
+                );
+            }
         }
         Ok(c)
     }
 }
 
 /// Returns the config text with the top-level `transport` set and every other byte as it was.
-/// Only that one line is edited (no TOML writer, which would drop the comments), so the result
-/// is re-parsed: it must read as the new transport with all other settings unchanged.
 #[cfg_attr(
     windows,
     allow(dead_code, reason = "the Windows tray arrives in phase 5")
 )]
 pub(crate) fn with_transport(text: &str, transport: Transport) -> Result<String> {
-    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    let top = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    let is_key = |l: &String| {
-        l.trim_start()
-            .strip_prefix("transport")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    };
-    let assignment = format!("transport = \"{}\"", transport.as_str());
-    if let Some(line) = lines[..top].iter_mut().find(|l| is_key(l)) {
-        let (key, rest) = line.split_once('=').unwrap_or_default();
-        let value = rest.trim_start();
-        let after = value
-            .chars()
-            .next()
-            .filter(|q| matches!(q, '"' | '\''))
-            .and_then(|q| value[1..].split_once(q))
-            .map(|(_, after)| after)
-            .context("the transport line in config.toml is not a plain string")?;
-        *line = format!("{key}= \"{}\"{after}", transport.as_str());
-    } else {
-        // After the last top-level key, so a comment block above the first table stays with it.
-        let at = lines[..top]
-            .iter()
-            .rposition(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-            .map_or(0, |i| i + 1);
-        if at > 0 && !lines[at - 1].ends_with('\n') {
-            lines[at - 1].push('\n');
-        }
-        lines.insert(at, format!("{assignment}\n"));
-    }
-    let new = lines.concat();
-
-    let others = |text: &str| -> Result<toml::Table> {
-        let mut table: toml::Table = toml::from_str(text)?;
-        table.remove("transport");
-        Ok(table)
-    };
-    if Config::parse(&new).ok().map(|c| c.transport) != Some(transport)
-        || others(text)? != others(&new)?
-    {
-        bail!("cannot set the transport without touching other settings; edit config.toml by hand");
-    }
-    Ok(new)
+    use crate::config_edit::{Edit, Place, apply};
+    apply(
+        text,
+        &Edit::Set(Place::Top("transport"), transport.as_str().into()),
+    )
 }
 
-/// Writes the transport choice to `config.toml` in `dir`.
+/// Rewrites `config.toml` to what `f` makes of its text, under `preserver-config.lock`: the
+/// tray and the GUI read, edit and write it one at a time, so neither loses the other's change.
 #[cfg_attr(
     windows,
     allow(dead_code, reason = "the Windows tray arrives in phase 5")
 )]
-pub(crate) fn save_transport(dir: &Path, transport: Transport) -> Result<()> {
+pub(crate) fn rewrite(paths: &Paths, f: impl FnOnce(&str) -> Result<String>) -> Result<()> {
+    let lock_file = paths.lock_file("config");
+    platform::private_dir_all(&paths.runtime)?;
+    let _lock = platform::private_file(&lock_file)
+        .and_then(|l| l.lock().map(|()| l))
+        .with_context(|| lock_file.display().to_string())?;
     // The file may be a symlink into a dotfiles checkout: the rename must replace its target.
-    let file = std::fs::canonicalize(dir.join("config.toml"))?;
+    let file = std::fs::canonicalize(paths.cfg.join("config.toml"))?;
     let text = std::fs::read_to_string(&file)?;
-    let new = with_transport(&text, transport)?;
+    let new = f(&text)?;
     if new != text {
-        crate::platform::write_private(&file, new.as_bytes())?;
+        platform::write_private(&file, new.as_bytes())?;
     }
     Ok(())
+}
+
+/// Writes the transport choice to `config.toml`.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the Windows tray arrives in phase 5")
+)]
+pub(crate) fn save_transport(paths: &Paths, transport: Transport) -> Result<()> {
+    rewrite(paths, |text| with_transport(text, transport))
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,13 +278,14 @@ mod tests {
         let c = Config::parse(
             "owners = [\"a-b\", \"X9\"]\nprimary_uuid = \"0123ABCD-0000-4000-8000-0123456789ab\"\n\
              transport = \"https\"\nbandwidth_mbit = 0\nreserve_percent = 90\n\
-             [[local]]\nname = \"docs.v2_x-1\"\npath = \"/x\"\n",
+             [[local]]\nname = \"docs.v2_x-1\"\npath = \"/x\"\norigin = \"google\"\n",
         )
         .unwrap();
         assert_eq!(c.owners, ["a-b", "X9"]);
         assert_eq!(c.transport, Transport::Https);
         assert_eq!(c.reserve_percent, 90);
         assert_eq!(c.local[0].name, "docs.v2_x-1");
+        assert_eq!(c.local[0].origin.as_deref(), Some("google"));
     }
 
     #[test]
@@ -386,6 +377,12 @@ mod tests {
             (
                 "folder relative path",
                 format!("owners = []\n{UUID}[[local]]\nname = \"x\"\npath = \"rel\"\n"),
+            ),
+            (
+                "folder origin with a space",
+                format!(
+                    "owners = []\n{UUID}[[local]]\nname = \"x\"\npath = \"/a\"\norigin = \"a b\"\n"
+                ),
             ),
             (
                 "folder duplicate",
@@ -481,11 +478,12 @@ mod tests {
         std::fs::create_dir_all(real.parent().unwrap()).unwrap();
         let text = format!("# mine\nowners = [\"a\"]\n{UUID}reserve_percent = 20\n");
         std::fs::write(&real, &text).unwrap();
-        let cfg = tmp.path().join("cfg");
-        std::fs::create_dir(&cfg).unwrap();
+        let paths = crate::testutil::paths(tmp.path());
+        let cfg = paths.cfg.clone();
+        std::fs::create_dir_all(&cfg).unwrap();
         std::os::unix::fs::symlink(&real, cfg.join("config.toml")).unwrap();
 
-        save_transport(&cfg, Transport::Https).unwrap();
+        save_transport(&paths, Transport::Https).unwrap();
         assert!(cfg.join("config.toml").is_symlink());
         assert_eq!(
             std::fs::read_to_string(&real).unwrap(),
@@ -494,12 +492,13 @@ mod tests {
         let c = Config::load(&cfg).unwrap();
         assert_eq!((c.transport, c.reserve_percent), (Transport::Https, 20));
 
-        save_transport(&cfg, Transport::Ssh).unwrap();
+        save_transport(&paths, Transport::Ssh).unwrap();
         assert_eq!(
             std::fs::read_to_string(&real).unwrap(),
             format!("{text}transport = \"ssh\"\n")
         );
-        assert!(save_transport(&tmp.path().join("absent"), Transport::Ssh).is_err());
+        std::fs::remove_file(cfg.join("config.toml")).unwrap();
+        assert!(save_transport(&paths, Transport::Ssh).is_err());
     }
 
     #[test]

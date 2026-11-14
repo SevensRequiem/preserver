@@ -2,7 +2,7 @@
 name = "preserver"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 description = "Encrypted GitHub and local-folder backups plus public-archive mirroring to removable drives"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -30,6 +30,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 ureq = { version = "=3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier", "rustls-webpki-roots"] }
 # pins the version ureq's rustls-webpki-roots feature pulls in
 webpki-roots = { version = "=1.0.11", default-features = false }
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.6", features = ["fs", "process"] }
@@ -37,7 +38,20 @@ rustix = { version = "=1.1.6", features = ["fs", "process"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "=0.3.7", default-features = false, features = ["blocking", "async-io"] }
 zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+# dlopen libwayland at run time, so preserver-gui NEEDs no libwayland-client
+winit = { version = "=0.30.13", default-features = false, features = ["wayland-dlopen"], optional = true }
 
+[features]
+gui = ["dep:eframe", "dep:winit"]
+
+[[bin]]
+name = "preserver"
+path = "src/main.rs"
+
+[[bin]]
+name = "preserver-gui"
+path = "src/bin/preserver-gui.rs"
+required-features = ["gui"]
 
 [dev-dependencies]
 # Test keys only: its rand_core re-export is the RNG trait rpgp key generation wants.

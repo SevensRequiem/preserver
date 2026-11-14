@@ -24,6 +24,8 @@ reserve_percent = 10
 [[local]]
 name = "documents"
 path = "/home/you/Documents"
+# origin = "google"   # optional, a-z, 0-9 and - (up to 32): where the folder's data comes from.
+#                     # Reserved: nothing reads it yet.
 
 # When the daemon queues each job by itself. Leave a key out (or the whole table) and that job
 # only runs when you ask: the tray, or 'preserver personal' / 'public'. "H:MM:SS" is an interval

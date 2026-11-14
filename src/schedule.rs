@@ -138,20 +138,21 @@ pub(crate) fn due(
     }
 }
 
-/// The daemon's scheduler, run before every pass next to the copy rules'.
-pub(crate) fn tick(paths: &Paths, now: &Zoned) {
-    if let Err(e) = try_tick(paths, now) {
+/// The daemon's scheduler, run before every pass next to the copy rules'. `public_queued` is
+/// when it last queued the public sets: `status/public.json` only moves once the download lane
+/// gets to run, which a paused queue or a long pass can delay past many wake-ups.
+pub(crate) fn tick(paths: &Paths, now: &Zoned, public_queued: &mut Option<Timestamp>) {
+    if let Err(e) = try_tick(paths, now, public_queued) {
         tracing::warn!("schedule: {e:#}");
     }
 }
 
-fn try_tick(paths: &Paths, now: &Zoned) -> Result<()> {
+fn try_tick(paths: &Paths, now: &Zoned, public_queued: &mut Option<Timestamp>) -> Result<()> {
     let cfg = Config::load(&paths.cfg)?;
     let store = Store::new(paths.queue.clone());
     let jobs = store.jobs()?;
     let unfinished = |j: &&Job| !matches!(j.state, JobState::Done | JobState::Canceled);
     let last = |name: &str| Status::read(&paths.status_file(name)).last_run;
-    let retry = |id: &str| store.edit_control(Some(id), |c| c.retry += 1);
 
     let personal = [
         (
@@ -170,42 +171,42 @@ fn try_tick(paths: &Paths, now: &Zoned) -> Result<()> {
     for (s, kind, priority, name) in personal {
         let Some(s) = s else { continue };
         let pending = jobs.iter().filter(unfinished).find(|j| j.kind.same(&kind));
-        match due(&s, pending, last(name), now) {
-            Some(Act::Create) => {
+        match (due(&s, pending, last(name), now), pending) {
+            (Some(Act::Create), _) => {
                 let id = store.create(&kind, &cfg.primary_uuid, priority)?.id;
                 tracing::info!("schedule: queued {name} as {id}");
             }
-            Some(Act::Retry(id)) => {
-                retry(&id)?;
-                tracing::info!("schedule: retrying {name} job {id}");
+            (Some(Act::Retry(_)), Some(j)) if store.retry(j, false)? => {
+                tracing::info!("schedule: retrying {name} job {}", j.id);
             }
-            None => {}
+            _ => {}
         }
     }
 
     let Some(s) = cfg.schedule.public else {
         return Ok(());
     };
-    let sets: Vec<&Job> = jobs
-        .iter()
-        .filter(unfinished)
-        .filter(|j| matches!(j.kind, JobKind::Set { .. }))
-        .collect();
-    if sets.is_empty() {
-        if due(&s, None, last("public"), now) == Some(Act::Create) {
-            let cat = Catalog::embedded()?;
-            let ids =
-                public::enqueue_all(&store, &cat.select(&[], false)?, &cfg.primary_uuid, false)?;
-            tracing::info!("schedule: queued {} public sets", ids.len());
-        }
+    if due(&s, None, last("public").max(*public_queued), now) != Some(Act::Create) {
         return Ok(());
     }
-    for j in sets {
-        if let Some(Act::Retry(id)) = due(&s, Some(j), last("public"), now) {
-            retry(&id)?;
-            tracing::info!("schedule: retrying public job {id}");
-        }
-    }
+    // Every set, also when some have not finished: `enqueue` reuses a set's waiting job and
+    // retries a stopped one. A set a person paused stays paused.
+    let paused: Vec<&str> = jobs
+        .iter()
+        .filter_map(|j| match &j.kind {
+            JobKind::Set { set } if j.state == JobState::Paused => Some(set.as_str()),
+            _ => None,
+        })
+        .collect();
+    let cat = Catalog::embedded()?;
+    let sets: Vec<_> = cat
+        .select(&[], false)?
+        .into_iter()
+        .filter(|set| !paused.contains(&set.name.as_str()))
+        .collect();
+    let ids = public::enqueue_all(&store, &sets, &cfg.primary_uuid, false)?;
+    *public_queued = Some(now.timestamp());
+    tracing::info!("schedule: queued {} public sets", ids.len());
     Ok(())
 }
 
@@ -317,6 +318,75 @@ mod tests {
             let new = job(state, "2026-11-14T02:00:00Z");
             assert_eq!(due(&daily, Some(&new), None, &now), None, "{state}");
             assert_eq!(due(&day, Some(&new), None, &now), None);
+        }
+    }
+
+    /// A stopped job is asked to retry once per occurrence however often the daemon wakes, and
+    /// one stopped public set does not keep the others from being queued.
+    #[test]
+    fn tick_asks_once_and_queues_every_set() {
+        let tmp = crate::testutil::TempDir::new();
+        let paths = crate::testutil::paths(tmp.path());
+        std::fs::create_dir_all(&paths.cfg).unwrap();
+        std::fs::write(
+            paths.cfg.join("config.toml"),
+            "owners = [\"a\"]\nprimary_uuid = \"0123-ABCD\"\n[schedule]\npersonal = \"01:30\"\npublic = \"03:00\"\n",
+        )
+        .unwrap();
+        let store = Store::new(paths.queue.clone());
+        let cat = Catalog::embedded().unwrap();
+        let names: Vec<String> = cat
+            .select(&[], false)
+            .unwrap()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.len() >= 3);
+        let drive: crate::config::DriveId = "0123-ABCD".parse().unwrap();
+        let mut stopped = Vec::new();
+        for (kind, state) in [
+            (
+                JobKind::Github { transport: None },
+                JobState::Blocked(BlockReason::NeedsTouch),
+            ),
+            (
+                JobKind::Set {
+                    set: names[0].clone(),
+                },
+                JobState::Failed,
+            ),
+            (
+                JobKind::Set {
+                    set: names[1].clone(),
+                },
+                JobState::Paused,
+            ),
+        ] {
+            let mut j = store.create(&kind, &drive, 0).unwrap();
+            j.state = state;
+            j.updated = "2026-11-13T23:00:00Z".parse().unwrap();
+            let file = paths.queue.join(format!("{}.json", j.id));
+            std::fs::write(file, serde_json::to_vec(&j).unwrap()).unwrap();
+            stopped.push(j.id);
+        }
+
+        let now = at("2026-11-14T12:00:00");
+        let mut queued = None;
+        for _ in 0..3 {
+            try_tick(&paths, &now, &mut queued).unwrap();
+        }
+        let ctl = |id: &str| store.control(Some(id));
+        assert_eq!(ctl(&stopped[0]).retry, 1, "the key is asked for once");
+        assert_eq!(ctl(&stopped[1]).retry, 1, "the failed set is retried once");
+        assert_eq!(ctl(&stopped[2]).retry, 0, "paused stays paused");
+        assert_eq!(queued, Some(now.timestamp()));
+        let jobs = store.jobs().unwrap();
+        for name in &names {
+            let n = jobs
+                .iter()
+                .filter(|j| matches!(&j.kind, JobKind::Set { set } if set == name))
+                .count();
+            assert_eq!(n, 1, "{name}");
         }
     }
 

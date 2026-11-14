@@ -6,12 +6,13 @@ use crate::catalog::Catalog;
 use crate::config::{Config, DriveId, Transport};
 use crate::copy::{self, rules};
 use crate::paths::Paths;
-use crate::queue::{JobKind, Store, Target};
+use crate::queue::{JobKind, JobState, Store, Target};
 use crate::status::{self, Status};
 use crate::tray_model::{Command, Inputs, Job};
 use crate::{platform, public};
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 
 /// The daemon holds its lock for life, so the lock, not `status/daemon.json`, says it runs.
@@ -32,7 +33,8 @@ pub(crate) fn mount(id: &DriveId) {
 }
 
 /// Queues the local-folder job (when config.toml lists any) and, unless `local_only`, the
-/// GitHub one. A GitHub job already waiting keeps the transport it was queued with.
+/// GitHub one. A GitHub job already waiting over another transport than `transport` is refused
+/// rather than run over the one it was queued with.
 pub(crate) fn enqueue_personal(
     paths: &Paths,
     cfg: &Config,
@@ -40,8 +42,11 @@ pub(crate) fn enqueue_personal(
     transport: Option<Transport>,
     tidy: bool,
 ) -> Result<Vec<String>> {
-    mount(&cfg.primary_uuid);
     let store = Store::new(paths.queue.clone());
+    if let Some(t) = transport.filter(|_| !local_only) {
+        same_transport(&store, cfg, t)?;
+    }
+    mount(&cfg.primary_uuid);
     let mut ids = Vec::new();
     if !cfg.local.is_empty() {
         ids.push(store.enqueue(&JobKind::Local, &cfg.primary_uuid, 0, tidy)?);
@@ -50,6 +55,24 @@ pub(crate) fn enqueue_personal(
         ids.push(store.enqueue(&JobKind::Github { transport }, &cfg.primary_uuid, 1, tidy)?);
     }
     Ok(ids)
+}
+
+fn same_transport(store: &Store, cfg: &Config, want: Transport) -> Result<()> {
+    for j in store.jobs()? {
+        let JobKind::Github { transport } = j.kind else {
+            continue;
+        };
+        let was = transport.unwrap_or(cfg.transport);
+        ensure!(
+            matches!(j.state, JobState::Done | JobState::Canceled) || was == want,
+            "GitHub job {} is already queued over {}; cancel it (preserver queue cancel {}) \
+             or leave out --transport",
+            j.id,
+            was.as_str(),
+            j.id
+        );
+    }
+    Ok(())
 }
 
 /// Queues a job per catalog set (or the named ones).
@@ -110,16 +133,54 @@ pub(crate) fn pause_all(paths: &Paths, pause: bool) -> Result<()> {
     Store::new(paths.queue.clone()).edit_control(None, |c| c.pause = pause)
 }
 
-/// Runs `preserver <args>` as this binary, with no shell and no stdin.
+/// The `preserver` binary: this one, or the one next to preserver-gui.
+fn preserver_exe() -> std::io::Result<PathBuf> {
+    preserver_for(&std::env::current_exe()?)
+}
+
+fn preserver_for(exe: &Path) -> std::io::Result<PathBuf> {
+    let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    // An upgrade renames a new binary over the running one, and Linux then reports this
+    // process's exe as "<path> (deleted)", which no longer names a file.
+    if !name.starts_with("preserver-gui") && exe.exists() {
+        return Ok(exe.to_path_buf());
+    }
+    let sibling = exe.with_file_name(format!("preserver{}", std::env::consts::EXE_SUFFIX));
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} not found", sibling.display()),
+    ))
+}
+
+/// Runs `preserver <args>`, with no shell and no stdin.
 #[cfg_attr(
     windows,
     allow(dead_code, reason = "the Windows tray arrives in phase 5")
 )]
 pub(crate) fn spawn_foreground(args: &[String]) -> std::io::Result<Child> {
-    std::process::Command::new(std::env::current_exe()?)
-        .args(args)
-        .stdin(Stdio::null())
-        .spawn()
+    let mut cmd = std::process::Command::new(preserver_exe()?);
+    cmd.args(args).stdin(Stdio::null());
+    // preserver.exe is a console program: started from the GUI, which has no console, Windows
+    // would open a console window for every run. CREATE_NO_WINDOW.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd.spawn()
+}
+
+/// `preserver open`: mounts the primary and opens its archive folder.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the Windows tray arrives in phase 5")
+)]
+pub(crate) fn open_archive() -> Result<()> {
+    let status = spawn_foreground(&["open".to_string()])
+        .context("start preserver open")?
+        .wait()?;
+    ensure!(status.success(), "preserver open exited with {status}");
+    Ok(())
 }
 
 /// What the tray and the GUI do for a command: queue it for the daemon when one runs, else run
@@ -151,7 +212,11 @@ pub(crate) fn run(paths: &Paths, cmd: &Command) -> Result<()> {
     windows,
     allow(dead_code, reason = "the Windows tray arrives in phase 5")
 )]
-pub(crate) fn snapshot(paths: &Paths, starting: bool, start_failure: Option<String>) -> Inputs {
+pub(crate) fn snapshot(
+    paths: &Paths,
+    starting: Vec<Command>,
+    start_failure: Option<String>,
+) -> Inputs {
     let job = |name| {
         let status = Status::read(&paths.status_file(name));
         // The lock is only probed for a job that claims to run: probing takes it for an instant.
@@ -240,8 +305,46 @@ mod tests {
     #[test]
     fn snapshot_of_an_empty_home() {
         let tmp = TempDir::new();
-        let i = snapshot(&paths(tmp.path()), false, None);
+        let i = snapshot(&paths(tmp.path()), Vec::new(), None);
         assert!(i.jobs.is_empty() && i.rules.is_empty() && !i.has_local);
+    }
+
+    #[test]
+    fn the_gui_and_a_replaced_binary_run_the_preserver_next_to_them() {
+        let tmp = TempDir::new();
+        let file = |name: &str| {
+            tmp.path()
+                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        };
+        let (cli, gui) = (file("preserver"), file("preserver-gui"));
+        std::fs::write(&gui, "").unwrap();
+        assert_eq!(
+            preserver_for(&gui).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(&cli, "").unwrap();
+        assert_eq!(preserver_for(&gui).unwrap(), cli);
+        assert_eq!(preserver_for(&cli).unwrap(), cli);
+        let gone = |p: &Path| PathBuf::from(format!("{} (deleted)", p.display()));
+        assert_eq!(preserver_for(&gone(&gui)).unwrap(), cli);
+        assert_eq!(preserver_for(&gone(&cli)).unwrap(), cli);
+    }
+
+    #[test]
+    fn a_waiting_github_job_keeps_its_transport_or_refuses() {
+        let tmp = TempDir::new();
+        let store = Store::new(tmp.path().join("queue"));
+        let cfg = Config::parse("owners = [\"a\"]\nprimary_uuid = \"0123abcd-2d54\"\n").unwrap();
+        assert_eq!(cfg.transport, Transport::Ssh);
+        let mut j = store
+            .create(&JobKind::Github { transport: None }, &cfg.primary_uuid, 1)
+            .unwrap();
+        same_transport(&store, &cfg, Transport::Ssh).unwrap();
+        let e = same_transport(&store, &cfg, Transport::Https).unwrap_err();
+        assert!(e.to_string().contains("already queued over ssh"), "{e}");
+        j.state = JobState::Canceled;
+        store.save(&mut j).unwrap();
+        same_transport(&store, &cfg, Transport::Https).unwrap();
     }
 
     #[test]

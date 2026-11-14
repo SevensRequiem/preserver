@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Installs preserver and its systemd user units. See CLAUDE.md, "Install and release".
+# Installs preserver, preserver-gui and the systemd user units. See CLAUDE.md, "Install and release".
 set -euo pipefail
 
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bindir=$HOME/.local/bin
 unitdir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+desktop=${XDG_DATA_HOME:-$HOME/.local/share}/applications/preserver.desktop
 bin=$bindir/preserver
 prev=$bindir/preserver.prev
+gui=$bindir/preserver-gui
+gprev=$bindir/preserver-gui.prev
 units=(preserver-tray.service preserver-daemon.service)
 # Jobs the daemon now runs from config.toml [schedule]; removed on install and uninstall.
 retired=(preserver-personal.service preserver-local.service preserver-local.timer preserver-public.service preserver-public.timer)
@@ -19,12 +22,16 @@ ctl() { systemctl --user "$@"; }
 usage() {
 	cat <<'USAGE'
 usage: install.sh [RELEASE_DIR]   install from a downloaded release (preserver-<target> + SHA256SUMS), or build this checkout
-       install.sh --rollback      swap back to the previous binary
-       install.sh --uninstall     remove the binary and the units (data and keys stay)
+       install.sh --rollback      swap back to the previous binaries
+       install.sh --uninstall     remove the binaries, the desktop file and the units (data and keys stay)
 USAGE
 }
 
 [ "$(id -u)" -ne 0 ] || die "run as your own user, not root"
+# The desktop file's Exec quotes this path, and these characters would need escaping inside it.
+case $bindir in
+*[\"\`\$\\%]* | *$'\n'*) die "unsupported character in $bindir" ;;
+esac
 
 mkdir -p "$bindir"
 work=$(mktemp -d "$bindir/.preserver.XXXXXX")
@@ -32,30 +39,36 @@ trap 'rm -rf "$work"' EXIT
 
 uninstall() {
 	if have_systemd; then
-		ctl disable --now preserver-tray.service preserver-daemon.service preserver-local.timer preserver-public.timer 2>/dev/null || true
-		ctl stop preserver-personal.service preserver-local.service preserver-public.service 2>/dev/null || true
+		ctl disable --now preserver-tray.service preserver-daemon.service 2>/dev/null || true
+		stop_retired
 	fi
 	for u in "${units[@]}" "${retired[@]}"; do rm -f "$unitdir/$u"; done
-	rm -f "$bin" "$prev"
+	rm -f "$bin" "$prev" "$gui" "$gprev" "$desktop"
 	have_systemd && { ctl daemon-reload || true; }
-	say "removed binary, previous binary and units; config, keys, state and backups are untouched"
+	say "removed the binaries, their previous versions, the desktop file and the units; config, keys, state and backups are untouched"
+}
+
+# swap CURRENT PREVIOUS: hard links keep CURRENT present throughout, each rename is atomic.
+swap() {
+	local cur=$1 old=$2 d=$work
+	rm -f "$d/new" "$d/old"
+	ln "$old" "$d/new"
+	if [ -f "$cur" ]; then
+		ln "$cur" "$d/old"
+	fi
+	mv -f "$d/new" "$cur"
+	if [ -f "$d/old" ]; then
+		mv -f "$d/old" "$old"
+	else
+		rm -f "$old"
+	fi
+	say "rolled back: $cur is the previous binary, $old is the one replaced"
 }
 
 rollback() {
-	[ -f "$prev" ] || die "no previous binary at $prev"
-	local d=$work
-	# Hard links keep $bin present throughout: each rename is atomic.
-	ln "$prev" "$d/new"
-	if [ -f "$bin" ]; then
-		ln "$bin" "$d/old"
-	fi
-	mv -f "$d/new" "$bin"
-	if [ -f "$d/old" ]; then
-		mv -f "$d/old" "$prev"
-	else
-		rm -f "$prev"
-	fi
-	say "rolled back: $bin is the previous binary, $prev is the one replaced"
+	[ -f "$prev" ] || [ -f "$gprev" ] || die "no previous binary at $prev or $gprev"
+	if [ -f "$prev" ]; then swap "$bin" "$prev"; fi
+	if [ -f "$gprev" ]; then swap "$gui" "$gprev"; fi
 	restart_services
 }
 
@@ -64,30 +77,59 @@ restart_services() {
 	ctl try-restart preserver-tray.service preserver-daemon.service || say "warning: could not restart the tray and the daemon"
 }
 
-host_target() {
+host_arch() {
 	local arch
 	arch=$(uname -m)
 	case $arch in
-	x86_64 | aarch64) echo "$arch-unknown-linux-musl" ;;
-	arm64) echo "aarch64-unknown-linux-musl" ;;
+	x86_64 | aarch64) echo "$arch" ;;
+	arm64) echo aarch64 ;;
 	*) die "no release binary for architecture $arch" ;;
 	esac
 }
 
+# verify RELEASE_DIR NAME: stages NAME into $work and checks it against SHA256SUMS.
+verify() {
+	local rel=$1 name=$2 line
+	line=$(grep -E "^[0-9a-fA-F]{64} [ *]${name}\$" "$rel/SHA256SUMS" || true)
+	[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ] || die "SHA256SUMS needs exactly one entry for $name, nothing installed"
+	# Hash the staged copy, not the download, so what is checked is what gets installed.
+	install -m 0755 "$rel/$name" "$work/$name"
+	(cd "$work" && printf '%s\n' "$line" | sha256sum -c --status -) || die "checksum mismatch for $name, nothing installed"
+	say "checksum ok for $name"
+}
+
+# install_binary NEW NAME: NEW becomes $bindir/NAME, the one it replaces $bindir/NAME.prev.
+# Sets changed=1 when it replaced anything.
 install_binary() {
-	local new=$1 d=$work
-	install -m 0755 "$new" "$d/preserver"
-	if [ -f "$bin" ] && cmp -s "$d/preserver" "$bin"; then
-		say "$bin is already this binary"
+	local new=$1 dst=$bindir/$2 d=$work
+	changed=0
+	install -m 0755 "$new" "$d/$2.new"
+	if [ -f "$dst" ] && cmp -s "$d/$2.new" "$dst"; then
+		say "$dst is already this binary"
 		return 0
 	fi
-	if [ -f "$bin" ]; then
-		cp -p "$bin" "$d/prev"
-		mv -f "$d/prev" "$prev"
-		say "kept the previous binary as $prev"
+	changed=1
+	if [ -f "$dst" ]; then
+		cp -p "$dst" "$d/$2.prev"
+		mv -f "$d/$2.prev" "$dst.prev"
+		say "kept the previous binary as $dst.prev"
+	else
+		rm -f "$dst.prev"
 	fi
-	mv -f "$d/preserver" "$bin"
-	say "installed $bin"
+	mv -f "$d/$2.new" "$dst"
+	say "installed $dst"
+}
+
+install_desktop() {
+	local line
+	mkdir -p "$(dirname "$desktop")"
+	while IFS= read -r line; do
+		case $line in Exec=*) line="Exec=\"$gui\"" ;; esac
+		printf '%s\n' "$line"
+	done <"$src/dist/applications/preserver.desktop" >"$desktop.new"
+	chmod 0644 "$desktop.new"
+	mv -f "$desktop.new" "$desktop"
+	say "installed $desktop"
 }
 
 install_units() {
@@ -100,6 +142,13 @@ install_units() {
 	say "installed ${#units[@]} units into $unitdir"
 }
 
+# One unit per call: systemctl stops at a unit that no longer exists, before --now stops anything.
+stop_retired() {
+	local u
+	for u in preserver-local.timer preserver-public.timer; do ctl disable --now "$u" 2>/dev/null || true; done
+	for u in preserver-personal.service preserver-local.service preserver-public.service; do ctl stop "$u" 2>/dev/null || true; done
+}
+
 retire_units() {
 	local u found=0
 	for u in "${retired[@]}"; do
@@ -110,8 +159,7 @@ retire_units() {
 		if ctl is-enabled --quiet preserver-local.timer 2>/dev/null; then
 			say 'nightly local backups now come from config.toml: add local = "01:30" under [schedule]'
 		fi
-		ctl disable --now preserver-local.timer preserver-public.timer 2>/dev/null || true
-		ctl stop preserver-personal.service preserver-local.service preserver-public.service 2>/dev/null || true
+		stop_retired
 	fi
 	for u in "${retired[@]}"; do rm -f "$unitdir/$u"; done
 	say "removed the retired personal, local and public units; the daemon runs those jobs now"
@@ -143,34 +191,51 @@ case ${1-} in
 esac
 [ $# -le 1 ] || { usage >&2; exit 2; }
 
+newgui=
 if [ $# -eq 1 ]; then
 	rel=$1
-	t=$(host_target)
-	name=preserver-$t
+	arch=$(host_arch)
+	name=preserver-$arch-unknown-linux-musl
+	gname=preserver-gui-$arch-unknown-linux-gnu
 	[ -f "$rel/$name" ] || die "$rel/$name not found"
 	[ -f "$rel/SHA256SUMS" ] || die "$rel/SHA256SUMS not found"
 	command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
-	line=$(grep -E "^[0-9a-fA-F]{64} [ *]${name}\$" "$rel/SHA256SUMS" || true)
-	[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ] || die "SHA256SUMS needs exactly one entry for $name"
-	# Hash the staged copy, not the download, so what is checked is what gets installed.
-	check=$work
-	install -m 0755 "$rel/$name" "$check/$name"
-	(cd "$check" && printf '%s\n' "$line" | sha256sum -c --status -) || die "checksum mismatch for $name, nothing installed"
-	say "checksum ok for $name"
-	new=$check/$name
+	verify "$rel" "$name"
+	new=$work/$name
+	if [ ! -f "$rel/$gname" ]; then
+		if [ -f "$gui" ]; then say "this release has no $gname: left $gui as it is"; fi
+	elif ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+		say "skipped $gname: it needs glibc and this system has none"
+	else
+		verify "$rel" "$gname"
+		newgui=$work/$gname
+	fi
 else
 	[ -f "$src/Cargo.toml" ] || die "no Cargo.toml next to this script: pass a release directory"
 	command -v cargo >/dev/null 2>&1 || die "cargo not found"
-	(cd "$src" && cargo build --release --locked)
+	(cd "$src" && cargo build --release --locked --features gui)
 	new=${CARGO_TARGET_DIR:-$src/target}/release/preserver
+	newgui=${CARGO_TARGET_DIR:-$src/target}/release/preserver-gui
 	[ -f "$new" ] || die "build did not produce $new"
+	[ -f "$newgui" ] || die "build did not produce $newgui"
 fi
 
 [ -d "$src/dist/systemd" ] || die "no dist/systemd next to this script, nothing installed"
 for u in "${units[@]}"; do
 	[ -f "$src/dist/systemd/$u" ] || die "dist/systemd/$u not found, nothing installed"
 done
-install_binary "$new"
+[ -z "$newgui" ] || [ -f "$src/dist/applications/preserver.desktop" ] || die "dist/applications/preserver.desktop not found, nothing installed"
+install_binary "$new" preserver
+bin_changed=$changed gui_changed=0
+if [ -n "$newgui" ]; then
+	install_binary "$newgui" preserver-gui
+	gui_changed=$changed
+	install_desktop
+fi
+# --rollback undoes the last install, so a .prev it did not write (an older install's) goes.
+if [ "$bin_changed" -ne "$gui_changed" ]; then
+	if [ "$bin_changed" -eq 1 ]; then rm -f "$gprev"; else rm -f "$prev"; fi
+fi
 retire_units
 install_units
 enable_units

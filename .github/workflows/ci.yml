@@ -28,6 +28,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
+      - run: cargo test --locked --features gui
       - run: bash tests/install-sh.sh
       - run: shellcheck install.sh tests/install-sh.sh
 
@@ -57,5 +58,5 @@ jobs:
           persist-credentials: false
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install --profile minimal
-      - run: cargo build --locked --target ${{ matrix.target }}
-      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --locked --target ${{ matrix.target }} --features gui
+      - run: cargo test --locked --target ${{ matrix.target }} --features gui

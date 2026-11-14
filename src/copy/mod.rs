@@ -821,7 +821,7 @@ fn record(store: &Store, file: &Path, start: Timestamp) -> Result<Vec<String>> {
 }
 
 /// When each rule last ran, from `status/copy.json`.
-fn last_runs(file: &Path) -> HashMap<String, Timestamp> {
+pub(crate) fn last_runs(file: &Path) -> HashMap<String, Timestamp> {
     Status::read(file)
         .sets
         .iter()
@@ -893,7 +893,11 @@ pub(crate) fn schedule(paths: &Paths, now: Timestamp) -> Result<()> {
                 };
                 store.create(&kind, &primary, RULE_PRIORITY)?;
             }
-            rules::Act::Retry(id) => store.edit_control(Some(&id), |c| c.retry += 1)?,
+            rules::Act::Retry(id) => {
+                if let Some(j) = jobs.iter().find(|j| j.id == id) {
+                    store.retry(j, false)?;
+                }
+            }
         }
     }
     Ok(())
@@ -1102,10 +1106,60 @@ pub(crate) fn remove(paths: &Paths, store: &Store, id: &str) -> Result<String> {
     Ok(format!("canceling copy job {id}"))
 }
 
-/// Adds the rule, or replaces the one for the same target; true when it replaced one.
-pub(crate) fn add_rule(paths: &Paths, rule: rules::Rule) -> Result<(rules::Rule, bool)> {
+/// The target a person names (directory, filesystem id or label), as the CLI and GUI take it.
+pub(crate) fn resolve(paths: &Paths, cfg: &Config, arg: &str) -> Result<Target> {
+    let fss = platform::list_filesystems().unwrap_or_else(|e| {
+        println!("note: udisks2: {e:#}; only directories and ids work");
+        Vec::new()
+    });
+    let primary_mount = fss
+        .iter()
+        .find(|f| cfg.primary_uuid.matches(&f.id))
+        .and_then(|f| f.mount.clone())
+        .or_else(|| platform::is_mounted(&paths.mnt).then(|| paths.mnt.clone()));
+    resolve_target(arg, &fss, &cfg.primary_uuid, primary_mount.as_deref())
+}
+
+/// `copy --dry-run`: the plan, with sizes, as text.
+pub(crate) fn plan_text(
+    cfg: &Config,
+    target: &Target,
+    sets: &[String],
+    size: Option<u64>,
+) -> Result<String> {
+    with_real_env(&|s| print!("{s}"), |e| {
+        dry_run(e, &cfg.primary_uuid, target, sets, size)
+    })
+}
+
+/// Adds a rule every `every` (`H:MM:SS`) to `target`, or replaces the one for that target.
+/// `sets` are the tokens as given (resolved again at each run). Returns the rule and a line
+/// saying what changed.
+pub(crate) fn save_rule(
+    paths: &Paths,
+    target: &Target,
+    every: &str,
+    sets: &[String],
+    size: Option<u64>,
+) -> Result<(rules::Rule, String)> {
+    rules::resolve_sets(&Catalog::embedded()?, sets)?;
+    let interval = rules::parse_interval(every)?;
+    let rule = rules::Rule {
+        id: rules::rule_id(target),
+        interval,
+        sets: sets.to_vec(),
+        size,
+        target: target.clone(),
+    };
     let replaced = rules::upsert(&paths.copy_rules, rule.clone())?;
-    Ok((rule, replaced))
+    let msg = format!(
+        "{} rule {}: every {} to {}",
+        if replaced { "replaced" } else { "added" },
+        rule.id,
+        rules::show_interval(interval),
+        target.name()
+    );
+    Ok((rule, msg))
 }
 
 /// The job a saved rule makes: its target, resolved sets and size.
@@ -1153,47 +1207,17 @@ pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
     let Some(arg) = a.target else {
         bail!("give a target drive or directory, or --list");
     };
-    let cat = Catalog::embedded()?;
-    let sets = rules::resolve_sets(&cat, &a.sets)?;
+    let sets = rules::resolve_sets(&Catalog::embedded()?, &a.sets)?;
     let size = a.size.as_deref().map(rules::parse_size).transpose()?;
-    let interval = a.every.as_deref().map(rules::parse_interval).transpose()?;
-    let fss = platform::list_filesystems().unwrap_or_else(|e| {
-        println!("note: udisks2: {e:#}; only directories and ids work");
-        Vec::new()
-    });
-    let primary_mount = fss
-        .iter()
-        .find(|f| cfg.primary_uuid.matches(&f.id))
-        .and_then(|f| f.mount.clone())
-        .or_else(|| platform::is_mounted(&paths.mnt).then(|| paths.mnt.clone()));
-    let target = resolve_target(&arg, &fss, &cfg.primary_uuid, primary_mount.as_deref())?;
-    let say = |s: &str| print!("{s}");
+    let target = resolve(paths, cfg, &arg)?;
     if a.dry_run {
-        let text = with_real_env(&say, |e| {
-            dry_run(e, &cfg.primary_uuid, &target, &sets, size)
-        })?;
-        print!("{text}");
+        print!("{}", plan_text(cfg, &target, &sets, size)?);
         return Ok(());
     }
-    let rule = match interval {
-        Some(interval) => {
-            let (r, replaced) = add_rule(
-                paths,
-                rules::Rule {
-                    id: rules::rule_id(&target),
-                    interval,
-                    sets: a.sets.clone(),
-                    size,
-                    target: target.clone(),
-                },
-            )?;
-            println!(
-                "{} rule {}: every {} to {}",
-                if replaced { "replaced" } else { "added" },
-                r.id,
-                rules::show_interval(interval),
-                target.name()
-            );
+    let rule = match &a.every {
+        Some(every) => {
+            let (r, msg) = save_rule(paths, &target, every, &a.sets, size)?;
+            println!("{msg}");
             Some(r.id)
         }
         None => None,

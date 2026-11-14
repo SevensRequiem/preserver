@@ -92,8 +92,9 @@ pub(crate) fn run(paths: &Paths) -> Result<()> {
 
     let mut swept = Instant::now();
     let mut pass = DRIVE_EVENT;
+    let mut public_queued = None;
     loop {
-        schedule::tick(paths, &Zoned::now());
+        schedule::tick(paths, &Zoned::now(), &mut public_queued);
         if let Err(e) = copy::schedule(paths, Timestamp::now()) {
             tracing::warn!("copy rules: {e:#}");
         }

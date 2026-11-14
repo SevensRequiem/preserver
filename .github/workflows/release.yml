@@ -20,15 +20,35 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             ext: ""
+            build: ""
+            bins: preserver
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             ext: ""
+            build: ""
+            bins: preserver
+          # The GUI needs a dynamic loader for OpenGL, Wayland and X11, so on Linux it is a
+          # glibc build next to the static musl CLI.
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            build: --features gui --bin preserver-gui
+            bins: preserver-gui
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            build: --features gui --bin preserver-gui
+            bins: preserver-gui
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             ext: ".exe"
+            build: --features gui
+            bins: preserver preserver-gui
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             ext: ".exe"
+            build: --features gui
+            bins: preserver preserver-gui
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,16 +63,30 @@ jobs:
           want=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           [ "$TAG" = "v$want" ] || { echo "tag $TAG does not match Cargo.toml version $want" >&2; exit 1; }
       - name: Linux build tools
-        if: runner.os == 'Linux'
+        if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld llvm musl-tools
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install --profile minimal
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Name the binary
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.build }}
+      - name: The GUI loads its display libraries at run time
+        if: endsWith(matrix.target, '-gnu')
+        run: |
+          readelf -d "target/${{ matrix.target }}/release/preserver-gui" | tee needed.txt
+          if grep -E 'NEEDED.*(libwayland|libEGL|libGL|libX11|libxcb|libxkbcommon)' needed.txt; then
+            echo "preserver-gui links a display library; it must dlopen it" >&2
+            exit 1
+          fi
+      - name: Name the binaries
         shell: bash
+        env:
+          BINS: ${{ matrix.bins }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
         run: |
           mkdir dist-out
-          cp "target/${{ matrix.target }}/release/preserver${{ matrix.ext }}" "dist-out/preserver-${{ matrix.target }}${{ matrix.ext }}"
+          for b in $BINS; do
+            cp "target/$TARGET/release/$b$EXT" "dist-out/$b-$TARGET$EXT"
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: preserver-${{ matrix.target }}
@@ -83,4 +117,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist-out/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Download your preserver-TARGET binary, SHA256SUMS and preserver-install.tar.gz into one folder. Run sha256sum -c --ignore-missing SHA256SUMS, extract the tarball there, then run ./install.sh . (Linux) or install.bat . (Windows)."
+        run: |
+          gh release create "$TAG" dist-out/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "Download preserver-TARGET (and, for the desktop window, preserver-gui-TARGET: x86_64/aarch64 linux-gnu needs glibc; Windows .exe), SHA256SUMS and preserver-install.tar.gz into one folder. Run sha256sum -c --ignore-missing SHA256SUMS, extract the tarball there, then run ./install.sh . (Linux) or install.bat . (Windows)."

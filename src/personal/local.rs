@@ -817,6 +817,7 @@ mod tests {
         let folder = LocalFolder {
             name: "docs".to_string(),
             path: tmp.path().join("src"),
+            origin: None,
         };
         std::fs::create_dir(&folder.path).unwrap();
         Setup {
@@ -1105,10 +1106,12 @@ mod tests {
             LocalFolder {
                 name: "missing".to_string(),
                 path: s.tmp.path().join("absent"),
+                origin: None,
             },
             LocalFolder {
                 name: "docs".to_string(),
                 path: s.folder.path.clone(),
+                origin: None,
             },
         ];
         let err = backup_all(

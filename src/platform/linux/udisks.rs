@@ -139,6 +139,12 @@ pub(crate) fn mount_added(object: &str, wanted: &[DriveId]) -> Result<Option<(Dr
 /// the daemon's lanes coalesce the wake-ups.
 fn drive_event(msg: &zbus::Message) -> Option<DriveEvent> {
     let header = msg.header();
+    // The bus applies the match rule's sender to broadcasts only. A signal sent straight to this
+    // connection reaches it from anyone, and zbus's own check lets any sender through a
+    // well-known name, so a local process could fake a plug-in that way.
+    if header.destination().is_some() {
+        return None;
+    }
     let (iface, member) = (header.interface()?, header.member()?);
     match (iface.as_str(), member.as_str()) {
         ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => msg
@@ -271,6 +277,24 @@ mod tests {
             (
                 "mount points of another interface",
                 changed(BLOCK, &["MountPoints"]),
+                None,
+            ),
+            (
+                "sent to this connection only",
+                zbus::Message::signal(
+                    "/org/freedesktop/UDisks2/block_devices/sdb1",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                )
+                .unwrap()
+                .destination(":1.5")
+                .unwrap()
+                .build(&(
+                    FILESYSTEM,
+                    HashMap::from([("MountPoints", Value::from(0u32))]),
+                    Vec::<String>::new(),
+                ))
+                .unwrap(),
                 None,
             ),
             (

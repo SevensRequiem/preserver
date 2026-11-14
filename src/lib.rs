@@ -2,10 +2,13 @@ mod actions;
 mod catalog;
 pub mod cli;
 mod config;
+mod config_edit;
 mod copy;
 mod crypt;
 mod daemon;
 mod git;
+#[cfg(feature = "gui")]
+pub mod gui;
 mod keys;
 mod net;
 mod paths;

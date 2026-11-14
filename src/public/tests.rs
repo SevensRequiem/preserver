@@ -530,11 +530,19 @@ fn enqueue_while_the_daemon_works_retries_a_stopped_job_through_its_control() {
     .into_iter()
     .enumerate()
     {
+        // The worker applied every earlier retry before the job stopped again.
         let mut job = env.store.job(&ids[0]).unwrap();
         job.state = state;
+        job.retry_seen = retries();
         env.store.save(&mut job).unwrap();
         assert_eq!(enqueue_all(&env.store, &sets, &drive, false).unwrap(), ids);
         assert_eq!(retries(), u32::try_from(n).unwrap() + 1, "{state:?}");
+        enqueue_all(&env.store, &sets, &drive, false).unwrap();
+        assert_eq!(
+            retries(),
+            u32::try_from(n).unwrap() + 1,
+            "a pending retry is not asked again"
+        );
     }
     assert_eq!(env.store.jobs().unwrap().len(), 1, "no new job was made");
 }
