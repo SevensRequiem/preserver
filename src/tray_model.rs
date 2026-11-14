@@ -1,7 +1,7 @@
 //! What the tray shows, as a pure function of the status files and job locks.
 
 use crate::config::Transport;
-use crate::queue::{self, JobKind, JobState};
+use crate::queue::{self, BlockReason, JobKind, JobState, Lane};
 use crate::status::Status;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -41,6 +41,44 @@ pub(crate) struct Inputs {
     pub tz: TimeZone,
     /// `None` when config.toml does not load: the tray still shows the status.
     pub transport: Option<Transport>,
+    /// Saved copy rules as (id, target name).
+    pub rules: Vec<(String, String)>,
+    /// config.toml lists `[[local]]` folders.
+    pub has_local: bool,
+}
+
+/// Everything the tray, the GUI and the CLI can start. `args` is the foreground command line
+/// for when no daemon runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Command {
+    Personal,
+    Local,
+    Public,
+    CopyRule(String),
+}
+
+impl Command {
+    pub(crate) fn args(&self) -> Vec<String> {
+        let args: &[&str] = match self {
+            Self::Personal => &["personal", "--foreground"],
+            Self::Local => &["personal", "--local-only", "--foreground"],
+            Self::Public => &["public", "--foreground"],
+            Self::CopyRule(id) => &["copy", "--rule", id, "--foreground"],
+        };
+        args.iter().map(|a| (*a).to_string()).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandItem {
+    pub cmd: Command,
+    pub label: String,
+    pub enabled: bool,
+}
+
+/// The preserver-gui next to the running binary.
+pub(crate) fn gui_path(exe: &std::path::Path) -> std::path::PathBuf {
+    exe.with_file_name(format!("preserver-gui{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +107,6 @@ impl State {
 pub(crate) struct Model {
     pub state: State,
     pub tooltip: String,
-    pub run_label: &'static str,
     pub last_label: String,
     /// Absent until the public sync has run once.
     pub public_label: Option<String>,
@@ -82,24 +119,23 @@ pub(crate) struct Model {
     pub queue_paused: bool,
     /// The pause or resume item, shown while there is something to pause or resume.
     pub pause_label: Option<&'static str>,
-    /// Copy jobs that have not finished, each with what can be done to it.
-    pub copies: Vec<CopyItem>,
+    /// Every job that has not finished, each with what can be done to it.
+    pub jobs: Vec<JobItem>,
+    pub commands: Vec<CommandItem>,
+    /// A GitHub job is waiting for the security key.
+    pub touch_needed: Option<String>,
     /// How soon to read the files again: often while a job moves, hourly when idle.
     pub poll: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CopyItem {
+pub(crate) struct JobItem {
     pub id: String,
     pub label: String,
     pub retry: bool,
 }
 
 impl Model {
-    pub(crate) fn run_enabled(&self) -> bool {
-        self.state != State::Running
-    }
-
     /// The daily reminder is for a backup nobody is running, even when the last try failed.
     pub(crate) fn reminder_due(&self) -> bool {
         self.overdue && self.state != State::Running
@@ -138,34 +174,131 @@ fn daemon_label(job: &Job, tz: &TimeZone) -> String {
     }
 }
 
-/// Pending, running, blocked and failed copy jobs. Every one can be canceled; a stopped one
-/// can be retried.
-fn copies(jobs: &[queue::Job]) -> Vec<CopyItem> {
-    jobs.iter()
-        .filter(|j| !matches!(j.state, JobState::Done | JobState::Canceled))
-        .filter_map(|j| {
-            let JobKind::Copy { target, .. } = &j.kind else {
-                return None;
-            };
-            let p = &j.progress;
-            let state = match j.state {
-                JobState::Running { .. } if p.bytes_total > 0 => {
-                    format!("{}%", p.bytes_done.min(p.bytes_total) * 100 / p.bytes_total)
-                }
-                JobState::Running { .. } => "copying".to_string(),
-                JobState::Blocked(_) => "waiting for the drive".to_string(),
-                s => s.to_string(),
-            };
-            Some(CopyItem {
-                id: j.id.clone(),
-                label: format!("Copy to {}: {state}", target.name()),
-                retry: matches!(
-                    j.state,
-                    JobState::Failed | JobState::Blocked(_) | JobState::Paused
+#[expect(clippy::cast_precision_loss, reason = "a size shown to a few decimals")]
+fn gb(n: u64, decimals: usize) -> String {
+    format!("{:.decimals$}", n as f64 / 1e9)
+}
+
+fn percent(p: &queue::Progress) -> Option<u64> {
+    (p.bytes_total > 0).then(|| p.bytes_done.min(p.bytes_total) * 100 / p.bytes_total)
+}
+
+/// One line per job: what it is and where it stands.
+fn job_label(j: &queue::Job) -> String {
+    let p = &j.progress;
+    let cur = p.current.first().map_or("", String::as_str);
+    let item = || {
+        format!(
+            "{}/{}",
+            (p.files_done + 1).min(p.files_total),
+            p.files_total
+        )
+    };
+    let (name, running) = match &j.kind {
+        JobKind::Github { .. } => (
+            "GitHub".to_string(),
+            if p.files_total > 0 {
+                format!("repo {} ({cur})", item())
+            } else {
+                "starting".to_string()
+            },
+        ),
+        JobKind::Local => (
+            "Local folders".to_string(),
+            if p.files_total > 0 {
+                format!("{} ({cur})", item())
+            } else {
+                "starting".to_string()
+            },
+        ),
+        JobKind::Set { set } => (
+            format!("Public {set}"),
+            match percent(p) {
+                Some(pc) => format!(
+                    "{pc}% ({}/{} GB)",
+                    gb(p.bytes_done, 2),
+                    gb(p.bytes_total, 2)
                 ),
-            })
+                None if p.files_total > 0 => format!("files {}/{}", p.files_done, p.files_total),
+                None => "running".to_string(),
+            },
+        ),
+        JobKind::Copy { target, .. } => (
+            format!("Copy to {}", target.name()),
+            percent(p).map_or_else(|| "copying".to_string(), |pc| format!("{pc}%")),
+        ),
+    };
+    let what = match j.state {
+        JobState::Running { .. } => running,
+        JobState::Blocked(BlockReason::DriveAbsent) => "waiting for the drive".to_string(),
+        JobState::Blocked(BlockReason::Unmounted) => "drive not mounted".to_string(),
+        JobState::Blocked(BlockReason::NeedsTouch) => "waiting for your security key".to_string(),
+        s => s.to_string(),
+    };
+    format!("{name}: {what}")
+}
+
+/// Unfinished jobs, personal lane first, then downloads, then copies, each by priority. Every
+/// one can be canceled; a stopped one can be retried.
+fn job_items(jobs: &[queue::Job]) -> Vec<JobItem> {
+    let lane = |j: &queue::Job| match j.kind.lane() {
+        Lane::Personal => 0,
+        Lane::Download => 1,
+        Lane::Copy => 2,
+    };
+    let mut open: Vec<_> = jobs
+        .iter()
+        .filter(|j| !matches!(j.state, JobState::Done | JobState::Canceled))
+        .collect();
+    open.sort_by_key(|j| (lane(j), j.priority));
+    open.into_iter()
+        .map(|j| JobItem {
+            id: j.id.clone(),
+            label: job_label(j),
+            retry: matches!(
+                j.state,
+                JobState::Failed | JobState::Blocked(_) | JobState::Paused
+            ),
         })
         .collect()
+}
+
+fn commands(i: &Inputs) -> Vec<CommandItem> {
+    let running = |f: fn(&queue::Job) -> bool| {
+        i.jobs
+            .iter()
+            .any(|j| matches!(j.state, JobState::Running { .. }) && f(j))
+    };
+    let personal =
+        i.starting || i.github.running() || running(|j| matches!(j.kind, JobKind::Github { .. }));
+    let local = i.starting || i.local.running() || running(|j| j.kind == JobKind::Local);
+    let public = i.public.running() || running(|j| matches!(j.kind, JobKind::Set { .. }));
+    let mut out = vec![
+        CommandItem {
+            cmd: Command::Personal,
+            label: "Back up personal now".into(),
+            enabled: !personal,
+        },
+        CommandItem {
+            cmd: Command::Local,
+            label: "Back up local folders now".into(),
+            enabled: i.has_local && !local,
+        },
+        CommandItem {
+            cmd: Command::Public,
+            label: "Mirror public sets now".into(),
+            enabled: !public,
+        },
+    ];
+    out.extend(i.rules.iter().map(|(id, target)| CommandItem {
+        cmd: Command::CopyRule(id.clone()),
+        label: format!("Copy now: {target}"),
+        enabled: !i.jobs.iter().any(|j| {
+            matches!(j.state, JobState::Running { .. })
+                && matches!(&j.kind, JobKind::Copy { rule: Some(r), .. } if r == id)
+        }),
+    }));
+    out
 }
 
 /// The queue line and the poll interval, both from the job states.
@@ -193,6 +326,16 @@ fn queue(jobs: &[queue::Job]) -> (Option<String>, Duration) {
     } else {
         Duration::from_secs(3600)
     };
+    let mut label = label;
+    let (done, total) = jobs
+        .iter()
+        .filter(|j| matches!(j.state, JobState::Running { .. } | JobState::Queued))
+        .fold((0, 0), |(d, t), j| {
+            (d + j.progress.bytes_done, t + j.progress.bytes_total)
+        });
+    if total > 0 {
+        label.push(format!("{}/{} GB", gb(done.min(total), 1), gb(total, 1)));
+    }
     let label = (!label.is_empty()).then(|| format!("Queue: {}", label.join(", ")));
     (label, poll)
 }
@@ -245,11 +388,6 @@ pub(crate) fn model(i: &Inputs) -> Model {
     Model {
         state,
         tooltip,
-        run_label: if state == State::Running {
-            "Backing up…"
-        } else {
-            "Back up personal now"
-        },
         last_label,
         public_label: public_label(&i.public, &i.tz),
         overdue,
@@ -262,7 +400,13 @@ pub(crate) fn model(i: &Inputs) -> Model {
         },
         queue_label,
         queue_paused: i.queue_paused,
-        copies: copies(&i.jobs),
+        jobs: job_items(&i.jobs),
+        commands: commands(i),
+        touch_needed: i.jobs.iter().find_map(|j| {
+            (matches!(j.kind, JobKind::Github { .. })
+                && j.state == JobState::Blocked(BlockReason::NeedsTouch))
+            .then(|| j.id.clone())
+        }),
         poll,
     }
 }
@@ -299,6 +443,8 @@ mod tests {
             today: date(2026, 11, 13),
             tz: TimeZone::UTC,
             transport: Some(Transport::Ssh),
+            rules: Vec::new(),
+            has_local: false,
         }
     }
 
@@ -355,8 +501,8 @@ mod tests {
             assert_eq!(m.state, state, "{name}");
             assert_eq!(m.overdue, overdue, "{name}");
             assert_eq!(m.reminder_due(), overdue, "{name}");
-            assert!(m.run_enabled(), "{name}");
-            assert_eq!(m.run_label, "Back up personal now", "{name}");
+            assert!(m.commands[0].enabled, "{name}");
+            assert_eq!(m.commands[0].label, "Back up personal now", "{name}");
         }
     }
 
@@ -426,13 +572,10 @@ mod tests {
             set(&mut i, running(true), running(false));
             let m = model(&i);
             assert_eq!(m.state, state, "{name}");
-            assert_eq!(m.run_enabled(), state != State::Running, "{name}");
+            let busy = state == State::Running && !name.starts_with("local");
+            assert_eq!(m.commands[0].enabled, !busy, "{name}");
             if state == State::Running {
-                assert_eq!(
-                    (m.tooltip.as_str(), m.run_label),
-                    ("Backing up…", "Backing up…"),
-                    "{name}"
-                );
+                assert_eq!(m.tooltip, "Backing up…", "{name}");
             }
         }
     }
@@ -693,14 +836,11 @@ mod tests {
             queued(r#""failed""#),
         ];
         let m = model(&i);
-        let labels: Vec<_> = m
-            .copies
-            .iter()
-            .map(|c| (c.label.as_str(), c.retry))
-            .collect();
+        let labels: Vec<_> = m.jobs.iter().map(|c| (c.label.as_str(), c.retry)).collect();
         assert_eq!(
             labels,
             [
+                ("Public s: failed", true),
                 ("Copy to /media/stick: 25%", false),
                 ("Copy to /media/stick: waiting for the drive", true)
             ]
@@ -718,7 +858,169 @@ mod tests {
             m.tooltip,
             "Last run failed: copy to /media/stick: disk full"
         );
-        assert!(m.copies.last().unwrap().retry);
+        assert!(m.jobs.last().unwrap().retry);
+    }
+
+    fn kind_job(kind: &str, state: &str, progress: &str) -> queue::Job {
+        serde_json::from_str(&format!(
+            r#"{{"id":"7-8-9","kind":{kind},"priority":1,"state":{state},"attempts":1,"drive":"0123-ABCD","created":"2026-11-13T00:00:00Z","updated":"2026-11-13T00:00:00Z","progress":{progress}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn job_lines_by_kind_and_state() {
+        let running = r#"{"running":{"pid":7}}"#;
+        let gh = r#"{"github":{}}"#;
+        let set = r#"{"set":{"set":"kernel"}}"#;
+        let cases = [
+            (
+                gh,
+                running,
+                r#"{"files_done":11,"files_total":40,"current":["owner/name"]}"#,
+                "GitHub: repo 12/40 (owner/name)",
+            ),
+            (gh, running, "{}", "GitHub: starting"),
+            (
+                gh,
+                r#"{"blocked":"needs_touch"}"#,
+                "{}",
+                "GitHub: waiting for your security key",
+            ),
+            (
+                gh,
+                r#"{"blocked":"unmounted"}"#,
+                "{}",
+                "GitHub: drive not mounted",
+            ),
+            (
+                gh,
+                r#"{"blocked":"drive_absent"}"#,
+                "{}",
+                "GitHub: waiting for the drive",
+            ),
+            (
+                r#""local""#,
+                running,
+                r#"{"files_done":0,"files_total":3,"current":["documents"]}"#,
+                "Local folders: 1/3 (documents)",
+            ),
+            (
+                set,
+                running,
+                r#"{"bytes_done":1200000000,"bytes_total":2600000000}"#,
+                "Public kernel: 46% (1.20/2.60 GB)",
+            ),
+            (
+                set,
+                running,
+                r#"{"files_done":3,"files_total":9}"#,
+                "Public kernel: files 3/9",
+            ),
+            (set, r#""queued""#, "{}", "Public kernel: queued"),
+        ];
+        for (kind, state, progress, want) in cases {
+            assert_eq!(job_label(&kind_job(kind, state, progress)), want);
+        }
+        let mut i = inputs(Job::default());
+        i.jobs = vec![
+            queued(r#""queued""#),
+            copy_job(r#""queued""#, "{}", "null"),
+            kind_job(gh, r#""queued""#, "{}"),
+        ];
+        let order: Vec<_> = model(&i).jobs.iter().map(|j| j.label.clone()).collect();
+        assert_eq!(
+            order,
+            [
+                "GitHub: queued",
+                "Public s: queued",
+                "Copy to /media/stick: queued"
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_and_their_enablement() {
+        let running = r#"{"running":{"pid":7}}"#;
+        let mut i = inputs(Job::default());
+        i.rules = vec![("abc123abc123".into(), "stick".into())];
+        let m = model(&i);
+        let got: Vec<_> = m
+            .commands
+            .iter()
+            .map(|c| (c.label.as_str(), c.enabled))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Back up personal now", true),
+                ("Back up local folders now", false),
+                ("Mirror public sets now", true),
+                ("Copy now: stick", true)
+            ]
+        );
+        assert_eq!(m.commands[3].cmd, Command::CopyRule("abc123abc123".into()));
+
+        i.has_local = true;
+        i.jobs = vec![
+            kind_job(r#"{"github":{}}"#, running, "{}"),
+            kind_job(r#"{"set":{"set":"s"}}"#, running, "{}"),
+            kind_job(
+                r#"{"copy":{"target":{"dir":{"path":"/m"}},"sets":[],"rule":"abc123abc123"}}"#,
+                running,
+                "{}",
+            ),
+        ];
+        let en: Vec<_> = model(&i).commands.iter().map(|c| c.enabled).collect();
+        assert_eq!(en, [false, true, false, false]);
+        i.jobs = vec![kind_job(r#""local""#, running, "{}")];
+        let en: Vec<_> = model(&i).commands.iter().map(|c| c.enabled).collect();
+        assert_eq!(en, [true, false, true, true]);
+    }
+
+    #[test]
+    fn foreground_arguments_and_the_gui_path() {
+        assert_eq!(
+            Command::Local.args(),
+            ["personal", "--local-only", "--foreground"]
+        );
+        assert_eq!(
+            Command::CopyRule("abc".into()).args(),
+            ["copy", "--rule", "abc", "--foreground"]
+        );
+        assert_eq!(
+            gui_path(std::path::Path::new("/home/u/.local/bin/preserver")),
+            std::path::Path::new("/home/u/.local/bin/preserver-gui")
+        );
+    }
+
+    #[test]
+    fn touch_needed_and_queue_totals() {
+        let mut i = inputs(Job::default());
+        i.jobs = vec![kind_job(
+            r#"{"github":{}}"#,
+            r#"{"blocked":"needs_touch"}"#,
+            "{}",
+        )];
+        assert_eq!(model(&i).touch_needed.as_deref(), Some("7-8-9"));
+        i.jobs = vec![
+            kind_job(
+                r#"{"set":{"set":"a"}}"#,
+                r#"{"running":{"pid":7}}"#,
+                r#"{"bytes_done":4100000000,"bytes_total":10000000000}"#,
+            ),
+            kind_job(
+                r#"{"set":{"set":"b"}}"#,
+                r#""queued""#,
+                r#"{"bytes_total":8000000000}"#,
+            ),
+        ];
+        let m = model(&i);
+        assert_eq!(m.touch_needed, None);
+        assert_eq!(
+            m.queue_label.as_deref(),
+            Some("Queue: 1 running, 1 waiting, 4.1/18.0 GB")
+        );
     }
 
     #[test]

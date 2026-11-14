@@ -1,69 +1,49 @@
 use super::notify::{Reminder, notify};
 use crate::actions;
-use crate::config::{self, Config, Transport};
+use crate::config::{self, Transport};
 use crate::paths::Paths;
-use crate::queue::Store;
-use crate::status::{Status, lock_held};
-use crate::tray_model::{CopyItem, Inputs, Job, Model, model};
+use crate::tray_model::{Command, JobItem, Model, gui_path, model};
 use anyhow::{Context, Result};
 use ksni::blocking::TrayMethods;
 use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
-use std::process::{Command, Stdio};
+use std::collections::HashSet;
+use std::process::{Command as Process, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 
 const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
 
 /// What the menu and the helper threads ask of the main loop, which owns every decision.
 enum Cmd {
-    Backup,
-    BackupEnded {
+    Run(Command),
+    RunEnded {
         ok: bool,
     },
     Open,
+    OpenGui,
     Transport(Transport),
     /// Pause (true) or resume the whole queue through `all.ctl`.
     QueuePause(bool),
-    /// Cancel a copy job, or retry a stopped one, through its `.ctl`.
-    CopyCancel(String),
-    CopyRetry(String),
+    Cancel(String),
+    Retry(String),
     Quit,
 }
 
 struct Tray {
     paths: Paths,
     tx: Sender<Cmd>,
-    starting: bool,
+    /// Runs the tray started that have not ended.
+    starting: usize,
     start_failure: Option<String>,
     model: Model,
 }
 
 fn read(paths: &Paths, starting: bool, start_failure: Option<String>) -> Model {
-    let job = |name| {
-        let status = Status::read(&paths.status_file(name));
-        // The lock is only probed for a job that claims to run: probing takes it for an instant.
-        let locked = status.running && lock_held(&paths.lock_file(name));
-        Job { status, locked }
-    };
-    let store = Store::new(paths.queue.clone());
-    let now = jiff::Zoned::now();
-    model(&Inputs {
-        github: job("github"),
-        local: job("local"),
-        public: job("public"),
-        daemon: job("daemon"),
-        jobs: store.jobs().unwrap_or_default(),
-        queue_paused: store.control(None).pause,
-        starting,
-        start_failure,
-        today: now.date(),
-        tz: now.time_zone().clone(),
-        transport: Config::load(&paths.cfg).ok().map(|c| c.transport),
-    })
+    model(&actions::snapshot(paths, starting, start_failure))
 }
 
 impl Tray {
     fn refresh(&mut self) {
-        self.model = read(&self.paths, self.starting, self.start_failure.clone());
+        self.model = read(&self.paths, self.starting > 0, self.start_failure.clone());
     }
 
     fn send(&self, cmd: Cmd) {
@@ -81,7 +61,7 @@ impl ksni::Tray for Tray {
     }
 
     fn title(&self) -> String {
-        "Code archive".into()
+        "preserver".into()
     }
 
     fn status(&self) -> ksni::Status {
@@ -102,7 +82,7 @@ impl ksni::Tray for Tray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: "Code archive".into(),
+            title: "preserver".into(),
             description: self.model.tooltip.clone(),
             ..Default::default()
         }
@@ -133,12 +113,23 @@ impl ksni::Tray for Tray {
             .into()
         };
         let m = &self.model;
-        let mut items = vec![
-            action(m.run_label, "folder-download", m.run_enabled(), || {
-                Cmd::Backup
-            }),
-            info(&m.last_label),
-        ];
+        let mut items: Vec<MenuItem<Self>> = m
+            .commands
+            .iter()
+            .map(|c| {
+                let cmd = c.cmd.clone();
+                StandardItem {
+                    label: c.label.clone(),
+                    icon_name: "folder-download".into(),
+                    enabled: c.enabled,
+                    activate: Box::new(move |tray: &mut Self| tray.send(Cmd::Run(cmd.clone()))),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        items.push(MenuItem::Separator);
+        items.push(info(&m.last_label));
         items.extend(m.public_label.as_deref().map(info));
         items.push(info(&m.daemon_label));
         items.extend(m.queue_label.as_deref().map(info));
@@ -159,7 +150,7 @@ impl ksni::Tray for Tray {
                 .into(),
             );
         }
-        items.extend(m.copies.iter().map(copy_menu));
+        items.extend(m.jobs.iter().map(job_menu));
         items.push(MenuItem::Separator);
         if let Some(current) = m.transport {
             let group = RadioGroup {
@@ -185,45 +176,50 @@ impl ksni::Tray for Tray {
         items.push(action("Open archive folder", "folder-open", true, || {
             Cmd::Open
         }));
+        items.push(action("Open preserver", "preferences-system", true, || {
+            Cmd::OpenGui
+        }));
         items.push(action("Quit", "application-exit", true, || Cmd::Quit));
         items
     }
 }
 
-/// Queues the backup for the daemon, or runs `preserver personal --foreground` when none runs,
-/// and waits for it: the exit status is the only sign of a run that failed before it wrote its
-/// status file.
-fn backup(paths: &Paths) -> bool {
-    if actions::daemon_live(paths) {
-        let queued = Config::load(&paths.cfg).and_then(|cfg| {
-            actions::enqueue_personal(paths, &cfg, false, None, false)?;
-            actions::wake(paths)
-        });
-        return queued
-            .inspect_err(|e| tracing::error!("queue the backup: {e:#}"))
-            .is_ok();
-    }
-    std::env::current_exe()
-        .and_then(|exe| {
-            Command::new(exe)
-                .args(["personal", "--foreground"])
-                .stdin(Stdio::null())
-                .status()
-        })
-        .is_ok_and(|s| s.success())
-}
-
 fn open_folder() {
     let opened = std::env::current_exe()
-        .and_then(|exe| Command::new(exe).arg("open").stdin(Stdio::null()).status());
+        .and_then(|exe| Process::new(exe).arg("open").stdin(Stdio::null()).status());
     if !opened.is_ok_and(|s| s.success()) {
         tracing::error!("open the archive folder failed");
     }
 }
 
+/// Starts preserver-gui next to this binary and reaps it on a thread, so the loop never waits.
+fn open_gui() {
+    let gui = std::env::current_exe().map(|exe| gui_path(&exe));
+    let child = match gui {
+        Ok(gui) if gui.is_file() => Process::new(gui).stdin(Stdio::null()).spawn(),
+        _ => {
+            notify(
+                true,
+                "preserver-gui is not installed",
+                "Install it with install.sh from a release that ships preserver-gui.",
+            );
+            return;
+        }
+    };
+    match child {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => {
+            tracing::error!("start preserver-gui: {e}");
+            notify(true, "preserver-gui did not start", &e.to_string());
+        }
+    }
+}
+
 /// The daemon reads these from the user manager per job, for ssh's askpass dialog.
 fn import_session() {
-    let imported = Command::new("systemctl")
+    let imported = Process::new("systemctl")
         .args([
             "--user",
             "import-environment",
@@ -247,7 +243,7 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
         model: read(paths, false, None),
         paths: paths.clone(),
         tx: tx.clone(),
-        starting: false,
+        starting: 0,
         start_failure: None,
     };
     // The unit may start before the panel does; ksni registers once the watcher appears, and
@@ -258,20 +254,22 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
         .context("start the tray")?;
     let reminder_tx = tx.clone();
     let reminder = Reminder::new(move || {
-        let _ = reminder_tx.send(Cmd::Backup);
+        let _ = reminder_tx.send(Cmd::Run(Command::Personal));
     })
     .inspect_err(|e| tracing::warn!("no reminders: {e:#}"))
     .ok();
     let mut last_shown = None;
+    let mut touch_shown = HashSet::new();
 
     loop {
-        let (due, last, poll) = handle
+        let (due, last, poll, touch) = handle
             .update(|t| {
                 t.refresh();
                 (
                     t.model.reminder_due(),
                     t.model.last_label.clone(),
                     t.model.poll,
+                    t.model.touch_needed.clone(),
                 )
             })
             .context("the tray service stopped")?;
@@ -280,63 +278,54 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
             last_shown = Some(today);
             if let Some(reminder) = reminder.clone() {
                 // Off this thread: a notification server that hangs must not freeze the menu.
-                std::thread::spawn(move || reminder.show(&format!("{last}.")));
+                std::thread::spawn(move || {
+                    reminder.show("Personal backup overdue", &format!("{last}."));
+                });
             }
+        }
+        if let Some(id) = touch
+            && touch_shown.insert(id)
+            && let Some(reminder) = reminder.clone()
+        {
+            std::thread::spawn(move || {
+                reminder.show(
+                    "GitHub backup is waiting for your security key",
+                    "Touch the key when asked, or press Back up now to ask again.",
+                );
+            });
         }
 
         match rx.recv_timeout(poll) {
-            Ok(Cmd::Backup) => {
-                let start = handle.update(|t| {
-                    let idle = t.model.run_enabled();
-                    if idle {
-                        t.starting = true;
-                        t.start_failure = None;
-                    }
-                    idle
-                });
-                if start == Some(true) {
-                    let (tx, paths) = (tx.clone(), paths.clone());
-                    std::thread::spawn(move || tx.send(Cmd::BackupEnded { ok: backup(&paths) }));
-                }
-            }
-            Ok(Cmd::BackupEnded { ok }) => {
+            Ok(Cmd::Run(cmd)) => {
                 handle.update(|t| {
-                    t.starting = false;
+                    t.starting += 1;
+                    t.start_failure = None;
+                });
+                // Off this thread: a foreground run lasts as long as the backup, and a mount
+                // may wait on polkit.
+                let (tx, paths) = (tx.clone(), paths.clone());
+                std::thread::spawn(move || {
+                    let ok = actions::run(&paths, &cmd)
+                        .inspect_err(|e| tracing::error!("run {cmd:?}: {e:#}"))
+                        .is_ok();
+                    let _ = tx.send(Cmd::RunEnded { ok });
+                });
+            }
+            Ok(Cmd::RunEnded { ok }) => {
+                handle.update(|t| {
+                    t.starting = t.starting.saturating_sub(1);
                     if !ok {
                         t.start_failure =
                             Some("see journalctl --user -u preserver-tray.service".into());
                     }
                 });
             }
+            Ok(Cmd::OpenGui) => open_gui(),
             Ok(Cmd::Open) => {
                 std::thread::spawn(open_folder);
             }
-            Ok(Cmd::Transport(transport)) => {
-                if let Err(e) = config::save_transport(&paths.cfg, transport) {
-                    tracing::error!("set the transport: {e:#}");
-                    notify(true, "GitHub transport not changed", &format!("{e:#}"));
-                }
-            }
-            Ok(Cmd::QueuePause(pause)) => {
-                let store = Store::new(paths.queue.clone());
-                if let Err(e) = store.edit_control(None, |c| c.pause = pause) {
-                    tracing::error!("pause the queue: {e:#}");
-                }
-            }
-            Ok(Cmd::CopyCancel(id)) => {
-                let store = Store::new(paths.queue.clone());
-                if let Err(e) = store.edit_control(Some(&id), |c| c.cancel = true) {
-                    tracing::error!("cancel copy {id}: {e:#}");
-                }
-            }
-            Ok(Cmd::CopyRetry(id)) => {
-                // Off this thread: the mount may wait on polkit.
-                let paths = paths.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = actions::retry(&paths, &id) {
-                        tracing::error!("retry copy {id}: {e:#}");
-                    }
-                });
+            Ok(cmd @ (Cmd::Transport(_) | Cmd::QueuePause(_) | Cmd::Cancel(_) | Cmd::Retry(_))) => {
+                queue_cmd(paths, cmd);
             }
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {}
@@ -344,15 +333,47 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
     }
 }
 
-/// A copy job's entry: its line, and cancel and retry under it.
-fn copy_menu(c: &CopyItem) -> MenuItem<Tray> {
+/// The menu entries that only touch config.toml or the queue's control files.
+fn queue_cmd(paths: &Paths, cmd: Cmd) {
+    match cmd {
+        Cmd::Transport(transport) => {
+            if let Err(e) = config::save_transport(&paths.cfg, transport) {
+                tracing::error!("set the transport: {e:#}");
+                notify(true, "GitHub transport not changed", &format!("{e:#}"));
+            }
+        }
+        Cmd::QueuePause(pause) => {
+            if let Err(e) = actions::pause_all(paths, pause) {
+                tracing::error!("pause the queue: {e:#}");
+            }
+        }
+        Cmd::Cancel(id) => {
+            if let Err(e) = actions::cancel(paths, &id) {
+                tracing::error!("cancel {id}: {e:#}");
+            }
+        }
+        Cmd::Retry(id) => {
+            // Off this thread: the mount may wait on polkit.
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = actions::retry(&paths, &id) {
+                    tracing::error!("retry {id}: {e:#}");
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// A job's entry: its line, and cancel and retry under it.
+fn job_menu(c: &JobItem) -> MenuItem<Tray> {
     let (cancel, retry) = (c.id.clone(), c.id.clone());
     let mut submenu: Vec<MenuItem<Tray>> = vec![
         StandardItem {
             label: "Cancel".into(),
             icon_name: "process-stop".into(),
             activate: Box::new(move |tray: &mut Tray| {
-                tray.send(Cmd::CopyCancel(cancel.clone()));
+                tray.send(Cmd::Cancel(cancel.clone()));
             }),
             ..Default::default()
         }
@@ -364,7 +385,7 @@ fn copy_menu(c: &CopyItem) -> MenuItem<Tray> {
                 label: "Retry".into(),
                 icon_name: "view-refresh".into(),
                 activate: Box::new(move |tray: &mut Tray| {
-                    tray.send(Cmd::CopyRetry(retry.clone()));
+                    tray.send(Cmd::Retry(retry.clone()));
                 }),
                 ..Default::default()
             }

@@ -55,7 +55,7 @@ pub enum Command {
     /// Copy the archive to another drive or a directory, fitted to its free space
     Copy {
         /// A directory, a filesystem id, or a filesystem label
-        #[arg(required_unless_present_any = ["list", "remove"])]
+        #[arg(required_unless_present_any = ["list", "remove", "rule"])]
         target: Option<String>,
         /// Keep copying every hh:mm:ss (a rule in copy.toml)
         #[arg(short = 't', value_name = "HH:MM:SS")]
@@ -75,6 +75,9 @@ pub enum Command {
         /// Remove a copy rule (by id) or cancel a copy job
         #[arg(long, value_name = "ID", conflicts_with = "target")]
         remove: Option<String>,
+        /// Run a saved rule now, ahead of its schedule
+        #[arg(long, value_name = "ID", conflicts_with_all = ["target", "every", "sets", "size", "dry_run", "list", "remove"])]
+        rule: Option<String>,
         /// Run here even when the daemon runs, instead of queueing for it
         #[arg(long, conflicts_with_all = ["list", "remove"])]
         foreground: bool,
@@ -245,6 +248,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             list,
             remove,
+            rule,
             foreground,
         } => {
             let (mut paths, cfg) = load()?;
@@ -259,6 +263,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     dry_run,
                     list,
                     remove,
+                    rule,
                     foreground,
                 },
             )

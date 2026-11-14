@@ -28,7 +28,7 @@ fn send(
         Some(NOTIFICATIONS),
         "Notify",
         &(
-            "Code archive",
+            "preserver",
             replaces,
             "folder-git",
             title,
@@ -49,7 +49,7 @@ pub(crate) fn notify(urgent: bool, title: &str, body: &str) {
     }
 }
 
-/// The overdue reminder with its "Back up now" button. One connection and one listener serve
+/// A reminder (overdue, or waiting for the key) with its "Back up now" button. One connection and one listener serve
 /// every reminder, and a new one replaces the one still on screen.
 #[derive(Clone)]
 pub(crate) struct Reminder {
@@ -88,19 +88,11 @@ impl Reminder {
         Ok(Self { bus, shown })
     }
 
-    pub(crate) fn show(&self, body: &str) {
+    pub(crate) fn show(&self, title: &str, body: &str) {
         // Relaxed: see the listener.
         let previous = self.shown.load(Ordering::Relaxed);
         let actions = [RUN, "Back up now"];
-        match send(
-            &self.bus,
-            previous,
-            false,
-            "Personal backup overdue",
-            body,
-            &actions,
-            0,
-        ) {
+        match send(&self.bus, previous, false, title, body, &actions, 0) {
             Ok(id) => self.shown.store(id, Ordering::Relaxed),
             Err(e) => tracing::warn!("reminder: {e}"),
         }

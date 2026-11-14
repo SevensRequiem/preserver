@@ -37,7 +37,7 @@ const STATE: &str = ".state/copy.json";
 const PERSONAL: [&str; 2] = ["github-repos-personal", "local-personal"];
 /// One-off copies go before the ones a rule makes.
 const ONE_OFF_PRIORITY: u32 = 10;
-const RULE_PRIORITY: u32 = 20;
+pub(crate) const RULE_PRIORITY: u32 = 20;
 
 /// `<target>/preserver/.state/copy.json`: marks the tree as a copy's, and remembers what the
 /// personal files and the kit were when they were copied.
@@ -1075,6 +1075,7 @@ pub(crate) struct Args {
     pub dry_run: bool,
     pub list: bool,
     pub remove: Option<String>,
+    pub rule: Option<String>,
     pub foreground: bool,
 }
 
@@ -1107,6 +1108,20 @@ pub(crate) fn add_rule(paths: &Paths, rule: rules::Rule) -> Result<(rules::Rule,
     Ok((rule, replaced))
 }
 
+/// The job a saved rule makes: its target, resolved sets and size.
+pub(crate) fn rule_kind(paths: &Paths, id: &str) -> Result<JobKind> {
+    let rule = rules::load(&paths.copy_rules)?
+        .into_iter()
+        .find(|r| r.id == id)
+        .with_context(|| format!("no copy rule {id}"))?;
+    Ok(JobKind::Copy {
+        sets: rules::rule_sets(&Catalog::embedded()?, &rule)?,
+        target: rule.target,
+        size: rule.size,
+        rule: Some(rule.id),
+    })
+}
+
 /// `preserver copy`.
 pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
     let store = Store::new(paths.queue.clone());
@@ -1125,6 +1140,15 @@ pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
     if let Some(id) = a.remove {
         println!("{}", remove(paths, &store, &id)?);
         return Ok(());
+    }
+    if let Some(id) = a.rule {
+        let Some((_lock, ids)) = actions::handoff(paths, "copy-queue", a.foreground, |tidy| {
+            Ok(vec![actions::enqueue_copy_rule(paths, cfg, &id, tidy)?])
+        })?
+        else {
+            return Ok(());
+        };
+        return run_here(paths, &store, &ids[0]);
     }
     let Some(arg) = a.target else {
         bail!("give a target drive or directory, or --list");
