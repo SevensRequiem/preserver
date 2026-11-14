@@ -4,7 +4,7 @@
 mod json;
 mod listing;
 
-use crate::catalog::{Kind, Resolve, Source};
+use crate::catalog::{Kind, Resolve, SigOver, Source};
 use crate::net::download::Downloader;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -165,7 +165,12 @@ impl Resolver<'_> {
             }
             self.check_url(&it.url)?;
             if !s.sig.is_empty() && it.sig_url.is_none() {
-                it.sig_url = Some(format!("{}{}", it.url, s.sig));
+                // kernel.org signs the uncompressed tar: X.tar.xz is verified with X.tar.sign.
+                let base = match s.sig_over {
+                    Some(SigOver::Xz) => it.url.strip_suffix(".xz").unwrap_or(&it.url),
+                    None => &it.url,
+                };
+                it.sig_url = Some(format!("{base}{}", s.sig));
             }
             if !s.sums.is_empty() && it.sums_url.is_none() {
                 let name = s.sums.replace("{file}", &it.name);
@@ -557,6 +562,22 @@ pub(crate) mod tests {
                 srv.url("rel/alpine-standard-3.24.0-x86_64.iso.asc")
                     .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn a_signature_over_the_tar_drops_the_compression_suffix() {
+        let srv = serve(&[("fw/linux-firmware-20261019.tar.xz", b"x")]);
+        let dl = downloader();
+        let r = resolver(&dl, "");
+        let mut s = http(Resolve::Static);
+        s.urls = vec![srv.url("fw/linux-firmware-20261019.tar.xz")];
+        s.sig = ".sign".into();
+        s.sig_over = Some(SigOver::Xz);
+        let it = r.resolve(&s).unwrap().remove(0);
+        assert_eq!(
+            it.sig_url.as_deref(),
+            Some(srv.url("fw/linux-firmware-20261019.tar.sign").as_str())
         );
     }
 
