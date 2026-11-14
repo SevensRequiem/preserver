@@ -8,6 +8,21 @@ pub(crate) enum JobKind {
     Set { set: String },
 }
 
+/// Which daemon lane runs a job. A lane resets, applies and saves only its own jobs, so two
+/// lanes can share the queue directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    Download,
+}
+
+impl JobKind {
+    pub(crate) fn lane(&self) -> Lane {
+        match self {
+            Self::Set { .. } => Lane::Download,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BlockReason {

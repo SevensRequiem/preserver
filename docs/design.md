@@ -162,7 +162,7 @@ src/platform/windows/{volumes.rs, devnotify.rs, tray.rs (Shell_NotifyIcon + ball
 | `mount(&DriveId) -> PathBuf` | udisks `Filesystem.Mount` with `auth.no_user_interaction` (replaces the udisksctl exec) | resolve the volume path; no mount step |
 | `disk_free(&Path) -> (free, total)` | rustix statvfs | GetDiskFreeSpaceExW |
 | `is_mounted(&Path)` | st_dev differs from the parent's | volume root exists |
-| `watch_drives(Sender<DriveEvent>)` | InterfacesAdded/Removed signals | CM_Register_Notification on GUID_DEVINTERFACE_VOLUME |
+| `watch_drives(on_change: impl Fn())` (no ids: the listener rescans) | one match rule on udisks InterfacesAdded and Filesystem MountPoints changes, reconnecting every 30 s | CM_Register_Notification on GUID_DEVINTERFACE_VOLUME |
 | `run_tray(TrayModel, Receiver<..>)` | ksni blocking | hidden top-level window + Shell_NotifyIconW |
 | `notify(Alert)` | org.freedesktop.Notifications with the "run" action | NIF_INFO balloon, where NIN_BALLOONUSERCLICK means run |
 | `open_path` | xdg-open | explorer.exe |
@@ -197,13 +197,13 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Aspect | Design |
 |---|---|
 | Store | `~/.local/state/preserver/queue/<id>.json`, written only by the worker (tmp + rename). Control lives in `<id>.ctl`, written by the CLI and tray. New jobs are created with `O_EXCL` by anyone. The worker rescans every 1 s |
-| Single worker | `preserver queue run` holds `preserver-queue.lock`. `public`, `clone` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running". A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
+| Lanes and daemon | Each job kind belongs to a lane (`Lane::Download` now, copy in step 5); a worker resets and writes only its own lane's jobs. `preserver daemon` (user service) runs one thread per lane and takes the lane lock for one pass at a time: a 30 s tick (crashed jobs only), a drive event or the hourly sweep (also `Blocked`). `public`, `clone` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running", and a stopped job they name gets a `retry` in its ctl. A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
 | Per-file state | The filesystem is the state: a final file exists only after verification. A partial is `<dest>.part` + `<dest>.part.json` (PartState). Repo generations add `.staging/<gen>/done.tsv` (append-only, fsync batched) |
 | Priority | `Job.priority` is the position in first-pass catalog order (`--first-pass`), or stable by `priority` then catalog order. Within a job, items keep plan order |
 | Concurrency | `downloads = 4` threads. Per-host semaphores default to 2, overridable in config `[hosts]` (e.g. `"huggingface.co" = 4`) |
 | Retry | Per item: backoff 5 s·2ⁿ with jitter, capped at 10 min, 6 tries per run. 4xx other than 408/429 is permanent. A 429/503 `Retry-After` pauses the whole host. After that the job is Failed, and the next timer run retries it |
 | Pause/resume/cancel | Applied at the next 64 KiB chunk. Pause keeps `.part` files. Cancel deletes the job's staging. `queue pause --all` writes a global ctl |
-| Unplug | A write error showing the mount is gone (ENOENT/EIO/ENODEV, or `is_mounted` false) puts every job on that drive into `Blocked(DriveAbsent)` without counting attempts. The tray's drive watcher resumes them on replug |
+| Unplug | A write error showing the mount is gone (ENOENT/EIO/ENODEV, or `is_mounted` false) puts every job on that drive into `Blocked(DriveAbsent)` without counting attempts. The daemon's drive watcher resumes them on replug |
 | Bandwidth | One global token bucket (default `bandwidth_mbit = 80`, 0 = off, burst 256 KiB). It is taken before each body read in `net` and in the gix Http backend. It counts payload bytes, so the wire is about 2–3% above; TCP backpressure keeps the link honest. Personal ssh fetches are unthrottled, as now |
 | Resume | Segmented GETs, each with Range + If-Range (validator) and `timeout_recv_body` 10 min. A segment end is a checkpoint: `sync_data` the part, then write the sidecar atomically. On resume: truncate the part to `offset`, restore the hashers from the midstate, continue. 200 instead of 206 means restart from 0. A part without a sidecar is re-hashed once. Without Range support it is a single stream with a size-derived timeout and no resume. BLAKE3 has no public midstate, so its sources re-hash on resume |
 | Midstate | **Persist it.** `ResumableSha256/512` wrap `sha2::compress256/512`. Checkpoints sit on 64 MiB boundaries, so the state is just the words plus the length, and the sidecar carries a version number |

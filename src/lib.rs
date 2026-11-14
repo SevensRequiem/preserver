@@ -2,6 +2,7 @@ mod catalog;
 pub mod cli;
 mod config;
 mod crypt;
+mod daemon;
 mod git;
 mod keys;
 mod net;

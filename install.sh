@@ -7,7 +7,7 @@ bindir=$HOME/.local/bin
 unitdir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 bin=$bindir/preserver
 prev=$bindir/preserver.prev
-units=(preserver-tray.service preserver-personal.service preserver-local.service preserver-local.timer preserver-public.service preserver-public.timer)
+units=(preserver-tray.service preserver-daemon.service preserver-personal.service preserver-local.service preserver-local.timer preserver-public.service preserver-public.timer)
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "install.sh: $*"; }
@@ -30,7 +30,7 @@ trap 'rm -rf "$work"' EXIT
 
 uninstall() {
 	if have_systemd; then
-		ctl disable --now preserver-tray.service preserver-local.timer preserver-public.timer 2>/dev/null || true
+		ctl disable --now preserver-tray.service preserver-daemon.service preserver-local.timer preserver-public.timer 2>/dev/null || true
 		ctl stop preserver-personal.service preserver-local.service preserver-public.service 2>/dev/null || true
 	fi
 	for u in "${units[@]}"; do rm -f "$unitdir/$u"; done
@@ -54,12 +54,12 @@ rollback() {
 		rm -f "$prev"
 	fi
 	say "rolled back: $bin is the previous binary, $prev is the one replaced"
-	restart_tray
+	restart_services
 }
 
-restart_tray() {
+restart_services() {
 	have_systemd || return 0
-	ctl try-restart preserver-tray.service || say "warning: could not restart the tray"
+	ctl try-restart preserver-tray.service preserver-daemon.service || say "warning: could not restart the tray and the daemon"
 }
 
 host_target() {
@@ -99,13 +99,15 @@ install_units() {
 }
 
 enable_units() {
-	have_systemd || { say "warning: no systemd user session, units are installed but not enabled; from a login session run: systemctl --user daemon-reload && systemctl --user enable --now preserver-tray.service preserver-local.timer"; return 0; }
+	have_systemd || { say "warning: no systemd user session, units are installed but not enabled; from a login session run: systemctl --user daemon-reload && systemctl --user enable --now preserver-tray.service preserver-local.timer preserver-daemon.service"; return 0; }
 	ctl daemon-reload
-	ctl enable preserver-tray.service preserver-local.timer
+	ctl enable preserver-tray.service preserver-local.timer preserver-daemon.service
 	ctl start preserver-local.timer
-	ctl try-restart preserver-tray.service || true
+	# A new binary only takes over once the long-running services restart.
+	ctl try-restart preserver-tray.service preserver-daemon.service || true
+	ctl start preserver-daemon.service || say "warning: daemon not started; see journalctl --user -u preserver-daemon.service"
 	ctl start preserver-tray.service || say "warning: tray not started (no graphical session?); it starts with the next one"
-	say "enabled preserver-tray.service and preserver-local.timer (nightly 01:30)"
+	say "enabled preserver-tray.service, preserver-daemon.service and preserver-local.timer (nightly 01:30)"
 	say "preserver-public.timer is installed but not enabled: systemctl --user enable --now preserver-public.timer"
 }
 

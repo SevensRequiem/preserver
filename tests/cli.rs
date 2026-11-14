@@ -100,6 +100,44 @@ fn tray_without_a_session_bus_fails_cleanly() {
     assert!(stderr(&out).contains("start the tray"), "{}", stderr(&out));
 }
 
+#[test]
+fn a_second_daemon_waits_for_the_first() {
+    use std::io::BufRead;
+    let root = fresh_dir("daemon");
+    // The test plays the running daemon by holding its lock.
+    let lock = std::fs::File::create(root.join("run/preserver-daemon.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let mut child = preserver(&root)
+        .arg("daemon")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let _ = tx.send(line.unwrap_or_default());
+        }
+    });
+    let mut seen = Vec::new();
+    let waiting = loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(line) if line.contains("waiting for the running daemon to exit") => break true,
+            Ok(line) => seen.push(line),
+            Err(_) => break false,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(waiting, "{seen:?}");
+    assert!(
+        !root
+            .join("home/.local/state/preserver/status/daemon.json")
+            .exists(),
+        "a waiting daemon writes nothing"
+    );
+}
+
 fn local_status(root: &Path) -> String {
     std::fs::read_to_string(root.join("home/.local/state/preserver/status/local.json")).unwrap()
 }

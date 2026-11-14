@@ -1,7 +1,7 @@
 //! The worker: one job at a time, its files over `STREAMS` threads with at most `PER_HOST` per
 //! host, per-file retries with backoff, and the controls applied while it runs.
 
-use super::job::{BlockReason, Job, JobState, Progress};
+use super::job::{BlockReason, Job, JobState, Lane, Progress};
 use super::store::Store;
 use crate::config::DriveId;
 use crate::net::download::{Downloader, Fail, Fetch, STREAMS};
@@ -202,6 +202,49 @@ impl<'a> Pool<'a> {
     }
 }
 
+/// Which stopped jobs a worker pass puts back in the queue. A CLI run is `FRESH`: a person
+/// asked, so Failed and Blocked jobs get another try. The daemon passes every 30 s with `TICK`,
+/// or else a failed set would be retried every 30 s; it sets `retry_blocked` on a drive event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pass {
+    pub retry_failed: bool,
+    pub retry_blocked: bool,
+}
+
+impl Pass {
+    pub(crate) const FRESH: Self = Self {
+        retry_failed: true,
+        retry_blocked: true,
+    };
+    pub(crate) const TICK: Self = Self {
+        retry_failed: false,
+        retry_blocked: false,
+    };
+}
+
+/// Whether a pass of `lane` under `pass` would do anything, so an idle daemon tick touches
+/// no status file. Mirrors the reset in `Worker::run` and the rules of `apply`.
+pub(crate) fn runnable(store: &Store, lane: Lane, pass: Pass) -> Result<bool> {
+    let paused = store.control(None).pause;
+    Ok(store
+        .jobs()?
+        .iter()
+        .filter(|j| j.kind.lane() == lane)
+        .any(|j| {
+            let c = store.control(Some(&j.id));
+            let retry = c.retry > j.retry_seen;
+            match j.state {
+                JobState::Done | JobState::Canceled => false,
+                _ if c.cancel => true,
+                _ if paused => false,
+                JobState::Running { .. } | JobState::Queued => true,
+                JobState::Blocked(_) => pass.retry_blocked || retry,
+                JobState::Failed => pass.retry_failed || retry,
+                JobState::Paused => !c.pause || retry,
+            }
+        }))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Halt {
     Pause,
@@ -221,21 +264,31 @@ pub(crate) struct Worker<'a> {
 }
 
 impl Worker<'_> {
+    /// The download lane's jobs: the worker never resets or saves another lane's.
+    fn jobs(&self) -> Result<Vec<Job>> {
+        let mut jobs = self.store.jobs()?;
+        jobs.retain(|j| j.kind.lane() == Lane::Download);
+        Ok(jobs)
+    }
+
     /// Runs queued jobs until none is runnable. The caller holds the queue lock, so a job left
-    /// Running is a crashed worker's; Blocked and Failed jobs get one more try per run.
-    pub(crate) fn run(&self) -> Result<()> {
-        for mut job in self.store.jobs()? {
-            if matches!(
-                job.state,
-                JobState::Running { .. } | JobState::Blocked(_) | JobState::Failed
-            ) {
+    /// Running is a crashed worker's; `pass` says whether Blocked and Failed get another try.
+    pub(crate) fn run(&self, pass: Pass) -> Result<()> {
+        for mut job in self.jobs()? {
+            let requeue = match job.state {
+                JobState::Running { .. } => true,
+                JobState::Blocked(_) => pass.retry_blocked,
+                JobState::Failed => pass.retry_failed,
+                _ => false,
+            };
+            if requeue {
                 job.state = JobState::Queued;
                 self.store.save(&mut job)?;
             }
         }
         loop {
             let paused = self.store.control(None).pause;
-            let mut jobs = self.store.jobs()?;
+            let mut jobs = self.jobs()?;
             for job in &mut jobs {
                 if self.apply(job) {
                     self.store.save(job)?;
@@ -265,7 +318,7 @@ impl Worker<'_> {
         if c.retry > job.retry_seen {
             job.retry_seen = c.retry;
             job.attempts = 0;
-            if job.state == JobState::Failed {
+            if matches!(job.state, JobState::Failed | JobState::Blocked(_)) {
                 job.state = JobState::Queued;
             }
         }
@@ -511,6 +564,10 @@ mod tests {
         }
 
         fn run(&self) {
+            self.run_with(Pass::FRESH);
+        }
+
+        fn run_with(&self, pass: Pass) {
             let mnt = self.mnt();
             let plan = |_: &Job, root: &Path| Ok(vec![self.fetch(root)]);
             let drive = |_: &DriveId| Some(mnt.clone()).filter(|m| m.exists());
@@ -521,7 +578,7 @@ mod tests {
                 settle: &|_, _| {},
                 drive: &drive,
             }
-            .run()
+            .run(pass)
             .unwrap();
         }
 
@@ -631,6 +688,79 @@ mod tests {
         assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Canceled);
         let f = r.fetch(&r.mnt());
         assert!(!f.part().exists() && !f.sidecar().exists() && !f.dest.exists());
+    }
+
+    #[test]
+    fn a_tick_retries_only_crashed_jobs_and_a_drive_event_only_blocked_ones() {
+        let r = Rig::new(1000, 0);
+        let set = |state| {
+            let mut j = r.job();
+            j.state = state;
+            r.store.save(&mut j).unwrap();
+            j.id
+        };
+        let failed = set(JobState::Failed);
+        let blocked = set(JobState::Blocked(BlockReason::DriveAbsent));
+        let crashed = set(JobState::Running { pid: u32::MAX });
+        let state = |id: &str| r.store.job(id).unwrap().state;
+        let drive_event = Pass {
+            retry_blocked: true,
+            ..Pass::TICK
+        };
+        let can = |pass| runnable(&r.store, Lane::Download, pass).unwrap();
+
+        assert!(can(Pass::TICK), "a crashed job wants a pass");
+        r.run_with(Pass::TICK);
+        assert_eq!(state(&crashed), JobState::Done);
+        assert_eq!(state(&failed), JobState::Failed);
+        assert_eq!(state(&blocked), JobState::Blocked(BlockReason::DriveAbsent));
+        assert!(!can(Pass::TICK), "an idle tick does nothing");
+
+        assert!(can(drive_event));
+        r.run_with(drive_event);
+        assert_eq!(state(&blocked), JobState::Done);
+        assert_eq!(state(&failed), JobState::Failed);
+        assert!(!can(drive_event));
+
+        // An explicit retry needs no special pass.
+        r.store
+            .edit_control(Some(&failed), |c| c.retry += 1)
+            .unwrap();
+        assert!(can(Pass::TICK));
+        r.run_with(Pass::TICK);
+        assert_eq!(state(&failed), JobState::Done);
+        assert!(!can(Pass::FRESH), "only finished jobs are left");
+    }
+
+    #[test]
+    fn controls_decide_whether_a_pass_is_needed() {
+        let r = Rig::new(1000, 0);
+        let can = || runnable(&r.store, Lane::Download, Pass::TICK).unwrap();
+        assert!(!can(), "empty queue");
+        let job = r.job();
+        assert!(can(), "queued");
+        r.store.edit_control(None, |c| c.pause = true).unwrap();
+        assert!(!can(), "queue paused");
+        r.store
+            .edit_control(Some(&job.id), |c| c.cancel = true)
+            .unwrap();
+        assert!(can(), "a cancel is applied even while paused");
+        r.run();
+        assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Canceled);
+        assert!(!can(), "canceled");
+
+        r.store.edit_control(None, |c| c.pause = false).unwrap();
+        let mut job = r.job();
+        job.state = JobState::Paused;
+        r.store.save(&mut job).unwrap();
+        r.store
+            .edit_control(Some(&job.id), |c| c.pause = true)
+            .unwrap();
+        assert!(!can(), "paused job");
+        r.store
+            .edit_control(Some(&job.id), |c| c.pause = false)
+            .unwrap();
+        assert!(can(), "resumed job");
     }
 
     #[test]

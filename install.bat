@@ -59,6 +59,7 @@ copy /y "%BUILT%" "%WORK%\preserver.exe" >nul || goto fail
 
 :install
 schtasks /End /TN "\preserver\tray" >nul 2>&1
+schtasks /End /TN "\preserver\daemon" >nul 2>&1
 if exist "%EXE%" fc /b "%EXE%" "%WORK%\preserver.exe" >nul 2>&1 && (echo install.bat: "%EXE%" is already this binary & goto tasks)
 rem A running exe can be renamed but not overwritten, so the old one moves to .prev first.
 if exist "%EXE%" (move /y "%EXE%" "%PREV%" >nul || goto fail & echo install.bat: kept the previous binary as "%PREV%")
@@ -67,32 +68,37 @@ echo install.bat: installed %EXE%
 
 :tasks
 chcp 65001 >nul
-call :tasktray "%WORK%\tray.xml"
+call :tasklogon "%WORK%\tray.xml" tray
+call :tasklogon "%WORK%\daemon.xml" daemon
 call :tasklocal "%WORK%\local.xml" "personal --local-only" 01:30 true
 call :tasklocal "%WORK%\public.xml" "public" 03:00 false
 schtasks /Create /TN "\preserver\tray" /XML "%WORK%\tray.xml" /F >nul || goto fail
+schtasks /Create /TN "\preserver\daemon" /XML "%WORK%\daemon.xml" /F >nul || goto fail
 schtasks /Create /TN "\preserver\local" /XML "%WORK%\local.xml" /F >nul || goto fail
 schtasks /Create /TN "\preserver\public" /XML "%WORK%\public.xml" /F >nul || goto fail
 schtasks /Run /TN "\preserver\tray" >nul 2>&1
+schtasks /Run /TN "\preserver\daemon" >nul 2>&1
 rmdir /s /q "%WORK%"
-echo install.bat: tasks \preserver\tray (at logon) and \preserver\local (nightly 01:30) are registered
+echo install.bat: tasks \preserver\tray, \preserver\daemon (at logon) and \preserver\local (nightly 01:30) are registered
 echo install.bat: \preserver\public (03:00) is registered but disabled: schtasks /Change /TN "\preserver\public" /ENABLE
 exit /b 0
 
 :rollback
 if not exist "%PREV%" (echo install.bat: no previous binary at %PREV% 1>&2 & exit /b 1)
 schtasks /End /TN "\preserver\tray" >nul 2>&1
+schtasks /End /TN "\preserver\daemon" >nul 2>&1
 if exist "%EXE%" (
   move /y "%EXE%" "%BIN%\preserver.swap.exe" >nul || exit /b 1
 )
 move /y "%PREV%" "%EXE%" >nul || exit /b 1
 if exist "%BIN%\preserver.swap.exe" move /y "%BIN%\preserver.swap.exe" "%PREV%" >nul
 schtasks /Run /TN "\preserver\tray" >nul 2>&1
+schtasks /Run /TN "\preserver\daemon" >nul 2>&1
 echo install.bat: rolled back: %EXE% is the previous binary, %PREV% is the one replaced
 exit /b 0
 
 :uninstall
-for %%t in (tray local public) do (
+for %%t in (tray daemon local public) do (
   schtasks /End /TN "\preserver\%%t" >nul 2>&1
   schtasks /Delete /TN "\preserver\%%t" /F >nul 2>&1
 )
@@ -138,10 +144,10 @@ exit /b 0
 >>%1 echo ^</Task^>
 exit /b 0
 
-:tasktray
+:tasklogon
 call :xmlhead %1
 >>%1 echo     ^<LogonTrigger^>^<Enabled^>true^</Enabled^>^<UserId^>%USERDOMAIN%\%USERNAME%^</UserId^>^</LogonTrigger^>
-call :xmltail %1 true 7 tray
+call :xmltail %1 true 7 %2
 exit /b 0
 
 :tasklocal

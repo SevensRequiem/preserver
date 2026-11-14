@@ -1,6 +1,6 @@
 use crate::config::{Config, Transport, load_drives};
 use crate::paths::Paths;
-use crate::{personal, platform, public, queue};
+use crate::{daemon, personal, platform, public, queue};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -71,6 +71,8 @@ pub enum Command {
     Open,
     /// Run the tray icon
     Tray,
+    /// Run the background service: the download queue, and later copy rules, woken by drive events
+    Daemon,
     /// Install scheduled tasks (Windows)
     Install,
 }
@@ -188,6 +190,7 @@ pub fn run(cli: Cli) -> Result<()> {
             platform::open_path(&archive)
         }
         Command::Tray => platform::run_tray(&Paths::from_env()?),
+        Command::Daemon => daemon::run(&Paths::from_env()?),
         Command::Queue { action } => queue::cli(&Paths::from_env()?, action),
         Command::Public {
             sets,

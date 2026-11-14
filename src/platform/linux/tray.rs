@@ -1,6 +1,7 @@
 use super::notify::{Reminder, notify};
 use crate::config::{self, Config, Transport};
 use crate::paths::Paths;
+use crate::queue::Store;
 use crate::status::{Status, lock_held};
 use crate::tray_model::{Inputs, Job, Model, model};
 use anyhow::{Context, Result};
@@ -8,7 +9,6 @@ use ksni::blocking::TrayMethods;
 use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
-use std::time::Duration;
 
 const UNIT: &str = "preserver-personal.service";
 const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
@@ -16,9 +16,13 @@ const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
 /// What the menu and the helper threads ask of the main loop, which owns every decision.
 enum Cmd {
     Backup,
-    BackupEnded { ok: bool },
+    BackupEnded {
+        ok: bool,
+    },
     Open,
     Transport(Transport),
+    /// Pause (true) or resume the whole queue through `all.ctl`.
+    QueuePause(bool),
     Quit,
 }
 
@@ -37,11 +41,15 @@ fn read(paths: &Paths, starting: bool, start_failure: Option<String>) -> Model {
         let locked = status.running && lock_held(&paths.lock_file(name));
         Job { status, locked }
     };
+    let store = Store::new(paths.queue.clone());
     let now = jiff::Zoned::now();
     model(&Inputs {
         github: job("github"),
         local: job("local"),
         public: job("public"),
+        daemon: job("daemon"),
+        jobs: store.jobs().unwrap_or_default(),
+        queue_paused: store.control(None).pause,
         starting,
         start_failure,
         today: now.date(),
@@ -129,6 +137,25 @@ impl ksni::Tray for Tray {
             info(&m.last_label),
         ];
         items.extend(m.public_label.as_deref().map(info));
+        items.push(info(&m.daemon_label));
+        items.extend(m.queue_label.as_deref().map(info));
+        if let Some(label) = m.pause_label {
+            let pause = !m.queue_paused;
+            items.push(
+                StandardItem {
+                    label: label.into(),
+                    icon_name: if pause {
+                        "media-playback-pause"
+                    } else {
+                        "media-playback-start"
+                    }
+                    .into(),
+                    activate: Box::new(move |tray: &mut Self| tray.send(Cmd::QueuePause(pause))),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(MenuItem::Separator);
         if let Some(current) = m.transport {
             let group = RadioGroup {
@@ -212,10 +239,14 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
     let mut last_shown = None;
 
     loop {
-        let (due, last) = handle
+        let (due, last, poll) = handle
             .update(|t| {
                 t.refresh();
-                (t.model.reminder_due(), t.model.last_label.clone())
+                (
+                    t.model.reminder_due(),
+                    t.model.last_label.clone(),
+                    t.model.poll,
+                )
             })
             .context("the tray service stopped")?;
         let today = jiff::Zoned::now().date();
@@ -227,7 +258,7 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
             }
         }
 
-        match rx.recv_timeout(Duration::from_secs(3600)) {
+        match rx.recv_timeout(poll) {
             Ok(Cmd::Backup) => {
                 let start = handle.update(|t| {
                     let idle = t.model.run_enabled();
@@ -257,6 +288,12 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
                 if let Err(e) = config::save_transport(&paths.cfg, transport) {
                     tracing::error!("set the transport: {e:#}");
                     notify(true, "GitHub transport not changed", &format!("{e:#}"));
+                }
+            }
+            Ok(Cmd::QueuePause(pause)) => {
+                let store = Store::new(paths.queue.clone());
+                if let Err(e) = store.edit_control(None, |c| c.pause = pause) {
+                    tracing::error!("pause the queue: {e:#}");
                 }
             }
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(()),

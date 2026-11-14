@@ -7,8 +7,10 @@ use crate::config::Config;
 use crate::paths::Paths;
 use crate::public;
 use anyhow::{Result, bail};
-pub(crate) use job::{Job, JobKind, JobState};
-pub(crate) use sched::Worker;
+#[cfg(test)]
+pub(crate) use job::BlockReason;
+pub(crate) use job::{Job, JobKind, JobState, Lane};
+pub(crate) use sched::{Pass, Worker, runnable};
 use std::time::Duration;
 pub(crate) use store::Store;
 

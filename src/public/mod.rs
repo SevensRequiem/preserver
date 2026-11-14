@@ -12,7 +12,7 @@ use crate::net::client;
 use crate::net::download::{CHECKPOINT, Downloader, Fetch};
 use crate::net::throttle::Throttle;
 use crate::paths::Paths;
-use crate::queue::{Job, JobKind, JobState, Store, Worker};
+use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Worker, runnable};
 use crate::resolve::{GH_API, HF_BASE, Item, Resolver};
 use crate::verify::Verifier;
 use crate::{platform, status};
@@ -265,6 +265,8 @@ impl Public<'_> {
 
 /// Queues a job per set, unless one is already waiting, and returns the job ids in set order.
 /// `tidy` (the caller holds the worker lock) also drops the finished jobs of those sets.
+/// Without it the daemon owns the queue and would leave a Failed or Blocked job alone, so
+/// such a job gets a retry through its control file: a timer run still retries every set.
 fn enqueue(store: &Store, sets: &[&Set], drive: &DriveId, tidy: bool) -> Result<Vec<String>> {
     let jobs = store.jobs()?;
     let mut ids = Vec::new();
@@ -275,13 +277,16 @@ fn enqueue(store: &Store, sets: &[&Set], drive: &DriveId, tidy: bool) -> Result<
             *s == set.name
         }) {
             if !matches!(j.state, JobState::Done | JobState::Canceled) {
-                waiting.get_or_insert_with(|| j.id.clone());
+                waiting.get_or_insert(j);
             } else if tidy {
                 store.remove(&j.id)?;
             }
         }
-        let id = if let Some(id) = waiting {
-            id
+        let id = if let Some(j) = waiting {
+            if !tidy && matches!(j.state, JobState::Failed | JobState::Blocked(_)) {
+                store.edit_control(Some(&j.id), |c| c.retry += 1)?;
+            }
+            j.id.clone()
         } else {
             let kind = JobKind::Set {
                 set: set.name.clone(),
@@ -329,7 +334,7 @@ fn public<'a>(cat: &'a Catalog, paths: &'a Paths, cfg: &Config, dl: &'a Download
 }
 
 /// Runs the queue worker until nothing is runnable. The caller holds the queue lock.
-fn work(p: &Public, store: &Store, dl: &Downloader) -> Result<()> {
+fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
     Worker {
         store,
         dl,
@@ -337,7 +342,7 @@ fn work(p: &Public, store: &Store, dl: &Downloader) -> Result<()> {
         settle: &|job, root| p.settle(job, root),
         drive: &|id| platform::mount(id).ok(),
     }
-    .run()
+    .run(pass)
 }
 
 /// `preserver queue run`.
@@ -352,7 +357,50 @@ pub(crate) fn queue_run(paths: &Paths, cfg: &Config) -> Result<()> {
         &public(&cat, paths, cfg, &dl),
         &Store::new(paths.queue.clone()),
         &dl,
+        Pass::FRESH,
     )
+}
+
+/// One pass of the daemon's download lane. It skips without a word when a CLI run holds the
+/// queue or nothing is runnable, so an idle tick writes nothing. The config and the
+/// downloader are rebuilt per pass, so an edited bandwidth applies without a restart.
+pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
+    let Some(_lock) = status::try_lock(&paths.lock_file("queue"))? else {
+        return Ok(());
+    };
+    let store = Store::new(paths.queue.clone());
+    if !runnable(&store, Lane::Download, pass)? {
+        return Ok(());
+    }
+    let cfg = Config::load(&paths.cfg)?;
+    let cat = Catalog::embedded()?;
+    let dl = downloader(&cfg)?;
+    let start = Timestamp::now();
+    // Same lock order as run(): queue, then public.
+    status::job(&mut paths.clone(), "public", |paths| {
+        work(&public(&cat, paths, &cfg, &dl), &store, &dl, pass)?;
+        let mut errs = Vec::new();
+        for j in store.jobs()? {
+            if j.kind.lane() != Lane::Download {
+                continue;
+            }
+            let JobKind::Set { set } = &j.kind;
+            match j.state {
+                // Nobody waits on the result here, unlike run(): the worker tidies up.
+                JobState::Done | JobState::Canceled => store.remove(&j.id)?,
+                JobState::Failed if j.updated >= start => {
+                    errs.push(format!("{set}: {}", j.error.as_deref().unwrap_or_default()));
+                }
+                _ => {}
+            }
+        }
+        if errs.is_empty() {
+            return Ok(());
+        }
+        let msg = errs.join("; ");
+        notify(true, "Public sync had failures", &trunc(&msg, 600));
+        bail!(msg)
+    })
 }
 
 /// `preserver public [SET...] [--dry-run] [--first-pass]`.
@@ -388,7 +436,7 @@ pub(crate) fn run(
     };
     status::job(paths, "public", |paths| {
         let ids = enqueue(&store, &sets, &cfg.primary_uuid, true)?;
-        work(&public(&cat, paths, cfg, &dl), &store, &dl)?;
+        work(&public(&cat, paths, cfg, &dl), &store, &dl, Pass::FRESH)?;
         let mut errs = Vec::new();
         for (set, id) in sets.iter().zip(&ids) {
             let job = store.job(id)?;

@@ -1,0 +1,19 @@
+[Unit]
+Description=preserver daemon (download queue, copy rules, drive events)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/preserver daemon
+Restart=on-failure
+RestartSec=30
+# No CPUSchedulingPolicy=idle: a process that never exits could starve under load for good.
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

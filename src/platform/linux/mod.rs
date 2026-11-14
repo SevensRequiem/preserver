@@ -9,7 +9,7 @@ pub(crate) use fs::{
 };
 pub(crate) use notify::notify;
 pub(crate) use tray::run_tray;
-pub(crate) use udisks::{list_filesystems, mount};
+pub(crate) use udisks::{list_filesystems, mount, watch_drives};
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;

@@ -23,6 +23,10 @@ pub(crate) fn mount(_id: &DriveId) -> Result<PathBuf> {
     Err(unsupported().into())
 }
 
+pub(crate) fn watch_drives(_on_change: impl Fn() + Send + 'static) {
+    tracing::warn!("drive events are not supported on Windows yet (phase 5)");
+}
+
 pub(crate) fn is_mounted(_path: &Path) -> bool {
     false
 }

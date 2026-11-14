@@ -82,7 +82,7 @@ impl Env {
                 settle: &|job, root| p.settle(job, root),
                 drive: &|_| Some(self.paths.mnt.clone()),
             }
-            .run()
+            .run(Pass::FRESH)
             .unwrap();
         });
         self.store.job(&ids[0]).unwrap()
@@ -503,6 +503,51 @@ fn enqueue_reuses_waiting_jobs_and_drops_finished_ones() {
     assert_eq!(env.store.jobs().unwrap().len(), 2);
     assert_eq!(enqueue(&env.store, &sets, &drive, true).unwrap(), second);
     assert_eq!(env.store.jobs().unwrap().len(), 1);
+}
+
+#[test]
+fn enqueue_while_the_daemon_works_retries_a_stopped_job_through_its_control() {
+    let env = Env::new();
+    let cat = catalog(2, Vec::new());
+    let drive: DriveId = "0123-ABCD".parse().unwrap();
+    let sets = [&cat.sets[0]];
+    let ids = enqueue(&env.store, &sets, &drive, false).unwrap();
+    let retries = || env.store.control(Some(&ids[0])).retry;
+    assert_eq!(enqueue(&env.store, &sets, &drive, false).unwrap(), ids);
+    assert_eq!(retries(), 0, "a queued job needs no retry");
+    for (n, state) in [
+        JobState::Failed,
+        JobState::Blocked(crate::queue::BlockReason::DriveAbsent),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut job = env.store.job(&ids[0]).unwrap();
+        job.state = state;
+        env.store.save(&mut job).unwrap();
+        assert_eq!(enqueue(&env.store, &sets, &drive, false).unwrap(), ids);
+        assert_eq!(retries(), u32::try_from(n).unwrap() + 1, "{state:?}");
+        // Holding the lock means the caller runs a fresh pass itself: no bump.
+        assert_eq!(enqueue(&env.store, &sets, &drive, true).unwrap(), ids);
+        assert_eq!(retries(), u32::try_from(n).unwrap() + 1, "{state:?}");
+    }
+    assert_eq!(env.store.jobs().unwrap().len(), 1, "no new job was made");
+}
+
+#[test]
+fn a_daemon_pass_skips_an_idle_queue_without_touching_the_status() {
+    let env = Env::new();
+    daemon_pass(&env.paths, Pass::FRESH).unwrap();
+    assert!(!env.paths.status_file("public").exists());
+    // A CLI run holds the queue: the pass leaves it alone, even with work waiting.
+    let cat = catalog(2, Vec::new());
+    let drive: DriveId = "0123-ABCD".parse().unwrap();
+    enqueue(&env.store, &[&cat.sets[0]], &drive, false).unwrap();
+    let _held = status::try_lock(&env.paths.lock_file("queue"))
+        .unwrap()
+        .unwrap();
+    daemon_pass(&env.paths, Pass::FRESH).unwrap();
+    assert!(!env.paths.status_file("public").exists());
 }
 
 #[test]

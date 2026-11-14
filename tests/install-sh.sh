@@ -45,11 +45,12 @@ mkrel "$t/r2" v2
 run "$t/r1" || fail "install v1: $(cat "$t/out")"
 grep -q v1 "$bin" || fail "binary is not v1"
 [ ! -e "$prev" ] || fail "first install made a .prev"
-for u in tray.service personal.service local.service local.timer public.service public.timer; do
+for u in tray.service daemon.service personal.service local.service local.timer public.service public.timer; do
 	[ -f "$units/preserver-$u" ] && [ ! -L "$units/preserver-$u" ] || fail "unit $u missing or a symlink"
 done
 grep -q "systemctl --user daemon-reload" "$CALLS" || fail "no daemon-reload"
-grep -q "enable preserver-tray.service preserver-local.timer" "$CALLS" || fail "tray and local timer not enabled"
+grep -q "enable preserver-tray.service preserver-local.timer preserver-daemon.service" "$CALLS" || fail "tray, local timer and daemon not enabled"
+grep -q "start preserver-daemon.service" "$CALLS" || fail "daemon not started"
 grep -q "enable.*public" "$CALLS" && fail "public timer was enabled"
 ok install
 
@@ -57,11 +58,15 @@ run "$t/r1" || fail "re-install v1"
 [ ! -e "$prev" ] || fail "re-install of the same binary made a .prev"
 ok "re-install is idempotent"
 
+: >"$CALLS"
 run "$t/r2" || fail "install v2"
+grep -q "try-restart.* preserver-daemon.service" "$CALLS" || fail "upgrade did not restart the daemon"
 grep -q v2 "$bin" && grep -q v1 "$prev" || fail "v2 install did not keep v1 as .prev"
 ok "upgrade keeps previous"
 
+: >"$CALLS"
 run --rollback || fail "rollback"
+grep -q "try-restart.* preserver-daemon.service" "$CALLS" || fail "rollback did not restart the daemon"
 grep -q v1 "$bin" && grep -q v2 "$prev" || fail "rollback did not swap"
 run --rollback || fail "second rollback"
 grep -q v2 "$bin" && grep -q v1 "$prev" || fail "second rollback did not swap back"
@@ -84,6 +89,7 @@ grep -q built "$bin" || fail "source build not installed"
 ok "source install"
 
 run --uninstall || fail "uninstall"
+grep -q "disable --now.* preserver-daemon.service" "$CALLS" || fail "uninstall did not stop the daemon"
 [ ! -e "$bin" ] && [ ! -e "$prev" ] || fail "binary left behind"
 ls "$units"/preserver-* >/dev/null 2>&1 && fail "units left behind"
 [ -f "$HOME/.config/preserver/identity.age" ] || fail "uninstall touched data"
