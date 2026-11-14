@@ -1,4 +1,5 @@
 use super::notify::{Reminder, notify};
+use crate::actions;
 use crate::config::{self, Config, Transport};
 use crate::paths::Paths;
 use crate::queue::Store;
@@ -10,7 +11,6 @@ use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 
-const UNIT: &str = "preserver-personal.service";
 const TRANSPORTS: [Transport; 2] = [Transport::Ssh, Transport::Https];
 
 /// What the menu and the helper threads ask of the main loop, which owns every decision.
@@ -190,24 +190,26 @@ impl ksni::Tray for Tray {
     }
 }
 
-/// Starts the backup unit and waits for it: the exit status is the only sign of a
-/// run that failed before it wrote its status file.
-fn run_unit() -> bool {
-    // The unit runs under the user manager, so hand it the session's display for ksshaskpass.
-    let _ = Command::new("systemctl")
-        .args([
-            "--user",
-            "import-environment",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "XAUTHORITY",
-        ])
-        .stdin(Stdio::null())
-        .status();
-    Command::new("systemctl")
-        .args(["--user", "start", UNIT])
-        .stdin(Stdio::null())
-        .status()
+/// Queues the backup for the daemon, or runs `preserver personal --foreground` when none runs,
+/// and waits for it: the exit status is the only sign of a run that failed before it wrote its
+/// status file.
+fn backup(paths: &Paths) -> bool {
+    if actions::daemon_live(paths) {
+        let queued = Config::load(&paths.cfg).and_then(|cfg| {
+            actions::enqueue_personal(paths, &cfg, false, None, false)?;
+            actions::wake(paths)
+        });
+        return queued
+            .inspect_err(|e| tracing::error!("queue the backup: {e:#}"))
+            .is_ok();
+    }
+    std::env::current_exe()
+        .and_then(|exe| {
+            Command::new(exe)
+                .args(["personal", "--foreground"])
+                .stdin(Stdio::null())
+                .status()
+        })
         .is_ok_and(|s| s.success())
 }
 
@@ -219,7 +221,27 @@ fn open_folder() {
     }
 }
 
+/// The daemon reads these from the user manager per job, for ssh's askpass dialog.
+fn import_session() {
+    let imported = Command::new("systemctl")
+        .args([
+            "--user",
+            "import-environment",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+        ])
+        .stdin(Stdio::null())
+        .status();
+    if !imported.is_ok_and(|s| s.success()) {
+        tracing::warn!(
+            "systemctl --user import-environment failed: the daemon cannot ask for the security key"
+        );
+    }
+}
+
 pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
+    import_session();
     let (tx, rx) = channel();
     let tray = Tray {
         model: read(paths, false, None),
@@ -273,15 +295,16 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
                     idle
                 });
                 if start == Some(true) {
-                    let tx = tx.clone();
-                    std::thread::spawn(move || tx.send(Cmd::BackupEnded { ok: run_unit() }));
+                    let (tx, paths) = (tx.clone(), paths.clone());
+                    std::thread::spawn(move || tx.send(Cmd::BackupEnded { ok: backup(&paths) }));
                 }
             }
             Ok(Cmd::BackupEnded { ok }) => {
                 handle.update(|t| {
                     t.starting = false;
                     if !ok {
-                        t.start_failure = Some(format!("see journalctl --user -u {UNIT}"));
+                        t.start_failure =
+                            Some("see journalctl --user -u preserver-tray.service".into());
                     }
                 });
             }
@@ -307,14 +330,13 @@ pub(crate) fn run_tray(paths: &Paths) -> Result<()> {
                 }
             }
             Ok(Cmd::CopyRetry(id)) => {
-                let store = Store::new(paths.queue.clone());
-                let retry = store.edit_control(Some(&id), |c| {
-                    c.retry += 1;
-                    c.pause = false;
+                // Off this thread: the mount may wait on polkit.
+                let paths = paths.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = actions::retry(&paths, &id) {
+                        tracing::error!("retry copy {id}: {e:#}");
+                    }
                 });
-                if let Err(e) = retry {
-                    tracing::error!("retry copy {id}: {e:#}");
-                }
             }
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {}

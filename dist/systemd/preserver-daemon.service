@@ -1,5 +1,5 @@
 [Unit]
-Description=preserver daemon (download queue, copy rules, drive events)
+Description=preserver daemon (backup queue, schedules, copy rules, drive events)
 
 [Service]
 Type=simple
@@ -9,8 +9,11 @@ RestartSec=30
 # No CPUSchedulingPolicy=idle: a process that never exits could starve under load for good.
 Nice=19
 IOSchedulingClass=idle
+# The personal lane runs ssh; when the session has an agent it is here, and the session's own
+# SSH_AUTH_SOCK (read from the user manager per job) wins over this.
+Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket
 NoNewPrivileges=yes
-PrivateTmp=yes
+# No PrivateTmp: it would hide /tmp/.X11-unix from the FIDO askpass dialog.
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

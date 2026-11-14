@@ -5,7 +5,7 @@ mod store;
 use crate::cli::QueueAction;
 use crate::config::Config;
 use crate::paths::Paths;
-use crate::public;
+use crate::{actions, public};
 use anyhow::{Result, bail};
 pub(crate) use job::{BlockReason, Job, JobKind, JobState, Lane, Progress, Target};
 pub(crate) use sched::{Halt, Pass, Worker, apply_control, halt_requested, reset, runnable};
@@ -22,6 +22,8 @@ fn print(jobs: &[Job]) {
         let what = match &j.kind {
             JobKind::Set { set } => format!("set {set}"),
             JobKind::Copy { target, .. } => format!("copy -> {}", target.name()),
+            JobKind::Github { .. } => "github".to_string(),
+            JobKind::Local => "local folders".to_string(),
         };
         println!(
             "{:<28} {:<24} {:>4} {:>5}/{:<5} {:>7}/{:<8}  {what}{}",
@@ -84,14 +86,15 @@ pub(crate) fn cli(paths: &Paths, action: QueueAction) -> Result<()> {
             store.job(&id)?;
             store.edit_control(Some(&id), |c| c.cancel = true)
         }
-        QueueAction::Retry { id } => {
-            store.job(&id)?;
-            store.edit_control(Some(&id), |c| c.retry += 1)
-        }
+        QueueAction::Retry { id } => actions::retry(paths, &id),
         QueueAction::Prio { id, priority } => {
             store.job(&id)?;
             store.edit_control(Some(&id), |c| c.priority = Some(priority))
         }
-        QueueAction::Run => public::queue_run(paths, &Config::load(&paths.cfg)?),
+        QueueAction::Run => {
+            let cfg = Config::load(&paths.cfg)?;
+            actions::mount(&cfg.primary_uuid);
+            public::queue_run(paths, &cfg)
+        }
     }
 }

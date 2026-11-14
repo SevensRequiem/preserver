@@ -1,48 +1,47 @@
 pub(crate) mod github;
+pub(crate) mod lane;
 pub(crate) mod local;
 pub(crate) mod restore;
 
-use crate::config::{Config, Transport};
-use crate::paths::{NoDrive, Paths};
-use crate::{crypt, platform, status};
+use crate::config::Config;
+use crate::paths::Paths;
+use crate::{crypt, platform};
 use age::secrecy::{ExposeSecret, SecretString};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-pub(crate) fn run(
-    paths: &mut Paths,
-    cfg: &Config,
-    local_only: bool,
-    transport: Transport,
-) -> Result<()> {
+/// How a run reports each repo or folder and learns, between them, that it should stop.
+pub(crate) struct Hooks<'a> {
+    pub on_item: &'a (dyn Fn(usize, usize, &str) + Sync),
+    pub stop: &'a (dyn Fn() -> bool + Sync),
+}
+
+impl Hooks<'_> {
+    #[cfg(test)]
+    pub(crate) const NONE: Hooks<'static> = Hooks {
+        on_item: &|_, _, _| {},
+        stop: &|| false,
+    };
+}
+
+/// A run ended early because its job was paused or canceled.
+#[derive(Debug)]
+pub(crate) struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+pub(crate) fn require_init(paths: &Paths) -> Result<()> {
     let recipient = paths.personal.join("recipient.txt");
     if std::fs::metadata(&recipient).map_or(true, |m| m.len() == 0) {
         bail!("run 'preserver init' first");
     }
-    let github = if local_only {
-        Ok(())
-    } else {
-        status::job(paths, "github", |p| github::run(p, cfg, transport))
-    };
-    // The folders are backed up even when GitHub failed: the two have nothing in common.
-    let local = status::job(paths, "local", |p| local::run(p, cfg));
-    let result = match (github, local) {
-        (Err(github), Err(local)) => Err(anyhow!("{github:#}; local folders: {local:#}")),
-        (github, local) => github.and(local),
-    };
-    match result {
-        // The nightly run finds the drive unplugged most days: no notification for that. The failure
-        // is still in the status file, so the tray shows it until a run finds the drive.
-        Err(e) if local_only && e.is::<NoDrive>() => {
-            tracing::warn!("local backup skipped: {e:#}");
-            Ok(())
-        }
-        Err(e) => {
-            platform::notify(true, "Personal backup failed", &format!("{e:#}"));
-            Err(e)
-        }
-        Ok(()) => Ok(()),
-    }
+    Ok(())
 }
 
 /// Stores a locked private key and its recipient. The locked key goes to the drive and to home,
@@ -195,10 +194,10 @@ mod tests {
     #[test]
     fn personal_needs_init_first() {
         let tmp = TempDir::new();
-        let mut p = paths(tmp.path());
-        let cfg = Config::parse("owners = []\nprimary_uuid = \"0123-abcd\"\n").unwrap();
-        let err = run(&mut p, &cfg, false, Transport::Ssh).unwrap_err();
+        let p = paths(tmp.path());
+        let err = require_init(&p).unwrap_err();
         assert!(err.to_string().contains("init"), "{err}");
-        assert!(!p.status_file("github").exists());
+        platform::write_private(&p.personal.join("recipient.txt"), b"age1x\n").unwrap();
+        require_init(&p).unwrap();
     }
 }

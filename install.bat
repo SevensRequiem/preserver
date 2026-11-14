@@ -70,17 +70,17 @@ echo install.bat: installed %EXE%
 chcp 65001 >nul
 call :tasklogon "%WORK%\tray.xml" tray
 call :tasklogon "%WORK%\daemon.xml" daemon
-call :tasklocal "%WORK%\local.xml" "personal --local-only" 01:30 true
-call :tasklocal "%WORK%\public.xml" "public" 03:00 false
 schtasks /Create /TN "\preserver\tray" /XML "%WORK%\tray.xml" /F >nul || goto fail
 schtasks /Create /TN "\preserver\daemon" /XML "%WORK%\daemon.xml" /F >nul || goto fail
-schtasks /Create /TN "\preserver\local" /XML "%WORK%\local.xml" /F >nul || goto fail
-schtasks /Create /TN "\preserver\public" /XML "%WORK%\public.xml" /F >nul || goto fail
+rem The daemon runs these jobs now, on the times under [schedule] in config.toml.
+for %%t in (local public) do (
+  schtasks /End /TN "\preserver\%%t" >nul 2>&1
+  schtasks /Delete /TN "\preserver\%%t" /F >nul 2>&1
+)
 schtasks /Run /TN "\preserver\tray" >nul 2>&1
 schtasks /Run /TN "\preserver\daemon" >nul 2>&1
 rmdir /s /q "%WORK%"
-echo install.bat: tasks \preserver\tray, \preserver\daemon (at logon) and \preserver\local (nightly 01:30) are registered
-echo install.bat: \preserver\public (03:00) is registered but disabled: schtasks /Change /TN "\preserver\public" /ENABLE
+echo install.bat: tasks \preserver\tray and \preserver\daemon (at logon) are registered; backups run on the times under [schedule] in config.toml
 exit /b 0
 
 :rollback
@@ -150,8 +150,3 @@ call :xmlhead %1
 call :xmltail %1 true 7 %2
 exit /b 0
 
-:tasklocal
-call :xmlhead %1
->>%1 echo     ^<CalendarTrigger^>^<StartBoundary^>2026-01-01T%~3:00^</StartBoundary^>^<Enabled^>true^</Enabled^>^<ScheduleByDay^>^<DaysInterval^>1^</DaysInterval^>^</ScheduleByDay^>^</CalendarTrigger^>
-call :xmltail %1 %4 7 %2
-exit /b 0

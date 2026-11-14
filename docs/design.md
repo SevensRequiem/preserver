@@ -34,10 +34,11 @@ Common flags: exact `=` pins, `default-features = false` wherever listed. "Deps"
 | `gix` | 0.90.0, `["blocking-network-client","sha1"]`, plus `"worktree-mutation"` from phase 4 (native restore) | fetch mirrors, read refs, index packs | GitoxideLabs (Byron) | 122 | no C (zlib-rs) | MIT/Apache-2.0 | git2 is C (libgit2). Exec git doesn't put git https under our bandwidth cap |
 | `gix-transport` | 0.62.0, `["blocking-client","http-client"]` | the `Http` trait, so the ureq backend can plug in | GitoxideLabs | 44 (mostly shared) | no | MIT/Apache-2.0 | The only alternatives are its curl or reqwest backends |
 | `pgp` | 0.21.1, no default (drops bzip2) | detached, clearsigned and sig-over-xz verify; keyring parsing; fingerprint pins | rpgp org | 148 (69 unique) | no C | MIT/Apache-2.0 | sequoia: see §0. gpgv: not on Windows |
-| `ureq` | 3.5.2, `["rustls-no-provider","platform-verifier"]` | every HTTP fetch | algesten | 27 | no | MIT/Apache-2.0 | std has no TLS. reqwest: see §0 |
+| `ureq` | 3.5.2, `["rustls-no-provider","platform-verifier","rustls-webpki-roots"]` | every HTTP fetch | algesten | 27 | no | MIT/Apache-2.0 | std has no TLS. reqwest: see §0 |
 | `rustls` | 0.23.46, `["ring","std","tls12","logging"=off]` | builds the ring `CryptoProvider` that is passed to ureq's `TlsConfig` | rustls org | (in ureq) | — | Apache-2.0/ISC/MIT | Avoids leaning on ureq's private `_ring` feature |
 | `ring` | 0.17.14 (transitive) | TLS crypto | Brian Smith | — | **build.rs, C + asm via cc**. Freestanding: needs only clang for the target, no libc headers | Apache-2.0 AND ISC | aws-lc: see §0 |
 | `rustls-platform-verifier` | 0.7.1 (through ureq) | OS trust store: /etc/pki on Linux, CryptoAPI with revocation on Windows | rustls org | (in ureq) | no | MIT/Apache-2.0 | webpki-roots freezes the CA set into the binary. Open question 9 |
+| `webpki-roots` | 1.0.11 (through ureq, pinned by a direct line) | the fallback root store when the OS has none (a bare container, a rescue system) | rustls org | 1 (rustls-pki-types, shared) | no | CDLA-Permissive-2.0 (a deny.toml exception for this crate only) | Without it a host with no CA store cannot download at all. Used only when the platform verifier fails to load |
 | `sha2` | **0.10.9** | sha256/sha512; `compress256`/`compress512` make the resumable midstate possible | RustCrypto | 9 | no | MIT/Apache-2.0 | 0.10 is the version age, pgp and rsa use, so no duplicate. 0.11 has `SerializableState`, but rsa 0.9 can't use 0.11 digests |
 | `sha1` | 0.10.x (already in tree through gix) | Alpine `Q1` control checksums, `.SIGN.RSA.` | RustCrypto | 0 new | no | MIT/Apache-2.0 | — |
 | `rsa` | 0.9.10 (already in tree through pgp) | Alpine APKINDEX and apk RSA PKCS#1 v1.5 verify | RustCrypto | 0 new | no | MIT/Apache-2.0 | Alpine signatures aren't OpenPGP |
@@ -159,15 +160,19 @@ src/platform/windows/{volumes.rs, devnotify.rs, tray.rs (Shell_NotifyIcon + ball
 | fn | Linux | Windows |
 |---|---|---|
 | `list_filesystems() -> Vec<FsInfo{id, label, fstype, size, mount, removable}>` | udisks2 GetManagedObjects | FindFirstVolumeW + GetVolumePathNamesForVolumeNameW + GetVolumeInformationW + FSCTL_GET_NTFS_VOLUME_DATA |
-| `mount(&DriveId) -> PathBuf` | udisks `Filesystem.Mount` with `auth.no_user_interaction` (replaces the udisksctl exec) | resolve the volume path; no mount step |
+| `mount(&DriveId) -> PathBuf` | udisks `Filesystem.Mount` with `auth.no_user_interaction` (replaces the udisksctl exec). Called only for a person's action (CLI, tray) | resolve the volume path; no mount step |
+| `locate(&DriveId) -> DriveAt{Absent, Unmounted, Mounted(path)}` | udisks GetManagedObjects; never mounts, any error is Absent. What the lanes use | Absent (phase 5) |
+| `mount_added(object, wanted) -> Option<(DriveId, PathBuf)>` | mounts the filesystem just added at `object` only if its id is in `wanted`; the daemon's only mount | Ok(None) |
 | `disk_free(&Path) -> (free, total)` | rustix statvfs | GetDiskFreeSpaceExW |
 | `is_mounted(&Path)` | st_dev differs from the parent's | volume root exists |
-| `watch_drives(on_change: impl Fn())` (no ids: the listener rescans) | one match rule on udisks InterfacesAdded and Filesystem MountPoints changes, reconnecting every 30 s | CM_Register_Notification on GUID_DEVINTERFACE_VOLUME |
+| `watch_drives(on_event: impl Fn(DriveEvent))`, `DriveEvent{Added(object path), Changed}` | one match rule on udisks InterfacesAdded (a Filesystem interface gives Added) and Filesystem MountPoints changes (Changed), reconnecting every 30 s (Changed after a reconnect) | CM_Register_Notification on GUID_DEVINTERFACE_VOLUME |
+| `watch_queue(dir, on_change)` | inotify on the queue directory, firing for `wake` and `*.ctl` only | none yet: the daemon's 30 s tick |
+| `session_env()` | `systemctl --user show-environment`, filtered to DISPLAY, WAYLAND_DISPLAY, XAUTHORITY and SSH_AUTH_SOCK, read per job | empty |
 | `run_tray(TrayModel, Receiver<..>)` | ksni blocking | hidden top-level window + Shell_NotifyIconW |
 | `notify(Alert)` | org.freedesktop.Notifications with the "run" action | NIF_INFO balloon, where NIN_BALLOONUSERCLICK means run |
 | `open_path` | xdg-open | explorer.exe |
 | `ssh_program()`, `ssh_mux_args()` | `/usr/bin/ssh` + ControlMaster args, `SSH_ASKPASS=/usr/bin/ksshaskpass`, `SSH_ASKPASS_REQUIRE=force` | `%SystemRoot%\System32\OpenSSH\ssh.exe`, no mux args |
-| `install_schedule()` | none: units ship in `dist/systemd/`, installed by the environment repo | schtasks XML: `\preserver\public` 03:00 StartWhenAvailable Priority 7, `local` nightly, `verify` weekly, `tray` LogonTrigger |
+| `install_schedule()` | none: `install.sh` installs the tray and daemon units from `dist/systemd/`; job times come from `[schedule]` in config.toml | schtasks XML: `\preserver\tray` and `\preserver\daemon` at logon (install.bat for now) |
 | `background_priority()` | none (the units set Nice and IOSchedulingClass=idle) | SetPriorityClass(PROCESS_MODE_BACKGROUND_BEGIN) |
 
 **`DriveId` newtype (an invariant).** It is normalized hex without dashes, upper case. udisks reports FAT as `XXXX-XXXX` and NTFS as a 16-hex serial, which are the same values Windows returns. So the same `drives.d/<id>.toml` matches on both OSes, and the existing ext4 UUID still works on Linux.
@@ -182,10 +187,10 @@ enum Expect { None, Sha256([u8; 32]), Sha512([u8; 64]), Both([u8; 32], [u8; 64])
 
 struct Job { id: JobId, kind: JobKind, priority: u32, state: JobState, attempts: u32, next_try: Option<Timestamp>,
              drive: DriveId, created: Timestamp, updated: Timestamp, progress: Progress, error: Option<String> }
-enum JobKind { Personal { github: bool, local: bool }, Set { set: String }, Mirror { set: String, source: String },
+enum JobKind { Github { transport: Option<Transport> }, Local, Set { set: String }, Mirror { set: String, source: String },
                Copy { target: Target /* Drive { id, subdir, label } | Dir { path } */, sets: Vec<String>, size: Option<u64>, rule: Option<String> },
                Scrub { repair: bool } }
-enum JobState { Queued, Blocked(BlockReason /* DriveAbsent | Budget */), Running { pid: u32 }, Paused, Done, Failed, Canceled }
+enum JobState { Queued, Blocked(BlockReason /* DriveAbsent | Unmounted | NeedsTouch */), Running { pid: u32 }, Paused, Done, Failed, Canceled }
 struct Control { pause: bool, cancel: bool, priority: Option<u32> }          // <id>.ctl, written by CLI/tray only
 struct Progress { phase: Phase, files_done: u64, files_total: u64, bytes_done: u64, bytes_total: u64, rate_bps: u64, current: Vec<String> }
 struct Fetch { job: JobId, order: u32, host: String, url: String, dest: PathBuf, size: Option<u64>, expect: Expect }
@@ -198,11 +203,15 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Aspect | Design |
 |---|---|
 | Store | `~/.local/state/preserver/queue/<id>.json`, written only by the worker (tmp + rename). Control lives in `<id>.ctl`, written by the CLI and tray. New jobs are created with `O_EXCL` by anyone. The worker rescans every 1 s |
-| Lanes and daemon | Each job kind belongs to a lane (`Lane::Download`, `Lane::Copy`); a worker resets and writes only its own lane's jobs. `preserver daemon` (user service) runs one thread per lane and takes the lane lock for one pass at a time: a 30 s tick (crashed jobs only), a drive event or the hourly sweep (also `Blocked`). `public`, `copy` and `scrub` enqueue, then run the worker if the lock is free; otherwise they print "queued; worker running", and a stopped job they name gets a `retry` in its ctl. A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
+| Lanes and daemon | Each job kind belongs to a lane (`Lane::Download` for sets, `Lane::Copy`, `Lane::Personal` for GitHub and local folders); a worker resets and writes only its own lane's jobs. `preserver daemon` (user service) runs one thread per lane and takes the lane lock for one pass at a time: a 30 s tick or a queue wake-up (crashed jobs only), a drive event or the hourly sweep (also `Blocked`, except `NeedsTouch`). A `Running{pid}` job whose lock isn't held is a crash and goes back to Queued |
+| Handoff | `personal`, `public` and `copy` (not their `--dry-run`, `--list` or `--remove`) queue for a live daemon (its lock is held) and write `queue/wake`, which its inotify watch turns into a pass at once. With no daemon, or with `--foreground`, they take the lane lock first, queue, run the lane here and exit non-zero on Failed or `NeedsTouch`; when another worker holds the lane they only queue. One unfinished job per kind (`Store::enqueue`): a stopped one gets a `retry` and is unpaused instead of a second job. The tray uses the same code (`actions.rs`) |
+| Mounting | Lanes only `locate` the drive: Absent is `Blocked(DriveAbsent)`, plugged in but unmounted is `Blocked(Unmounted)`, both without an attempt. People's actions (CLI, tray, `queue retry`, `queue run`) mount first, best effort. The daemon mounts only a filesystem that appears while it runs and that a job wants (the primary, a copy rule's or unfinished copy job's target), so a drive already plugged in at login stays "not mounted" until someone mounts it, replugs it or presses Retry |
+| Schedules | `[schedule]` in config.toml: `personal` (the GitHub job), `local` and `public`, each `H:MM:SS` (every interval since the last run) or `HH:MM` (daily, local time, DST gaps and folds resolved the compatible way). The daemon checks them before every pass (`schedule.rs`). A missed occurrence runs once when the daemon next looks (systemd `Persistent=true`), since `last_run` in `status/<job>.json` is set by every run, manual ones too. A job still waiting is left alone; a Failed or `NeedsTouch` one older than the occurrence gets one retry, so an unanswered security key is asked for once per occurrence. Copy rules use the same `due` |
+| Security key | The personal lane runs ssh with the session's DISPLAY, WAYLAND_DISPLAY, XAUTHORITY and SSH_AUTH_SOCK, read from the user manager per job (the tray imports them at login). The prompt waits 120 s; no answer, or no graphical session, is `Blocked(NeedsTouch)` without an attempt. A pause or cancel during the prompt ends ssh and its askpass (their process group) |
 | Per-file state | The filesystem is the state: a final file exists only after verification. A partial is `<dest>.part` + `<dest>.part.json` (PartState). Repo generations add `.staging/<gen>/done.tsv` (append-only, fsync batched) |
 | Priority | `Job.priority` is the position in first-pass catalog order (`--first-pass`), or stable by `priority` then catalog order. Within a job, items keep plan order |
 | Concurrency | `downloads = 4` threads. Per-host semaphores default to 2, overridable in config `[hosts]` (e.g. `"huggingface.co" = 4`) |
-| Retry | Per item: backoff 5 s·2ⁿ with jitter, capped at 10 min, 6 tries per run. 4xx other than 408/429 is permanent. A 429/503 `Retry-After` pauses the whole host. After that the job is Failed, and the next timer run retries it |
+| Retry | Per item: backoff 5 s·2ⁿ with jitter, capped at 10 min, 6 tries per run. 4xx other than 408/429 is permanent. A 429/503 `Retry-After` pauses the whole host. After that the job is Failed, and the next scheduled occurrence retries it |
 | Pause/resume/cancel | Applied at the next 64 KiB chunk. Pause keeps `.part` files. Cancel deletes the job's staging. `queue pause --all` writes a global ctl |
 | Unplug | A write error showing the mount is gone (ENOENT/EIO/ENODEV, or `is_mounted` false) puts every job on that drive into `Blocked(DriveAbsent)` without counting attempts. The daemon's drive watcher resumes them on replug |
 | Bandwidth | One global token bucket (default `bandwidth_mbit = 80`, 0 = off, burst 256 KiB). It is taken before each body read in `net` and in the gix Http backend. It counts payload bytes, so the wire is about 2–3% above; TCP backpressure keeps the link honest. Personal ssh fetches are unthrottled, as now |
@@ -275,12 +284,12 @@ On the host: `~/.config/preserver/{config.toml,drives.d/,personal/{identity.age,
 | Command | Notes |
 |---|---|
 | `init [--import IDENTITY_AGE]` | in-process keygen. The secret goes straight into the scrypt Encryptor (zeroized) and never touches disk unencrypted. Writes `identity.age` on the drive and at home, and `recipient.txt`. With `--import` it copies an existing passphrase-locked identity instead: the restore password must unlock it (checked before anything is written), and `recipient.txt` is derived from the keys inside. Neither form replaces an identity that is already stored |
-| `personal [--local-only]` | github + local jobs, refs state, alerts |
+| `personal [--local-only] [--transport T] [--foreground]` | queues the local-folder and GitHub jobs (§3.3 Handoff), refs state, alerts |
 | `restore FILE DIR` | `.bundle.age` or `.tar.zst.age` (L0 then Dnn applies the manifest's deletions). FILE can be anywhere, for example a bundle of an older backup tree on a drive. The locked key is the `identity.age` found in the three directories above FILE, else the primary drive's, else the home copy |
-| `public [SET…] [--dry-run] [--first-pass]` | enqueue + run the worker |
+| `public [SET…] [--dry-run] [--first-pass] [--foreground]` | enqueue, then the daemon or this process runs the worker (§3.3 Handoff) |
 | `queue list [--watch] \| show ID \| pause [ID\|--all] \| resume [ID\|--all\|--drive ID] \| cancel ID \| retry ID \| prio ID N \| run` | new |
 | `public --list` | the sets by priority with their variants, estimated and, with the primary connected, measured |
-| `copy TARGET [-t HH:MM:SS] [--sets a,b,-c] [--size 32G] [--dry-run]`, `copy --list`, `copy --remove ID` | copy to a drive (id or label) or a directory, fitted to its room (§3.6); `-t` keeps a rule the daemon runs; `--remove` takes a rule id or cancels a copy job |
+| `copy TARGET [-t HH:MM:SS] [--sets a,b,-c] [--size 32G] [--dry-run] [--foreground]`, `copy --list`, `copy --remove ID` | copy to a drive (id or label) or a directory, fitted to its room (§3.6); `-t` keeps a rule the daemon runs; `--remove` takes a rule id or cancels a copy job |
 | `verify [--repair]` | phase 4 |
 | `drives`, `open`, `tray` | list drives, open the archive folder, run the tray |
 | `install` | Windows only: Task Scheduler tasks + tray at logon |

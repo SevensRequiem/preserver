@@ -25,6 +25,16 @@ reserve_percent = 10
 name = "documents"
 path = "/home/you/Documents"
 
+# When the daemon queues each job by itself. Leave a key out (or the whole table) and that job
+# only runs when you ask: the tray, or 'preserver personal' / 'public'. "H:MM:SS" is an interval
+# since the last run, "HH:MM" a daily local time. A time missed while the machine was off runs
+# once when the daemon starts. "personal" is the GitHub backup; "local" the folders above.
+# [schedule]
+# personal = "24:00:00"
+# local = "01:30"
+# public = "03:00"
+
 # Copies to other drives are not configured here. 'preserver copy TARGET -t 24:00:00' keeps a
 # rule in copy.toml next to this file, which the daemon runs; 'copy --list' and 'copy --remove'
 # manage the rules. That file is written by preserver: edit it only through those commands.
+# Copy rules are for other drives only; the primary's own jobs are timed by [schedule] above.

@@ -1,6 +1,6 @@
 use crate::config::{Config, Transport, load_drives};
 use crate::paths::Paths;
-use crate::{copy, daemon, personal, platform, public, queue};
+use crate::{actions, copy, daemon, personal, platform, public, queue};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -27,6 +27,9 @@ pub enum Command {
         /// GitHub transport, overriding config.toml
         #[arg(long, value_enum)]
         transport: Option<Transport>,
+        /// Run here even when the daemon runs, instead of queueing for it
+        #[arg(long)]
+        foreground: bool,
     },
     /// Restore a .bundle.age (git repo) or a .tar.zst.age (local folder; a Dnn needs its L0 next to it) into DIR. Symlinks with an absolute target or one that climbs out of DIR are not recreated: they are listed and the exit status is non-zero
     Restore { file: PathBuf, dir: PathBuf },
@@ -40,6 +43,9 @@ pub enum Command {
         list: bool,
         #[arg(long)]
         first_pass: bool,
+        /// Run here even when the daemon runs, instead of queueing for it
+        #[arg(long, conflicts_with = "list")]
+        foreground: bool,
     },
     /// Inspect and control the job queue
     Queue {
@@ -69,6 +75,9 @@ pub enum Command {
         /// Remove a copy rule (by id) or cancel a copy job
         #[arg(long, value_name = "ID", conflicts_with = "target")]
         remove: Option<String>,
+        /// Run here even when the daemon runs, instead of queueing for it
+        #[arg(long, conflicts_with_all = ["list", "remove"])]
+        foreground: bool,
     },
     /// Verify archive checksums
     Verify {
@@ -81,7 +90,7 @@ pub enum Command {
     Open,
     /// Run the tray icon
     Tray,
-    /// Run the background service: the download queue, and copy rules, woken by drive events
+    /// Run the background service: the queue, config.toml schedules and copy rules, woken by drive events
     Daemon,
     /// Install scheduled tasks (Windows)
     Install,
@@ -175,10 +184,22 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Personal {
             local_only,
             transport,
+            foreground,
         } => {
-            let (mut paths, cfg) = load()?;
-            let transport = transport.unwrap_or(cfg.transport);
-            personal::run(&mut paths, &cfg, local_only, transport)
+            let (paths, cfg) = load()?;
+            personal::require_init(&paths)?;
+            if local_only && cfg.local.is_empty() {
+                println!("nothing to back up: config.toml lists no [[local]] folders");
+                return Ok(());
+            }
+            let Some((_lock, ids)) =
+                actions::handoff(&paths, "personal-queue", foreground, |tidy| {
+                    actions::enqueue_personal(&paths, &cfg, local_only, transport, tidy)
+                })?
+            else {
+                return Ok(());
+            };
+            personal::lane::foreground(&paths, &ids)
         }
         Command::Restore { file, dir } => {
             let mut paths = Paths::from_env()?;
@@ -207,12 +228,14 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             first_pass,
             list,
+            foreground,
         } => {
             let (mut paths, cfg) = load()?;
             if list {
-                return public::list(&mut paths, &cfg);
+                print!("{}", public::list_report(&mut paths, &cfg)?);
+                return Ok(());
             }
-            public::run(&mut paths, &cfg, &sets, dry_run, first_pass)
+            public::run(&mut paths, &cfg, &sets, dry_run, first_pass, foreground)
         }
         Command::Copy {
             target,
@@ -222,6 +245,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             list,
             remove,
+            foreground,
         } => {
             let (mut paths, cfg) = load()?;
             copy::cli(
@@ -235,6 +259,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     dry_run,
                     list,
                     remove,
+                    foreground,
                 },
             )
         }

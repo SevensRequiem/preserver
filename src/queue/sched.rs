@@ -5,10 +5,11 @@ use super::job::{BlockReason, Job, JobState, Lane, Progress};
 use super::store::Store;
 use crate::config::DriveId;
 use crate::net::download::{Downloader, Fail, Fetch, STREAMS};
+use crate::platform::DriveAt;
 use anyhow::Result;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::BuildHasher;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -238,7 +239,9 @@ pub(crate) fn runnable(store: &Store, lane: Lane, pass: Pass) -> Result<bool> {
                 _ if c.cancel => true,
                 _ if paused => false,
                 JobState::Running { .. } | JobState::Queued => true,
-                JobState::Blocked(_) => pass.retry_blocked || retry,
+                JobState::Blocked(r) => {
+                    (pass.retry_blocked && r != BlockReason::NeedsTouch) || retry
+                }
                 JobState::Failed => pass.retry_failed || retry,
                 JobState::Paused => !c.pause || retry,
             }
@@ -277,7 +280,9 @@ pub(crate) fn reset(store: &Store, lane: Lane, pass: Pass) -> Result<()> {
     for mut job in store.jobs()?.into_iter().filter(|j| j.kind.lane() == lane) {
         let requeue = match job.state {
             JobState::Running { .. } => true,
-            JobState::Blocked(_) => pass.retry_blocked,
+            // An unanswered touch prompt is asked again only on a retry or the next scheduled
+            // occurrence, never on a drive event.
+            JobState::Blocked(r) => pass.retry_blocked && r != BlockReason::NeedsTouch,
             JobState::Failed => pass.retry_failed,
             _ => false,
         };
@@ -315,8 +320,8 @@ pub(crate) struct Worker<'a> {
     /// Called with the job's outcome before it is saved, whenever a job stops. It finishes
     /// what the downloads were for, and may turn a Done job into a Failed one.
     pub settle: &'a (dyn Fn(&mut Job, &Path) + Sync),
-    /// The drive's mount point, or `None` when it is not connected.
-    pub drive: &'a (dyn Fn(&DriveId) -> Option<PathBuf> + Sync),
+    /// Where the drive is; the worker never mounts it.
+    pub drive: &'a (dyn Fn(&DriveId) -> DriveAt + Sync),
 }
 
 impl Worker<'_> {
@@ -351,9 +356,16 @@ impl Worker<'_> {
     }
 
     fn run_job(&self, mut job: Job) -> Result<()> {
-        let Some(root) = (self.drive)(&job.drive) else {
-            job.state = JobState::Blocked(BlockReason::DriveAbsent);
-            return self.store.save(&mut job);
+        let root = match (self.drive)(&job.drive) {
+            DriveAt::Mounted(root) => root,
+            DriveAt::Unmounted => {
+                job.state = JobState::Blocked(BlockReason::Unmounted);
+                return self.store.save(&mut job);
+            }
+            DriveAt::Absent => {
+                job.state = JobState::Blocked(BlockReason::DriveAbsent);
+                return self.store.save(&mut job);
+            }
         };
         let fetches = match (self.plan)(&job, &root) {
             Ok(f) => f,
@@ -378,7 +390,7 @@ impl Worker<'_> {
 
         let pool = Pool::new(&fetches);
         let done = AtomicU64::new(0);
-        let drive_ok = || (self.drive)(&job.drive).is_some_and(|r| r.exists());
+        let drive_ok = || matches!((self.drive)(&job.drive), DriveAt::Mounted(r) if r.exists());
         let mut halt = None;
         std::thread::scope(|s| {
             for _ in 0..STREAMS {
@@ -457,6 +469,7 @@ mod tests {
     use crate::queue::job::JobKind;
     use crate::testutil::TempDir;
     use sha2::Digest;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use ureq::tls::RootCerts;
 
@@ -583,14 +596,24 @@ mod tests {
 
         fn run_with(&self, pass: Pass) {
             let mnt = self.mnt();
+            let drive = |_: &DriveId| {
+                if mnt.exists() {
+                    DriveAt::Mounted(mnt.clone())
+                } else {
+                    DriveAt::Absent
+                }
+            };
+            self.run_on(pass, &drive);
+        }
+
+        fn run_on(&self, pass: Pass, drive: &(dyn Fn(&DriveId) -> DriveAt + Sync)) {
             let plan = |_: &Job, root: &Path| Ok(vec![self.fetch(root)]);
-            let drive = |_: &DriveId| Some(mnt.clone()).filter(|m| m.exists());
             Worker {
                 store: &self.store,
                 dl: &self.dl,
                 plan: &plan,
                 settle: &|_, _| {},
-                drive: &drive,
+                drive,
             }
             .run(pass)
             .unwrap();
@@ -688,6 +711,54 @@ mod tests {
         let j = r.store.job(&job.id).unwrap();
         assert_eq!(j.state, JobState::Done, "{:?}", j.error);
         assert_eq!(std::fs::read(r.dest()).unwrap(), r.data);
+    }
+
+    #[test]
+    fn an_unmounted_drive_blocks_without_an_attempt() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        r.run_on(Pass::FRESH, &|_| DriveAt::Unmounted);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(
+            (j.state, j.attempts),
+            (JobState::Blocked(BlockReason::Unmounted), 0)
+        );
+        r.run();
+        assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn drive_events_skip_a_job_waiting_for_a_touch() {
+        let r = Rig::new(1000, 0);
+        let set = |state| {
+            let mut j = r.job();
+            j.state = state;
+            r.store.save(&mut j).unwrap();
+            j.id
+        };
+        let touch = set(JobState::Blocked(BlockReason::NeedsTouch));
+        let state = |id: &str| r.store.job(id).unwrap().state;
+        let can = |pass| runnable(&r.store, Lane::Download, pass).unwrap();
+        let drive_event = Pass {
+            retry_blocked: true,
+            ..Pass::TICK
+        };
+        assert!(!can(drive_event) && !can(Pass::FRESH));
+        reset(&r.store, Lane::Download, Pass::FRESH).unwrap();
+        assert_eq!(state(&touch), JobState::Blocked(BlockReason::NeedsTouch));
+
+        let unmounted = set(JobState::Blocked(BlockReason::Unmounted));
+        assert!(can(drive_event));
+        r.run_with(drive_event);
+        assert_eq!(state(&unmounted), JobState::Done);
+        assert_eq!(state(&touch), JobState::Blocked(BlockReason::NeedsTouch));
+
+        r.store
+            .edit_control(Some(&touch), |c| c.retry += 1)
+            .unwrap();
+        assert!(can(Pass::TICK));
+        r.run_with(Pass::TICK);
+        assert_eq!(state(&touch), JobState::Done);
     }
 
     #[test]

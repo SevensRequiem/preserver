@@ -7,7 +7,9 @@ bindir=$HOME/.local/bin
 unitdir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 bin=$bindir/preserver
 prev=$bindir/preserver.prev
-units=(preserver-tray.service preserver-daemon.service preserver-personal.service preserver-local.service preserver-local.timer preserver-public.service preserver-public.timer)
+units=(preserver-tray.service preserver-daemon.service)
+# Jobs the daemon now runs from config.toml [schedule]; removed on install and uninstall.
+retired=(preserver-personal.service preserver-local.service preserver-local.timer preserver-public.service preserver-public.timer)
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "install.sh: $*"; }
@@ -33,7 +35,7 @@ uninstall() {
 		ctl disable --now preserver-tray.service preserver-daemon.service preserver-local.timer preserver-public.timer 2>/dev/null || true
 		ctl stop preserver-personal.service preserver-local.service preserver-public.service 2>/dev/null || true
 	fi
-	for u in "${units[@]}"; do rm -f "$unitdir/$u"; done
+	for u in "${units[@]}" "${retired[@]}"; do rm -f "$unitdir/$u"; done
 	rm -f "$bin" "$prev"
 	have_systemd && { ctl daemon-reload || true; }
 	say "removed binary, previous binary and units; config, keys, state and backups are untouched"
@@ -98,17 +100,39 @@ install_units() {
 	say "installed ${#units[@]} units into $unitdir"
 }
 
+retire_units() {
+	local u found=0
+	for u in "${retired[@]}"; do
+		if [ -e "$unitdir/$u" ]; then found=1; fi
+	done
+	[ "$found" -eq 1 ] || return 0
+	if have_systemd; then
+		if ctl is-enabled --quiet preserver-local.timer 2>/dev/null; then
+			say 'nightly local backups now come from config.toml: add local = "01:30" under [schedule]'
+		fi
+		ctl disable --now preserver-local.timer preserver-public.timer 2>/dev/null || true
+		ctl stop preserver-personal.service preserver-local.service preserver-public.service 2>/dev/null || true
+	fi
+	for u in "${retired[@]}"; do rm -f "$unitdir/$u"; done
+	say "removed the retired personal, local and public units; the daemon runs those jobs now"
+}
+
 enable_units() {
-	have_systemd || { say "warning: no systemd user session, units are installed but not enabled; from a login session run: systemctl --user daemon-reload && systemctl --user enable --now preserver-tray.service preserver-local.timer preserver-daemon.service"; return 0; }
+	have_systemd || { say "warning: no systemd user session, units are installed but not enabled; from a login session run: systemctl --user daemon-reload && systemctl --user enable --now preserver-tray.service preserver-daemon.service"; return 0; }
 	ctl daemon-reload
-	ctl enable preserver-tray.service preserver-local.timer preserver-daemon.service
-	ctl start preserver-local.timer
+	ctl enable preserver-tray.service preserver-daemon.service
+	# The daemon asks for the security key through the session's askpass dialog; the tray
+	# imports these at each login, this covers the daemon started below.
+	local v vars=()
+	for v in DISPLAY WAYLAND_DISPLAY XAUTHORITY; do
+		if [ -n "${!v-}" ]; then vars+=("$v"); fi
+	done
+	if [ ${#vars[@]} -gt 0 ]; then ctl import-environment "${vars[@]}" || true; fi
 	# A new binary only takes over once the long-running services restart.
 	ctl try-restart preserver-tray.service preserver-daemon.service || true
 	ctl start preserver-daemon.service || say "warning: daemon not started; see journalctl --user -u preserver-daemon.service"
 	ctl start preserver-tray.service || say "warning: tray not started (no graphical session?); it starts with the next one"
-	say "enabled preserver-tray.service, preserver-daemon.service and preserver-local.timer (nightly 01:30)"
-	say "preserver-public.timer is installed but not enabled: systemctl --user enable --now preserver-public.timer"
+	say "enabled preserver-tray.service and preserver-daemon.service; backups run on the times under [schedule] in config.toml"
 }
 
 case ${1-} in
@@ -147,5 +171,6 @@ for u in "${units[@]}"; do
 	[ -f "$src/dist/systemd/$u" ] || die "dist/systemd/$u not found, nothing installed"
 done
 install_binary "$new"
+retire_units
 install_units
 enable_units

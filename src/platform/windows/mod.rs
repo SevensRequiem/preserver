@@ -1,7 +1,7 @@
 //! Windows arrives in phase 5. Until then every call that needs the OS reports that.
 
 use crate::config::DriveId;
-use crate::platform::FsInfo;
+use crate::platform::{DriveAt, DriveEvent, FsInfo};
 use anyhow::Result;
 use std::fs::File;
 use std::io;
@@ -23,8 +23,31 @@ pub(crate) fn mount(_id: &DriveId) -> Result<PathBuf> {
     Err(unsupported().into())
 }
 
-pub(crate) fn watch_drives(_on_change: impl Fn() + Send + 'static) {
+pub(crate) fn locate(_id: &DriveId) -> DriveAt {
+    DriveAt::Absent
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the linux fn; drive events come in phase 5"
+)]
+pub(crate) fn mount_added(
+    _object: &str,
+    _wanted: &[DriveId],
+) -> Result<Option<(DriveId, PathBuf)>> {
+    Ok(None)
+}
+
+pub(crate) fn watch_drives(_on_event: impl Fn(DriveEvent) + Send + 'static) {
     tracing::warn!("drive events are not supported on Windows yet (phase 5)");
+}
+
+pub(crate) fn watch_queue(_dir: &Path, _on_change: impl Fn() + Send + 'static) {
+    tracing::warn!("queue wake-ups are not supported on Windows yet (phase 5): 30 s tick");
+}
+
+pub(crate) fn session_env() -> Vec<(String, String)> {
+    Vec::new()
 }
 
 pub(crate) fn is_mounted(_path: &Path) -> bool {
@@ -83,8 +106,12 @@ pub(crate) fn run_tray(_paths: &crate::paths::Paths) -> Result<()> {
     Err(unsupported().into())
 }
 
-pub(crate) fn ssh_master(_runtime: &Path) -> io::Result<()> {
-    Err(unsupported())
+pub(crate) fn ssh_master(
+    _runtime: &Path,
+    _session: &[(String, String)],
+    _stop: &dyn Fn() -> bool,
+) -> Result<()> {
+    Err(unsupported().into())
 }
 
 pub(crate) fn ssh_master_stop(_runtime: &Path) {}

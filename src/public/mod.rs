@@ -15,7 +15,7 @@ use crate::paths::Paths;
 use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Worker, runnable};
 use crate::resolve::{GH_API, HF_BASE, Item, Resolver};
 use crate::verify::Verifier;
-use crate::{platform, status};
+use crate::{actions, platform, status};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use std::collections::HashMap;
@@ -267,49 +267,30 @@ impl Public<'_> {
     }
 }
 
-/// Queues a job per set, unless one is already waiting, and returns the job ids in set order.
-/// `tidy` (the caller holds the worker lock) also drops the finished jobs of those sets.
-/// Without it the daemon owns the queue and would leave a Failed or Blocked job alone, so
-/// such a job gets a retry through its control file: a timer run still retries every set.
-fn enqueue(store: &Store, sets: &[&Set], drive: &DriveId, tidy: bool) -> Result<Vec<String>> {
-    let jobs = store.jobs()?;
-    let mut ids = Vec::new();
-    for (i, set) in sets.iter().enumerate() {
-        let mut waiting = None;
-        for j in jobs
-            .iter()
-            .filter(|j| matches!(&j.kind, JobKind::Set { set: s } if *s == set.name))
-        {
-            if !matches!(j.state, JobState::Done | JobState::Canceled) {
-                waiting.get_or_insert(j);
-            } else if tidy {
-                store.remove(&j.id)?;
-            }
-        }
-        let id = if let Some(j) = waiting {
-            if !tidy && matches!(j.state, JobState::Failed | JobState::Blocked(_)) {
-                store.edit_control(Some(&j.id), |c| c.retry += 1)?;
-            }
-            j.id.clone()
-        } else {
+/// Queues a job per set (`Store::enqueue`, earlier sets first) and returns the ids in set order.
+pub(crate) fn enqueue_all(
+    store: &Store,
+    sets: &[&Set],
+    drive: &DriveId,
+    tidy: bool,
+) -> Result<Vec<String>> {
+    sets.iter()
+        .enumerate()
+        .map(|(i, set)| {
             let kind = JobKind::Set {
                 set: set.name.clone(),
             };
-            store
-                .create(&kind, drive, u32::try_from(i).unwrap_or(u32::MAX))?
-                .id
-        };
-        ids.push(id);
-    }
-    Ok(ids)
+            store.enqueue(&kind, drive, u32::try_from(i).unwrap_or(u32::MAX), tidy)
+        })
+        .collect()
 }
 
-fn downloader(cfg: &Config) -> Result<Downloader> {
-    Ok(Downloader::new(
-        client::agent(client::os_roots()?),
+fn downloader(cfg: &Config) -> Downloader {
+    Downloader::new(
+        client::agent(client::os_roots()),
         Arc::new(Throttle::from_mbit(cfg.bandwidth_mbit)),
         CHECKPOINT,
-    ))
+    )
 }
 
 fn notify(urgent: bool, title: &str, body: &str) {
@@ -344,7 +325,7 @@ fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
         dl,
         plan: &|job, root| p.plan(job, root),
         settle: &|job, root| p.settle(job, root),
-        drive: &|id| platform::mount(id).ok(),
+        drive: &platform::locate,
     }
     .run(pass)
 }
@@ -356,7 +337,7 @@ pub(crate) fn queue_run(paths: &Paths, cfg: &Config) -> Result<()> {
         return Ok(());
     };
     let cat = Catalog::embedded()?;
-    let dl = downloader(cfg)?;
+    let dl = downloader(cfg);
     work(
         &public(&cat, paths, cfg, &dl),
         &Store::new(paths.queue.clone()),
@@ -378,7 +359,7 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
     }
     let cfg = Config::load(&paths.cfg)?;
     let cat = Catalog::embedded()?;
-    let dl = downloader(&cfg)?;
+    let dl = downloader(&cfg);
     let start = Timestamp::now();
     // Same lock order as run(): queue, then public.
     status::job(&mut paths.clone(), "public", |paths| {
@@ -408,17 +389,13 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
 
 /// `preserver public --list`: the sets in priority order with their variants, estimated and,
 /// when the primary is connected, measured in its newest version.
-pub(crate) fn list(paths: &mut Paths, cfg: &Config) -> Result<()> {
+pub(crate) fn list_report(paths: &mut Paths, cfg: &Config) -> Result<String> {
     let cat = Catalog::embedded()?;
-    let root = match paths.mount(&cfg.primary_uuid) {
-        Ok(()) => Some(paths.mnt.clone()),
-        Err(e) => {
-            println!("note: {e:#}, so sizes are estimates only");
-            None
-        }
+    let (note, root) = match paths.mount(&cfg.primary_uuid) {
+        Ok(()) => (String::new(), Some(paths.mnt.clone())),
+        Err(e) => (format!("note: {e:#}, so sizes are estimates only\n"), None),
     };
-    print!("{}", list_text(&cat, root.as_deref())?);
-    Ok(())
+    Ok(note + &list_text(&cat, root.as_deref())?)
 }
 
 fn list_text(cat: &Catalog, root: Option<&Path>) -> Result<String> {
@@ -467,22 +444,23 @@ fn list_text(cat: &Catalog, root: Option<&Path>) -> Result<String> {
     Ok(out)
 }
 
-/// `preserver public [SET...] [--dry-run] [--first-pass]`.
+/// `preserver public [SET...] [--dry-run] [--first-pass] [--foreground]`.
 pub(crate) fn run(
     paths: &mut Paths,
     cfg: &Config,
     names: &[String],
     dry: bool,
     first_pass: bool,
+    foreground: bool,
 ) -> Result<()> {
     let cat = Catalog::embedded()?;
     let sets = cat.select(names, first_pass)?;
-    let mounted = paths.mount(&cfg.primary_uuid);
-    let dl = downloader(cfg)?;
     if dry {
+        let mounted = paths.mount(&cfg.primary_uuid);
         if let Err(e) = &mounted {
             println!("note: {e:#}, so budgets are unchecked");
         }
+        let dl = downloader(cfg);
         let p = public(&cat, paths, cfg, &dl);
         let root = mounted.is_ok().then_some(paths.mnt.as_path());
         let mut out = std::io::stdout().lock();
@@ -491,15 +469,16 @@ pub(crate) fn run(
         }
         return Ok(());
     }
-    mounted?;
+    actions::mount(&cfg.primary_uuid);
     let store = Store::new(paths.queue.clone());
-    let Some(_lock) = status::try_lock(&paths.lock_file("queue"))? else {
-        enqueue(&store, &sets, &cfg.primary_uuid, false)?;
-        println!("queued; worker running");
+    let Some((_lock, ids)) = actions::handoff(paths, "queue", foreground, |tidy| {
+        enqueue_all(&store, &sets, &cfg.primary_uuid, tidy)
+    })?
+    else {
         return Ok(());
     };
+    let dl = downloader(cfg);
     status::job(paths, "public", |paths| {
-        let ids = enqueue(&store, &sets, &cfg.primary_uuid, true)?;
         work(&public(&cat, paths, cfg, &dl), &store, &dl, Pass::FRESH)?;
         let mut errs = Vec::new();
         for (set, id) in sets.iter().zip(&ids) {
@@ -509,7 +488,7 @@ pub(crate) fn run(
                 JobState::Failed => {
                     errs.push(format!("{}: {}", set.name, job.error.unwrap_or_default()));
                 }
-                s => errs.push(format!("{}: {s}", set.name)),
+                s => println!("{}: {s} (job {id})", set.name),
             }
         }
         if errs.is_empty() {

@@ -1,9 +1,10 @@
+use crate::schedule::Schedule;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     #[default]
@@ -95,6 +96,19 @@ pub(crate) struct Config {
     pub reserve_percent: u8,
     #[serde(default)]
     pub local: Vec<LocalFolder>,
+    #[serde(default)]
+    pub schedule: Schedules,
+}
+
+/// `[schedule]`: unset kinds are never queued by the daemon. A typo is an error, not a backup
+/// that silently never runs.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Schedules {
+    /// The GitHub bundles.
+    pub personal: Option<Schedule>,
+    pub local: Option<Schedule>,
+    pub public: Option<Schedule>,
 }
 
 fn default_bandwidth() -> u32 {
@@ -289,6 +303,23 @@ mod tests {
         assert_eq!(c.transport, Transport::Ssh);
         assert_eq!(c.reserve_percent, 10);
         assert!(c.local.is_empty());
+        let s = &c.schedule;
+        assert!(s.personal.is_none() && s.local.is_none() && s.public.is_none());
+    }
+
+    #[test]
+    fn schedule_table() {
+        let c = Config::parse(&format!(
+            "owners = [\"a\"]\n{UUID}\n[schedule]\npersonal = \"24:00:00\"\nlocal = \"01:30\"\n"
+        ))
+        .unwrap();
+        assert_eq!(c.schedule.personal, Some(Schedule::Every(86_400)));
+        assert_eq!(c.schedule.local, Some("01:30".parse().unwrap()));
+        assert_eq!(c.schedule.public, None);
+        for bad in ["pubic = \"03:00\"", "local = \"25:00\"", "local = 130"] {
+            let text = format!("owners = [\"a\"]\n{UUID}\n[schedule]\n{bad}\n");
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

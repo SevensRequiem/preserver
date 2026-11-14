@@ -7,11 +7,12 @@ mod exec;
 pub(crate) mod plan;
 pub(crate) mod rules;
 
+use crate::actions;
 use crate::catalog::Catalog;
 use crate::config::{Config, DriveId};
 use crate::paths::Paths;
 use crate::personal::local::escapes;
-use crate::platform::{self, FsInfo};
+use crate::platform::{self, DriveAt, FsInfo};
 use crate::public::index;
 use crate::public::versioned::{plain_dirs, read_meta, read_set_file, read_sums, version_dirs};
 use crate::queue::{
@@ -57,8 +58,8 @@ struct Copied {
 
 /// Everything the lane needs from the OS, so tests can stand in for drives.
 pub(crate) struct Env<'a> {
-    /// Where a filesystem is mounted, mounting it if need be; `None` when it is not connected.
-    pub mount: &'a (dyn Fn(&DriveId) -> Option<PathBuf> + Sync),
+    /// Where a filesystem is; the lane never mounts one.
+    pub drive: &'a (dyn Fn(&DriveId) -> DriveAt + Sync),
     pub fstype: &'a (dyn Fn(&Target, &Path) -> String + Sync),
     pub free: &'a (dyn Fn(&Path) -> io::Result<(u64, u64)> + Sync),
     pub cluster: &'a (dyn Fn(&Path) -> u64 + Sync),
@@ -81,7 +82,7 @@ fn real_fstype(target: &Target, root: &Path) -> String {
 
 fn with_real_env<T>(say: &(dyn Fn(&str) + Sync), f: impl FnOnce(&Env) -> T) -> T {
     f(&Env {
-        mount: &|id| platform::mount(id).ok(),
+        drive: &platform::locate,
         fstype: &real_fstype,
         free: &platform::disk_free,
         cluster: &|p| platform::block_size(p).unwrap_or(4096),
@@ -89,20 +90,31 @@ fn with_real_env<T>(say: &(dyn Fn(&str) + Sync), f: impl FnOnce(&Env) -> T) -> T
     })
 }
 
-/// Where the target's files go, or `None` when it is not there. A drive's subdirectory is
-/// created on first use; a plain directory must exist already.
-fn target_root(env: &Env, target: &Target, create: bool) -> Result<Option<PathBuf>> {
+/// A drive's mount point, or why a job has to wait for it.
+fn mounted(env: &Env, id: &DriveId) -> Result<PathBuf, BlockReason> {
+    match (env.drive)(id) {
+        DriveAt::Mounted(p) => Ok(p),
+        DriveAt::Unmounted => Err(BlockReason::Unmounted),
+        DriveAt::Absent => Err(BlockReason::DriveAbsent),
+    }
+}
+
+/// Where the target's files go, or why it is not there. A drive's subdirectory is created on
+/// first use; a plain directory must exist already.
+fn target_root(env: &Env, target: &Target, create: bool) -> Result<Result<PathBuf, BlockReason>> {
     match target {
         Target::Drive { id, subdir, .. } => {
-            let Some(mnt) = (env.mount)(id) else {
-                return Ok(None);
+            let mnt = match mounted(env, id) {
+                Ok(m) => m,
+                Err(r) => return Ok(Err(r)),
             };
             if create {
-                return exec::ensure_dir(&mnt, subdir).map(Some);
+                return exec::ensure_dir(&mnt, subdir).map(Ok);
             }
-            Ok(Some(mnt.join(subdir)))
+            Ok(Ok(mnt.join(subdir)))
         }
-        Target::Dir { path } => Ok(path.is_dir().then(|| path.clone())),
+        Target::Dir { path } if path.is_dir() => Ok(Ok(path.clone())),
+        Target::Dir { .. } => Ok(Err(BlockReason::DriveAbsent)),
     }
 }
 
@@ -476,9 +488,14 @@ fn scan(
     ))
 }
 
-/// Plans a copy and runs it. `Ok(false)`: a drive is not there.
+/// Plans a copy and runs it. `Ok(Some(_))`: a drive is not there, and why.
 #[expect(clippy::too_many_lines, reason = "the run in plan order")]
-fn execute(job: &Job, env: &Env, stop: &(dyn Fn() -> bool + Sync), prog: &Prog) -> Result<bool> {
+fn execute(
+    job: &Job,
+    env: &Env,
+    stop: &(dyn Fn() -> bool + Sync),
+    prog: &Prog,
+) -> Result<Option<BlockReason>> {
     let JobKind::Copy {
         target, sets, size, ..
     } = &job.kind
@@ -486,14 +503,16 @@ fn execute(job: &Job, env: &Env, stop: &(dyn Fn() -> bool + Sync), prog: &Prog) 
         bail!("not a copy job");
     };
     target.validate()?;
-    let Some(primary) = (env.mount)(&job.drive) else {
-        return Ok(false);
+    let primary = match mounted(env, &job.drive) {
+        Ok(p) => p,
+        Err(r) => return Ok(Some(r)),
     };
-    let Some(root) = target_root(env, target, true)? else {
-        return Ok(false);
+    let root = match target_root(env, target, true)? {
+        Ok(r) => r,
+        Err(r) => return Ok(Some(r)),
     };
     let (Ok(p), Ok(r)) = (primary.canonicalize(), root.canonicalize()) else {
-        return Ok(false);
+        return Ok(Some(BlockReason::DriveAbsent));
     };
     if p.starts_with(&r) || r.starts_with(&p) {
         bail!("{} overlaps the primary drive", r.display());
@@ -606,7 +625,7 @@ fn execute(job: &Job, env: &Env, stop: &(dyn Fn() -> bool + Sync), prog: &Prog) 
             names.join(", ")
         );
     }
-    Ok(true)
+    Ok(None)
 }
 
 fn write_state(file: &Path, state: &State) -> Result<()> {
@@ -619,7 +638,7 @@ fn clean_up(env: &Env, job: &Job) {
     let JobKind::Copy { target, sets, .. } = &job.kind else {
         return;
     };
-    let Ok(Some(root)) = target_root(env, target, false) else {
+    let Ok(Ok(root)) = target_root(env, target, false) else {
         return;
     };
     let dst = root.join("preserver");
@@ -686,16 +705,21 @@ fn run_job(store: &Store, env: &Env, mut job: Job) -> Result<()> {
     job.progress.files_total = prog.files_total.load(Ordering::Relaxed);
     let gone = |job: &Job| {
         let JobKind::Copy { target, .. } = &job.kind else {
-            return false;
+            return None;
         };
-        (env.mount)(&job.drive).is_none_or(|p| !p.exists())
-            || target_root(env, target, false)
-                .ok()
-                .flatten()
-                .is_none_or(|r| !r.exists())
+        match mounted(env, &job.drive) {
+            Err(r) => return Some(r),
+            Ok(p) if !p.exists() => return Some(BlockReason::DriveAbsent),
+            Ok(_) => {}
+        }
+        match target_root(env, target, false) {
+            Ok(Err(r)) => Some(r),
+            Ok(Ok(r)) if r.exists() => None,
+            _ => Some(BlockReason::DriveAbsent),
+        }
     };
     job.state = match result {
-        Ok(true) => JobState::Done,
+        Ok(None) => JobState::Done,
         Err(e) if e.is::<Halted>() => {
             if halt == Some(Halt::Cancel) {
                 clean_up(env, &job);
@@ -704,16 +728,20 @@ fn run_job(store: &Store, env: &Env, mut job: Job) -> Result<()> {
                 JobState::Paused
             }
         }
-        r @ (Ok(false) | Err(_)) if r.is_ok() || gone(&job) => {
-            // Unplugging is not the job's fault.
+        // Unplugging is not the job's fault.
+        Ok(Some(r)) => {
             job.attempts -= 1;
-            JobState::Blocked(BlockReason::DriveAbsent)
+            JobState::Blocked(r)
         }
         Err(e) => {
-            job.error = Some(format!("{e:#}"));
-            JobState::Failed
+            if let Some(r) = gone(&job) {
+                job.attempts -= 1;
+                JobState::Blocked(r)
+            } else {
+                job.error = Some(format!("{e:#}"));
+                JobState::Failed
+            }
         }
-        Ok(false) => unreachable!("matched above"),
     };
     store.save(&mut job)
 }
@@ -966,13 +994,13 @@ fn dry_run(
     sets: &[String],
     size: Option<u64>,
 ) -> Result<String> {
-    let Some(pm) = (env.mount)(primary) else {
-        bail!("the primary drive ({primary}) is not connected; the plan needs its sizes");
+    let Ok(pm) = mounted(env, primary) else {
+        bail!("the primary drive ({primary}) is not mounted; the plan needs its sizes");
     };
     let src = pm.join("preserver");
     let cat = Catalog::embedded()?;
     let (inputs, skipped, limits, note) = match target_root(env, target, false)? {
-        Some(root) if root.exists() => {
+        Ok(root) if root.exists() => {
             let dst = root.join("preserver");
             check_owned(&dst)?;
             let limits = Limits::of(&(env.fstype)(target, &root), (env.cluster)(&root));
@@ -1047,10 +1075,11 @@ pub(crate) struct Args {
     pub dry_run: bool,
     pub list: bool,
     pub remove: Option<String>,
+    pub foreground: bool,
 }
 
 /// `copy --remove`: a rule id removes the rule and cancels its jobs; a job id cancels the job.
-fn remove(paths: &Paths, store: &Store, id: &str) -> Result<()> {
+pub(crate) fn remove(paths: &Paths, store: &Store, id: &str) -> Result<String> {
     if rules::is_rule_id(id) {
         if !rules::remove(&paths.copy_rules, id)? {
             bail!("no rule {id}; 'preserver copy --list' shows them");
@@ -1060,8 +1089,7 @@ fn remove(paths: &Paths, store: &Store, id: &str) -> Result<()> {
                 store.edit_control(Some(&j.id), |c| c.cancel = true)?;
             }
         }
-        println!("removed rule {id}");
-        return Ok(());
+        return Ok(format!("removed rule {id}"));
     }
     let job = store
         .job(id)
@@ -1070,8 +1098,13 @@ fn remove(paths: &Paths, store: &Store, id: &str) -> Result<()> {
         bail!("{id} is not a copy job");
     }
     store.edit_control(Some(id), |c| c.cancel = true)?;
-    println!("canceling copy job {id}");
-    Ok(())
+    Ok(format!("canceling copy job {id}"))
+}
+
+/// Adds the rule, or replaces the one for the same target; true when it replaced one.
+pub(crate) fn add_rule(paths: &Paths, rule: rules::Rule) -> Result<(rules::Rule, bool)> {
+    let replaced = rules::upsert(&paths.copy_rules, rule.clone())?;
+    Ok((rule, replaced))
 }
 
 /// `preserver copy`.
@@ -1090,7 +1123,8 @@ pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
         return Ok(());
     }
     if let Some(id) = a.remove {
-        return remove(paths, &store, &id);
+        println!("{}", remove(paths, &store, &id)?);
+        return Ok(());
     }
     let Some(arg) = a.target else {
         bail!("give a target drive or directory, or --list");
@@ -1111,22 +1145,24 @@ pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
     let target = resolve_target(&arg, &fss, &cfg.primary_uuid, primary_mount.as_deref())?;
     let say = |s: &str| print!("{s}");
     if a.dry_run {
-        let text = with_real_env(&say, |env| {
-            dry_run(env, &cfg.primary_uuid, &target, &sets, size)
+        let text = with_real_env(&say, |e| {
+            dry_run(e, &cfg.primary_uuid, &target, &sets, size)
         })?;
         print!("{text}");
         return Ok(());
     }
     let rule = match interval {
         Some(interval) => {
-            let r = rules::Rule {
-                id: rules::rule_id(&target),
-                interval,
-                sets: a.sets.clone(),
-                size,
-                target: target.clone(),
-            };
-            let replaced = rules::upsert(&paths.copy_rules, r.clone())?;
+            let (r, replaced) = add_rule(
+                paths,
+                rules::Rule {
+                    id: rules::rule_id(&target),
+                    interval,
+                    sets: a.sets.clone(),
+                    size,
+                    target: target.clone(),
+                },
+            )?;
             println!(
                 "{} rule {}: every {} to {}",
                 if replaced { "replaced" } else { "added" },
@@ -1138,47 +1174,35 @@ pub(crate) fn cli(paths: &mut Paths, cfg: &Config, a: Args) -> Result<()> {
         }
         None => None,
     };
+    actions::mount(&cfg.primary_uuid);
+    if let Target::Drive { id, .. } = &target {
+        actions::mount(id);
+    }
+    let pri = if rule.is_some() {
+        RULE_PRIORITY
+    } else {
+        ONE_OFF_PRIORITY
+    };
     let kind = JobKind::Copy {
         target,
         sets,
         size,
         rule,
     };
-    let jobs = store.jobs()?;
-    let waiting = jobs
-        .iter()
-        .find(|j| j.kind == kind && !matches!(j.state, JobState::Done | JobState::Canceled));
-    let id = if let Some(j) = waiting {
-        if matches!(
-            j.state,
-            JobState::Failed | JobState::Blocked(_) | JobState::Paused
-        ) {
-            store.edit_control(Some(&j.id), |c| {
-                c.retry += 1;
-                c.pause = false;
-            })?;
-        }
-        j.id.clone()
-    } else {
-        let pri = if matches!(&kind, JobKind::Copy { rule: Some(_), .. }) {
-            RULE_PRIORITY
-        } else {
-            ONE_OFF_PRIORITY
-        };
-        store.create(&kind, &cfg.primary_uuid, pri)?.id
-    };
-    run_now(paths, &store, &id)
-}
-
-/// Runs the copy queue in the foreground unless the daemon or another CLI run has it.
-fn run_now(paths: &mut Paths, store: &Store, id: &str) -> Result<()> {
-    let Some(_lock) = status::try_lock(&paths.lock_file("copy-queue"))? else {
-        println!("queued as {id}; the daemon or another copy runs it");
+    let Some((_lock, ids)) = actions::handoff(paths, "copy-queue", a.foreground, |tidy| {
+        Ok(vec![store.enqueue(&kind, &cfg.primary_uuid, pri, tidy)?])
+    })?
+    else {
         return Ok(());
     };
+    run_here(paths, &store, &ids[0])
+}
+
+/// Runs the copy lane here, under the `copy-queue` lock the caller holds, and reports the job.
+fn run_here(paths: &mut Paths, store: &Store, id: &str) -> Result<()> {
     let start = Timestamp::now();
     status::job(paths, "copy", |paths| {
-        with_real_env(&|s| print!("{s}"), |env| work(store, env, Pass::FRESH))?;
+        with_real_env(&|s| print!("{s}"), |e| work(store, e, Pass::FRESH))?;
         let job = store.job(id).ok();
         record(store, &paths.status_file("copy"), start)?;
         match job.map(|j| (j.state, j.error)) {
@@ -1186,10 +1210,8 @@ fn run_now(paths: &mut Paths, store: &Store, id: &str) -> Result<()> {
                 println!("copy done");
                 Ok(())
             }
-            Some((JobState::Blocked(_), _)) => {
-                println!(
-                    "the target is not connected; the copy runs when it is plugged in (job {id})"
-                );
+            Some((s @ JobState::Blocked(_), _)) => {
+                println!("copy {s}; it runs once the drive is mounted (job {id})");
                 Ok(())
             }
             Some((JobState::Failed, e)) => bail!(e.unwrap_or_default()),

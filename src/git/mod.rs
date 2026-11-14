@@ -11,13 +11,16 @@ use std::process::Command;
 /// The environment that lets `git fetch` reach GitHub over the chosen transport.
 pub(crate) struct Auth {
     env: Vec<(&'static str, OsString)>,
+    /// The graphical session's display and agent, for the shim's ssh and its askpass.
+    session: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Auth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The values can hold the token.
         f.debug_list()
-            .entries(self.env.iter().map(|(k, _)| k))
+            .entries(self.env.iter().map(|(k, _)| *k))
+            .entries(self.session.iter().map(|(k, _)| k.as_str()))
             .finish()
     }
 }
@@ -72,12 +75,21 @@ impl Auth {
                 ]
             }
         };
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            session: Vec::new(),
+        })
+    }
+
+    pub(crate) fn with_session(mut self, vars: Vec<(String, String)>) -> Self {
+        self.session = vars;
+        self
     }
 
     pub(crate) fn apply(&self, cmd: &mut Command) {
         // GIT_SSH_COMMAND would win over GIT_SSH and run through a shell.
         cmd.env_remove("GIT_SSH_COMMAND")
-            .envs(self.env.iter().map(|(k, v)| (k, v)));
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .envs(self.session.iter().map(|(k, v)| (k, v)));
     }
 }

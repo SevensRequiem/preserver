@@ -7,7 +7,7 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 t=$(mktemp -d)
 trap 'rm -rf "$t"' EXIT
 export HOME=$t/home
-unset XDG_CONFIG_HOME
+unset XDG_CONFIG_HOME DISPLAY WAYLAND_DISPLAY XAUTHORITY
 mkdir -p "$HOME" "$t/fakebin"
 export CALLS=$t/calls
 : >"$CALLS"
@@ -45,21 +45,28 @@ mkrel "$t/r2" v2
 run "$t/r1" || fail "install v1: $(cat "$t/out")"
 grep -q v1 "$bin" || fail "binary is not v1"
 [ ! -e "$prev" ] || fail "first install made a .prev"
-for u in tray.service daemon.service personal.service local.service local.timer public.service public.timer; do
+for u in tray.service daemon.service; do
 	[ -f "$units/preserver-$u" ] && [ ! -L "$units/preserver-$u" ] || fail "unit $u missing or a symlink"
 done
 grep -q "systemctl --user daemon-reload" "$CALLS" || fail "no daemon-reload"
-grep -q "enable preserver-tray.service preserver-local.timer preserver-daemon.service" "$CALLS" || fail "tray, local timer and daemon not enabled"
+grep -q "enable preserver-tray.service preserver-daemon.service" "$CALLS" || fail "tray and daemon not enabled"
 grep -q "start preserver-daemon.service" "$CALLS" || fail "daemon not started"
-grep -q "enable.*public" "$CALLS" && fail "public timer was enabled"
+grep -q "import-environment" "$CALLS" && fail "imported variables the session does not have"
 ok install
 
 run "$t/r1" || fail "re-install v1"
 [ ! -e "$prev" ] || fail "re-install of the same binary made a .prev"
 ok "re-install is idempotent"
 
+retired=(personal.service local.service local.timer public.service public.timer)
+for u in "${retired[@]}"; do : >"$units/preserver-$u"; done
 : >"$CALLS"
-run "$t/r2" || fail "install v2"
+WAYLAND_DISPLAY=wayland-test run "$t/r2" || fail "install v2"
+for u in "${retired[@]}"; do
+	[ ! -e "$units/preserver-$u" ] || fail "retired unit $u left behind"
+done
+grep -q "disable --now preserver-local.timer preserver-public.timer" "$CALLS" || fail "retired timers not disabled"
+grep -q "import-environment WAYLAND_DISPLAY$" "$CALLS" || fail "the session display was not imported"
 grep -q "try-restart.* preserver-daemon.service" "$CALLS" || fail "upgrade did not restart the daemon"
 grep -q v2 "$bin" && grep -q v1 "$prev" || fail "v2 install did not keep v1 as .prev"
 ok "upgrade keeps previous"
@@ -88,6 +95,7 @@ grep -q "cargo build --release --locked" "$CALLS" || fail "no cargo build"
 grep -q built "$bin" || fail "source build not installed"
 ok "source install"
 
+for u in "${retired[@]}"; do : >"$units/preserver-$u"; done
 run --uninstall || fail "uninstall"
 grep -q "disable --now.* preserver-daemon.service" "$CALLS" || fail "uninstall did not stop the daemon"
 [ ! -e "$bin" ] && [ ! -e "$prev" ] || fail "binary left behind"

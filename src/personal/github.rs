@@ -2,6 +2,7 @@ use crate::config::{Config, Transport};
 use crate::crypt;
 use crate::git::Auth;
 use crate::paths::Paths;
+use crate::personal::{Hooks, Stopped};
 use crate::platform;
 use age::x25519;
 use anyhow::{Context, Result, bail};
@@ -209,20 +210,28 @@ fn backup_repo(
     Ok(true)
 }
 
-/// Backs up every repo and returns how many bundles were written. One failing repo does not stop the rest.
+/// Backs up every repo and returns how many bundles were written. One failing repo does not
+/// stop the rest; a stop does, between repos (one long fetch runs to its end).
 pub(crate) fn backup_all(
     paths: &Paths,
     auth: &Auth,
     recipients: &[x25519::Recipient],
     repos: &[Repo],
     today: jiff::civil::Date,
+    hooks: &Hooks,
 ) -> Result<usize> {
     // The mirrors are plaintext copies of private repos, and git init makes what it creates 0755.
     platform::private_dir_all(&paths.mirrors)?;
     platform::restrict_dir(&paths.mirrors)?;
     let mut wrote = 0;
     let mut failed = Vec::new();
-    for repo in repos {
+    let mut stopped = false;
+    for (n, repo) in repos.iter().enumerate() {
+        if (hooks.stop)() {
+            stopped = true;
+            break;
+        }
+        (hooks.on_item)(n, repos.len(), &repo.name);
         match backup_repo(paths, auth, recipients, repo, today) {
             Ok(w) => wrote += usize::from(w),
             Err(e) => {
@@ -234,6 +243,9 @@ pub(crate) fn backup_all(
     let dest = paths.gh_dest();
     platform::private_dir_all(&dest)?;
     platform::sync_fs(&dest).context("sync")?;
+    if stopped {
+        return Err(Stopped.into());
+    }
     if !failed.is_empty() {
         bail!(
             "{} of {} repos failed: {}",
@@ -249,8 +261,12 @@ pub(crate) fn backup_all(
 struct SshMaster<'a>(&'a Path);
 
 impl<'a> SshMaster<'a> {
-    fn start(runtime: &'a Path) -> Result<Self> {
-        platform::ssh_master(runtime)?;
+    fn start(
+        runtime: &'a Path,
+        session: &[(String, String)],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        platform::ssh_master(runtime, session, stop)?;
         Ok(Self(runtime))
     }
 }
@@ -261,27 +277,34 @@ impl Drop for SshMaster<'_> {
     }
 }
 
-pub(crate) fn run(paths: &mut Paths, cfg: &Config, transport: Transport) -> Result<()> {
-    paths.mount(&cfg.primary_uuid)?;
+/// `paths.mnt` is the primary the caller located. `gh repo list` runs before the ssh master,
+/// so a network outage is a failure and not a missing touch.
+pub(crate) fn run(
+    paths: &Paths,
+    cfg: &Config,
+    transport: Transport,
+    session: Vec<(String, String)>,
+    hooks: &Hooks,
+) -> Result<()> {
     // The recipient comes from home, not the drive, so tampering with the drive can't redirect new backups.
     let recipients = crypt::read_recipients(&paths.personal.join("recipient.txt"))?;
     let mut repos = Vec::new();
     for owner in &cfg.owners {
         repos.extend(list(owner, transport).with_context(|| format!("list repos of {owner}"))?);
     }
-    let auth = Auth::new(transport, &paths.runtime)?;
     let _master = if transport == Transport::Ssh {
         platform::notify(
             false,
             "GitHub backup",
             "Enter your security key PIN if asked, then touch the key.",
         );
-        Some(SshMaster::start(&paths.runtime)?)
+        Some(SshMaster::start(&paths.runtime, &session, hooks.stop)?)
     } else {
         None
     };
+    let auth = Auth::new(transport, &paths.runtime)?.with_session(session);
     let today = jiff::Zoned::now().date();
-    let wrote = backup_all(paths, &auth, &recipients, &repos, today)?;
+    let wrote = backup_all(paths, &auth, &recipients, &repos, today, hooks)?;
     platform::notify(
         false,
         "GitHub backup done",
@@ -415,7 +438,17 @@ mod tests {
             url: format!("file://{}", remote.display()),
             branch: Some("main".into()),
         }];
-        let run = |day| backup_all(&p, &auth, &recipients, &repos, date(2026, 11, day)).unwrap();
+        let run = |day| {
+            backup_all(
+                &p,
+                &auth,
+                &recipients,
+                &repos,
+                date(2026, 11, day),
+                &Hooks::NONE,
+            )
+            .unwrap()
+        };
         let dir = p.gh_dest().join("o/r");
         let state_file = p.github.join("o/r.refs");
 
@@ -496,7 +529,15 @@ mod tests {
                 branch: Some("main".into()),
             },
         ];
-        let err = backup_all(&p, &auth, &recipients, &repos, date(2026, 11, 13)).unwrap_err();
+        let err = backup_all(
+            &p,
+            &auth,
+            &recipients,
+            &repos,
+            date(2026, 11, 13),
+            &Hooks::NONE,
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "2 of 3 repos failed: ../escape o/gone");
         assert_eq!(
             bundles(&p.gh_dest().join("o/ok")),
@@ -523,7 +564,15 @@ mod tests {
             branch: None,
         }];
         assert_eq!(
-            backup_all(&p, &auth, &recipients, &repos, date(2026, 11, 13)).unwrap(),
+            backup_all(
+                &p,
+                &auth,
+                &recipients,
+                &repos,
+                date(2026, 11, 13),
+                &Hooks::NONE
+            )
+            .unwrap(),
             0
         );
         assert!(!p.gh_dest().join("o/empty").exists());

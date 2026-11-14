@@ -1,4 +1,4 @@
-use crate::config::DriveId;
+use crate::config::{DriveId, Transport};
 use anyhow::{Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,14 @@ pub(crate) enum JobKind {
         #[serde(default)]
         rule: Option<String>,
     },
+    /// `preserver personal`: the GitHub bundles.
+    Github {
+        /// `None` takes `config.toml`'s at run time.
+        #[serde(default)]
+        transport: Option<Transport>,
+    },
+    /// `preserver personal --local-only`: the `[[local]]` folders.
+    Local,
 }
 
 /// Where a copy goes: a drive (by filesystem id, wherever it is mounted) or a plain directory.
@@ -103,6 +111,7 @@ impl Target {
 pub(crate) enum Lane {
     Download,
     Copy,
+    Personal,
 }
 
 impl JobKind {
@@ -110,6 +119,15 @@ impl JobKind {
         match self {
             Self::Set { .. } => Lane::Download,
             Self::Copy { .. } => Lane::Copy,
+            Self::Github { .. } | Self::Local => Lane::Personal,
+        }
+    }
+
+    /// One unfinished job per kind: a GitHub job is the same whatever its transport.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Github { .. }, Self::Github { .. }) => true,
+            _ => self == other,
         }
     }
 }
@@ -118,6 +136,11 @@ impl JobKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BlockReason {
     DriveAbsent,
+    /// Plugged in but not mounted: the daemon never mounts a drive that was already there.
+    Unmounted,
+    /// The security key prompt went unanswered. Only a retry or the next scheduled occurrence
+    /// asks again, so the daemon never prompts in a loop.
+    NeedsTouch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +160,8 @@ impl std::fmt::Display for JobState {
         match self {
             Self::Queued => f.write_str("queued"),
             Self::Blocked(BlockReason::DriveAbsent) => f.write_str("blocked (drive absent)"),
+            Self::Blocked(BlockReason::Unmounted) => f.write_str("blocked (drive not mounted)"),
+            Self::Blocked(BlockReason::NeedsTouch) => f.write_str("blocked (needs security key)"),
             Self::Running { pid } => write!(f, "running (pid {pid})"),
             Self::Paused => f.write_str("paused"),
             Self::Done => f.write_str("done"),
@@ -193,4 +218,41 @@ pub(crate) fn valid_id(s: &str) -> bool {
     (1..=40).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_kinds_and_reasons_round_trip_and_old_files_parse() {
+        for (kind, state) in [
+            (
+                JobKind::Github {
+                    transport: Some(Transport::Https),
+                },
+                JobState::Blocked(BlockReason::NeedsTouch),
+            ),
+            (
+                JobKind::Github { transport: None },
+                JobState::Blocked(BlockReason::Unmounted),
+            ),
+            (JobKind::Local, JobState::Queued),
+        ] {
+            let k: JobKind = serde_json::from_str(&serde_json::to_string(&kind).unwrap()).unwrap();
+            let s: JobState =
+                serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            assert_eq!((k, s), (kind, state));
+        }
+        let gh: JobKind = serde_json::from_str(r#"{"github":{}}"#).unwrap();
+        assert_eq!(gh, JobKind::Github { transport: None });
+        let old: JobKind = serde_json::from_str(r#"{"set":{"set":"a"}}"#).unwrap();
+        assert_eq!(old.lane(), Lane::Download);
+        let old: JobState = serde_json::from_str(r#"{"blocked":"drive_absent"}"#).unwrap();
+        assert_eq!(old.to_string(), "blocked (drive absent)");
+        assert!(JobKind::Github { transport: None }.same(&JobKind::Github {
+            transport: Some(Transport::Ssh)
+        }));
+        assert!(!JobKind::Local.same(&JobKind::Github { transport: None }));
+    }
 }

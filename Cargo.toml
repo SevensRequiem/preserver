@@ -27,10 +27,12 @@ tar = { version = "=0.4.46", default-features = false }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "display", "serde"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
-ureq = { version = "=3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+ureq = { version = "=3.5.2", default-features = false, features = ["rustls-no-provider", "platform-verifier", "rustls-webpki-roots"] }
+# pins the version ureq's rustls-webpki-roots feature pulls in
+webpki-roots = { version = "=1.0.11", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.6", features = ["fs"] }
+rustix = { version = "=1.1.6", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "=0.3.7", default-features = false, features = ["blocking", "async-io"] }

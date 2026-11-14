@@ -5,8 +5,11 @@ use crate::catalog::{Catalog, RESERVED};
 use crate::platform;
 use crate::queue::{Job, JobKind, JobState, Target};
 use crate::resolve::hex;
+use crate::schedule::{self, Schedule};
+pub(crate) use crate::schedule::{parse_interval, show_interval};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -96,32 +99,6 @@ pub(crate) fn remove(file: &Path, id: &str) -> Result<bool> {
     }
     save(file, rules)?;
     Ok(true)
-}
-
-/// `H:MM:SS`, at least one second; hours are unbounded.
-pub(crate) fn parse_interval(s: &str) -> Result<u64> {
-    let parts: Vec<&str> = s.split(':').collect();
-    let num = |p: &str| {
-        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| p.parse::<u64>().ok())
-            .flatten()
-    };
-    let parsed = match parts.as_slice() {
-        [h, m, sec] if m.len() == 2 && sec.len() == 2 => num(h).zip(num(m)).zip(num(sec)),
-        _ => None,
-    };
-    let Some(((h, m), sec)) = parsed.filter(|((_, m), sec)| *m < 60 && *sec < 60) else {
-        bail!("bad interval {s:?}: give hh:mm:ss, like 24:00:00");
-    };
-    let total = h
-        .checked_mul(3600)
-        .and_then(|t| t.checked_add(m * 60 + sec))
-        .filter(|t| *t > 0);
-    total.with_context(|| format!("bad interval {s:?}: give hh:mm:ss, like 24:00:00"))
-}
-
-pub(crate) fn show_interval(secs: u64) -> String {
-    format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// `32G` is decimal (SD cards and sticks are sold that way), `32Gi` binary; a plain number is
@@ -220,26 +197,21 @@ pub(crate) fn due(
     last: &HashMap<String, Timestamp>,
     now: Timestamp,
 ) -> Vec<Act> {
-    let elapsed = |t: Timestamp, interval: u64| {
-        u64::try_from(now.as_second() - t.as_second()).is_ok_and(|d| d >= interval)
-    };
-    let mut acts = Vec::new();
-    for r in rules {
-        let pending = jobs.iter().find(|j| {
-            matches!(&j.kind, JobKind::Copy { rule: Some(id), .. } if *id == r.id)
-                && !matches!(j.state, JobState::Done | JobState::Canceled)
-        });
-        match pending {
-            Some(j) if j.state == JobState::Failed && elapsed(j.updated, r.interval) => {
-                acts.push(Act::Retry(j.id.clone()));
+    let now = now.to_zoned(TimeZone::UTC);
+    rules
+        .iter()
+        .filter_map(|r| {
+            let pending = jobs.iter().find(|j| {
+                matches!(&j.kind, JobKind::Copy { rule: Some(id), .. } if *id == r.id)
+                    && !matches!(j.state, JobState::Done | JobState::Canceled)
+            });
+            let every = Schedule::Every(r.interval);
+            match schedule::due(&every, pending, last.get(&r.id).copied(), &now)? {
+                schedule::Act::Create => Some(Act::Create(r.clone())),
+                schedule::Act::Retry(id) => Some(Act::Retry(id)),
             }
-            None if last.get(&r.id).is_none_or(|t| elapsed(*t, r.interval)) => {
-                acts.push(Act::Create(r.clone()));
-            }
-            _ => {}
-        }
-    }
-    acts
+        })
+        .collect()
 }
 
 #[cfg(test)]

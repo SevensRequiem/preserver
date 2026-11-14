@@ -24,6 +24,42 @@ pub(crate) struct FsInfo {
     pub removable: bool,
 }
 
+/// Where a drive is, as far as a lane may know: lanes locate drives and never mount them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Windows drive lookup arrives in phase 5")
+)]
+pub(crate) enum DriveAt {
+    Absent,
+    Unmounted,
+    Mounted(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Windows drive events arrive in phase 5")
+)]
+pub(crate) enum DriveEvent {
+    /// A filesystem appeared (a plug-in): its udisks object path.
+    Added(String),
+    /// A mount changed, or events may have been missed.
+    Changed,
+}
+
+/// The security key prompt went unanswered, or ssh failed after `gh` had reached GitHub.
+#[derive(Debug)]
+pub(crate) struct TouchMissing(pub String);
+
+impl std::fmt::Display for TouchMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the security key was not touched ({})", self.0)
+    }
+}
+
+impl std::error::Error for TouchMissing {}
+
 /// Writes an owner-only file through `<file>.tmp` and a rename, creating the parent directory.
 pub(crate) fn write_private(file: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {

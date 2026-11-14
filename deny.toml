@@ -31,6 +31,10 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# Mozilla's root store as data; only this crate may use the data license.
+exceptions = [
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"

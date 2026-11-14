@@ -1,4 +1,3 @@
-use anyhow::{Context, Result, bail};
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,17 +12,19 @@ fn provider() -> Arc<CryptoProvider> {
 
 /// The OS trust store, or the embedded roots when the OS has none (a bare container, a rescue
 /// system). Only Linux can fail here: the Windows and macOS verifiers load their roots per check.
-pub(crate) fn os_roots() -> Result<RootCerts> {
+pub(crate) fn os_roots() -> RootCerts {
     match rustls_platform_verifier::Verifier::new(provider()) {
-        Ok(_) => Ok(RootCerts::PlatformVerifier),
-        Err(e) => embedded_roots().with_context(|| format!("OS trust store: {e}")),
+        Ok(_) => RootCerts::PlatformVerifier,
+        Err(e) => {
+            tracing::warn!("OS trust store: {e}; using the embedded Mozilla roots");
+            embedded_roots()
+        }
     }
 }
 
-/// The fallback seam. It becomes `Ok(RootCerts::WebPki)` once ureq's `rustls-webpki-roots`
-/// feature (the webpki-roots crate) is approved.
-fn embedded_roots() -> Result<RootCerts> {
-    bail!("no TLS roots: the embedded fallback (webpki-roots) is not built in")
+/// Mozilla's root store as of the pinned webpki-roots release, compiled in.
+fn embedded_roots() -> RootCerts {
+    RootCerts::WebPki
 }
 
 /// Every download runs on this config: https only, redirects included, and no phase without a
@@ -129,6 +130,19 @@ mod tests {
         // The same server is refused under any other root, here the leaf's own cert.
         let other = RootCerts::new_with_certs(&[Certificate::from_der(LEAF).to_owned()]);
         let err = loopback_agent(other)
+            .get(format!("https://127.0.0.1:{port}/x"))
+            .call()
+            .unwrap_err();
+        assert!(err.to_string().contains("UnknownIssuer"), "{err}");
+    }
+
+    #[test]
+    fn the_fallback_is_the_embedded_mozilla_store() {
+        assert!(matches!(embedded_roots(), RootCerts::WebPki));
+        assert!(webpki_roots::TLS_SERVER_ROOTS.len() > 50);
+        // Wired, not a panic: the test CA is no Mozilla root, so the handshake is refused.
+        let port = tls_server();
+        let err = loopback_agent(embedded_roots())
             .get(format!("https://127.0.0.1:{port}/x"))
             .call()
             .unwrap_err();

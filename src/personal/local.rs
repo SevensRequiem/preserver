@@ -7,6 +7,7 @@ use crate::config::{Config, LocalFolder};
 use crate::crypt::{self, Identities};
 use crate::paths::Paths;
 use crate::personal::restore::check_target;
+use crate::personal::{Hooks, Stopped};
 use crate::platform;
 use age::x25519;
 use anyhow::{Context, Result, anyhow, bail};
@@ -528,15 +529,23 @@ fn backup_folder(
     })
 }
 
-/// Backs up every folder. One failing folder does not stop the rest.
+/// Backs up every folder. One failing folder does not stop the rest; a stop does, between
+/// folders.
 fn backup_all(
     paths: &Paths,
     recipients: &[x25519::Recipient],
     folders: &[LocalFolder],
     now: &jiff::Zoned,
+    hooks: &Hooks,
 ) -> Result<()> {
     let mut failed = Vec::new();
-    for folder in folders {
+    let mut stopped = false;
+    for (n, folder) in folders.iter().enumerate() {
+        if (hooks.stop)() {
+            stopped = true;
+            break;
+        }
+        (hooks.on_item)(n, folders.len(), &folder.name);
         if let Err(e) = backup_folder(paths, recipients, folder, now) {
             tracing::error!(folder = folder.name, "local backup: {e:#}");
             failed.push(folder.name.as_str());
@@ -545,6 +554,9 @@ fn backup_all(
     let dest = paths.local_dest();
     platform::private_dir_all(&dest)?;
     platform::sync_fs(&dest).context("sync")?;
+    if stopped {
+        return Err(Stopped.into());
+    }
     if !failed.is_empty() {
         bail!(
             "{} of {} folders failed: {}",
@@ -556,13 +568,13 @@ fn backup_all(
     Ok(())
 }
 
-pub(crate) fn run(paths: &mut Paths, cfg: &Config) -> Result<()> {
+/// `paths.mnt` is the primary the caller located.
+pub(crate) fn run(paths: &Paths, cfg: &Config, hooks: &Hooks) -> Result<()> {
     if cfg.local.is_empty() {
         return Ok(());
     }
-    paths.mount(&cfg.primary_uuid)?;
     let recipients = crypt::read_recipients(&paths.personal.join("recipient.txt"))?;
-    backup_all(paths, &recipients, &cfg.local, &jiff::Zoned::now())
+    backup_all(paths, &recipients, &cfg.local, &jiff::Zoned::now(), hooks)
 }
 
 type Entries<'a> = tar::Entries<'a, Box<dyn Read>>;
@@ -1099,8 +1111,14 @@ mod tests {
                 path: s.folder.path.clone(),
             },
         ];
-        let err =
-            backup_all(&s.paths, &s.recipients, &folders, &DAY1.parse().unwrap()).unwrap_err();
+        let err = backup_all(
+            &s.paths,
+            &s.recipients,
+            &folders,
+            &DAY1.parse().unwrap(),
+            &Hooks::NONE,
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "1 of 2 folders failed: missing");
         assert!(s.archive("2026-11", "L0").exists());
         assert!(

@@ -1,5 +1,5 @@
 use crate::config::DriveId;
-use crate::platform::FsInfo;
+use crate::platform::{DriveAt, DriveEvent, FsInfo};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,15 +73,32 @@ pub(crate) fn list_filesystems() -> Result<Vec<FsInfo>> {
         .collect())
 }
 
-/// Mounts the filesystem with this id and returns where it is mounted.
-/// It never asks for authentication: backups run unattended.
-pub(crate) fn mount(id: &DriveId) -> Result<PathBuf> {
-    let bus = Connection::system()?;
-    let objs = objects(&bus)?;
-    let (path, info) = filesystems(&objs)
+/// Where the filesystem with this id is, without mounting it. udisks being unreachable reads
+/// as absent: the job waits for a drive event either way.
+pub(crate) fn locate(id: &DriveId) -> DriveAt {
+    let objs = match Connection::system()
+        .map_err(anyhow::Error::from)
+        .and_then(|bus| objects(&bus))
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!("locate {id}: {e:#}");
+            return DriveAt::Absent;
+        }
+    };
+    match filesystems(&objs)
         .into_iter()
-        .find(|(_, info)| id.matches(&info.id))
-        .with_context(|| format!("no filesystem with id {id}"))?;
+        .find(|(_, i)| id.matches(&i.id))
+    {
+        None => DriveAt::Absent,
+        Some((_, FsInfo { mount: None, .. })) => DriveAt::Unmounted,
+        Some((_, FsInfo { mount: Some(m), .. })) => DriveAt::Mounted(m),
+    }
+}
+
+/// It never asks for authentication: the daemon runs unattended, and a person who asked for
+/// a backup sees a failed mount as a blocked job.
+fn mount_object(bus: &Connection, path: &OwnedObjectPath, info: FsInfo) -> Result<PathBuf> {
     if let Some(at) = info.mount {
         return Ok(at);
     }
@@ -90,36 +107,65 @@ pub(crate) fn mount(id: &DriveId) -> Result<PathBuf> {
     Ok(PathBuf::from(reply.body().deserialize::<String>()?))
 }
 
+/// Mounts the filesystem with this id and returns where it is mounted. People only (CLI, tray),
+/// plus the daemon's plug-in path through `mount_added`.
+pub(crate) fn mount(id: &DriveId) -> Result<PathBuf> {
+    let bus = Connection::system()?;
+    let objs = objects(&bus)?;
+    let (path, info) = filesystems(&objs)
+        .into_iter()
+        .find(|(_, info)| id.matches(&info.id))
+        .with_context(|| format!("no filesystem with id {id}"))?;
+    mount_object(&bus, path, info)
+}
+
+/// The daemon's only mount: a filesystem that was just plugged in, if it is one it has a use for.
+pub(crate) fn mount_added(object: &str, wanted: &[DriveId]) -> Result<Option<(DriveId, PathBuf)>> {
+    let bus = Connection::system()?;
+    let objs = objects(&bus)?;
+    let Some((path, info)) = filesystems(&objs)
+        .into_iter()
+        .find(|(p, _)| p.as_str() == object)
+    else {
+        return Ok(None);
+    };
+    let Some(id) = wanted.iter().find(|w| w.matches(&info.id)) else {
+        return Ok(None);
+    };
+    Ok(Some((id.clone(), mount_object(&bus, path, info)?)))
+}
+
 /// A filesystem appeared, or one was mounted or unmounted. One plug-in sends several of these;
 /// the daemon's lanes coalesce the wake-ups.
-fn is_drive_signal(msg: &zbus::Message) -> bool {
+fn drive_event(msg: &zbus::Message) -> Option<DriveEvent> {
     let header = msg.header();
-    let (Some(iface), Some(member)) = (header.interface(), header.member()) else {
-        return false;
-    };
+    let (iface, member) = (header.interface()?, header.member()?);
     match (iface.as_str(), member.as_str()) {
         ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => msg
             .body()
             .deserialize::<(OwnedObjectPath, Interfaces)>()
-            .is_ok_and(|(_, ifs)| ifs.contains_key(FILESYSTEM)),
+            .ok()
+            .filter(|(_, ifs)| ifs.contains_key(FILESYSTEM))
+            .map(|(p, _)| DriveEvent::Added(p.to_string())),
         ("org.freedesktop.DBus.Properties", "PropertiesChanged") => msg
             .body()
             .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-            .is_ok_and(|(i, changed, _)| i == FILESYSTEM && changed.contains_key("MountPoints")),
-        _ => false,
+            .is_ok_and(|(i, changed, _)| i == FILESYSTEM && changed.contains_key("MountPoints"))
+            .then_some(DriveEvent::Changed),
+        _ => None,
     }
 }
 
-/// Calls `on_change` from a thread of its own whenever udisks reports a drive event.
-pub(crate) fn watch_drives(on_change: impl Fn() + Send + 'static) {
-    watch(Connection::system, on_change);
+/// Calls `on_event` from a thread of its own whenever udisks reports a drive event.
+pub(crate) fn watch_drives(on_event: impl Fn(DriveEvent) + Send + 'static) {
+    watch(Connection::system, on_event);
 }
 
 /// Survives a udisks or system bus restart: on a lost or failed connection it warns once and
-/// tries again every 30 s, and after a gap it calls `on_change`, since a plug-in may be missed.
+/// tries again every 30 s, and after a gap it reports `Changed`, since a plug-in may be missed.
 fn watch(
     connect: impl Fn() -> zbus::Result<Connection> + Send + 'static,
-    on_change: impl Fn() + Send + 'static,
+    on_event: impl Fn(DriveEvent) + Send + 'static,
 ) {
     let subscribe = move || -> zbus::Result<MessageIterator> {
         // Every udisks signal, filtered here: InterfacesAdded comes from the manager object,
@@ -138,12 +184,15 @@ fn watch(
                 Ok(signals) => {
                     if std::mem::take(&mut failing) {
                         tracing::info!("drive events: watching udisks again");
-                        on_change();
+                        on_event(DriveEvent::Changed);
                     }
                     for msg in signals {
                         match msg {
-                            Ok(m) if is_drive_signal(&m) => on_change(),
-                            Ok(_) => {}
+                            Ok(m) => {
+                                if let Some(ev) = drive_event(&m) {
+                                    on_event(ev);
+                                }
+                            }
                             Err(e) => tracing::debug!("drive events: {e}"),
                         }
                     }
@@ -169,6 +218,8 @@ mod tests {
 
     type Changed<'a> = HashMap<&'a str, Value<'a>>;
 
+    const SDB1: &str = "/org/freedesktop/UDisks2/block_devices/sdb1";
+
     fn signal<B: serde::Serialize + zbus::zvariant::DynamicType>(
         path: &str,
         iface: &str,
@@ -187,12 +238,7 @@ mod tests {
             "/org/freedesktop/UDisks2",
             "org.freedesktop.DBus.ObjectManager",
             "InterfacesAdded",
-            &(
-                ObjectPath::from_static_str_unchecked(
-                    "/org/freedesktop/UDisks2/block_devices/sdb1",
-                ),
-                ifs,
-            ),
+            &(ObjectPath::from_static_str_unchecked(SDB1), ifs),
         )
     }
 
@@ -208,23 +254,24 @@ mod tests {
 
     #[test]
     fn drive_signals() {
+        let sdb1 = || Some(DriveEvent::Added(SDB1.to_string()));
         let cases = [
-            ("new filesystem", added(&[BLOCK, FILESYSTEM]), true),
-            ("block without a filesystem", added(&[BLOCK]), false),
+            ("new filesystem", added(&[BLOCK, FILESYSTEM]), sdb1()),
+            ("block without a filesystem", added(&[BLOCK]), None),
             (
                 "mount points changed",
                 changed(FILESYSTEM, &["MountPoints"]),
-                true,
+                Some(DriveEvent::Changed),
             ),
             (
                 "other filesystem property",
                 changed(FILESYSTEM, &["Size"]),
-                false,
+                None,
             ),
             (
                 "mount points of another interface",
                 changed(BLOCK, &["MountPoints"]),
-                false,
+                None,
             ),
             (
                 "another signal",
@@ -237,7 +284,7 @@ mod tests {
                         vec![FILESYSTEM],
                     ),
                 ),
-                false,
+                None,
             ),
             (
                 "wrong body",
@@ -247,11 +294,11 @@ mod tests {
                     "InterfacesAdded",
                     &FILESYSTEM,
                 ),
-                false,
+                None,
             ),
         ];
         for (name, msg, want) in cases {
-            assert_eq!(is_drive_signal(&msg), want, "{name}");
+            assert_eq!(drive_event(&msg), want, "{name}");
         }
     }
 
@@ -299,8 +346,8 @@ mod tests {
         let watch_addr = addr.clone();
         watch(
             move || zbus::blocking::connection::Builder::address(watch_addr.as_str())?.build(),
-            move || {
-                let _ = tx.send(());
+            move |ev| {
+                let _ = tx.send(ev);
             },
         );
         // The watcher subscribes on its own thread: keep announcing until it has.
@@ -321,7 +368,8 @@ mod tests {
                     ),
                 )
                 .unwrap();
-            if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+                assert_eq!(ev, DriveEvent::Added(SDB1.to_string()));
                 seen = true;
                 break;
             }

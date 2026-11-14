@@ -187,51 +187,79 @@ fn a_second_daemon_waits_for_the_first() {
     );
 }
 
-fn local_status(root: &Path) -> String {
-    std::fs::read_to_string(root.join("home/.local/state/preserver/status/local.json")).unwrap()
-}
-
-#[test]
-fn local_only_without_folders_succeeds_without_the_drive() {
-    let root = fresh_dir("nolocal");
-    write_config(&root);
-    let personal = root.join("home/.config/preserver/personal");
-    std::fs::create_dir_all(&personal).unwrap();
-    std::fs::write(personal.join("recipient.txt"), "age1x\n").unwrap();
-    let out = preserver(&root)
-        .args(["personal", "--local-only"])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", stderr(&out));
-    let status = local_status(&root);
-    assert!(status.contains(r#""error":"""#), "{status}");
-    assert!(!status.contains(r#""last_ok":"0001"#), "{status}");
-    assert!(
-        !root
-            .join("home/.local/state/preserver/status/github.json")
-            .exists(),
-        "--local-only leaves GitHub alone"
-    );
-}
-
-#[test]
-fn nightly_local_run_skips_quietly_when_the_drive_is_absent() {
-    let root = fresh_dir("nodrive");
+/// A config with one local folder, an age recipient, and a system bus that leads nowhere, so
+/// the test never talks to the real udisks.
+fn personal_setup(name: &str, local: bool) -> (PathBuf, impl Fn() -> Command) {
+    let root = fresh_dir(name);
     write_config(&root);
     let cfg = root.join("home/.config/preserver");
-    let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
-    text.push_str("[[local]]\nname = \"docs\"\npath = \"/nonexistent\"\n");
-    std::fs::write(cfg.join("config.toml"), text).unwrap();
+    if local {
+        let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        text.push_str("[[local]]\nname = \"docs\"\npath = \"/nonexistent\"\n");
+        std::fs::write(cfg.join("config.toml"), text).unwrap();
+    }
     std::fs::create_dir_all(cfg.join("personal")).unwrap();
     std::fs::write(cfg.join("personal/recipient.txt"), "age1x\n").unwrap();
-    let out = preserver(&root)
-        .args(["personal", "--local-only"])
-        .output()
-        .unwrap();
+    let bus = format!("unix:path={}", root.join("no-bus").display());
+    let r = root.clone();
+    (root, move || {
+        let mut cmd = preserver(&r);
+        cmd.env("DBUS_SYSTEM_BUS_ADDRESS", &bus);
+        cmd
+    })
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn local_only_without_folders_does_nothing() {
+    let (root, cmd) = personal_setup("nolocal", false);
+    let out = cmd().args(["personal", "--local-only"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stderr(&out).contains("skipped"), "{}", stderr(&out));
-    let status = local_status(&root);
-    assert!(status.contains("backup drive is not connected"), "{status}");
+    assert!(
+        stdout(&out).contains("no [[local]] folders"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!root.join("home/.local/state/preserver/queue").exists());
+}
+
+#[test]
+fn without_a_daemon_a_missing_drive_blocks_the_job_here() {
+    let (_root, cmd) = personal_setup("nodrive", true);
+    let out = cmd().args(["personal", "--local-only"]).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("no daemon running; running here"), "{text}");
+    assert!(text.contains("local folders: blocked"), "{text}");
+    let out = cmd().args(["queue", "list"]).output().unwrap();
+    assert!(stdout(&out).contains("local folders"), "{}", stdout(&out));
+}
+
+#[test]
+fn with_the_daemon_running_personal_only_queues() {
+    let (root, cmd) = personal_setup("handoff", true);
+    // The test plays the running daemon by holding its lock.
+    let lock = std::fs::File::create(root.join("run/preserver-daemon.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let out = cmd().arg("personal").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("queued as "), "{}", stdout(&out));
+    assert!(root.join("home/.local/state/preserver/queue/wake").exists());
+    let out = cmd().args(["queue", "list"]).output().unwrap();
+    let list = stdout(&out);
+    assert!(
+        list.contains("github") && list.contains("local folders"),
+        "{list}"
+    );
+    assert!(
+        !root
+            .join("home/.local/state/preserver/status/local.json")
+            .exists(),
+        "nothing ran here"
+    );
 }
 
 #[test]

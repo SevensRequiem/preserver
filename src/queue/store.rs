@@ -97,6 +97,39 @@ impl Store {
         unreachable!("ids are unbounded")
     }
 
+    /// The one way to ask for a job: an unfinished job of the same kind is reused (and, when it
+    /// stopped, retried and unpaused through its ctl), else a new one is created. With `tidy`
+    /// the caller holds the lane lock, so finished jobs of that kind can go.
+    pub(crate) fn enqueue(
+        &self,
+        kind: &JobKind,
+        drive: &DriveId,
+        priority: u32,
+        tidy: bool,
+    ) -> Result<String> {
+        let mut waiting = None;
+        for j in self.jobs()?.into_iter().filter(|j| j.kind.same(kind)) {
+            if !matches!(j.state, JobState::Done | JobState::Canceled) {
+                waiting.get_or_insert(j);
+            } else if tidy {
+                self.remove(&j.id)?;
+            }
+        }
+        let Some(j) = waiting else {
+            return Ok(self.create(kind, drive, priority)?.id);
+        };
+        if matches!(
+            j.state,
+            JobState::Failed | JobState::Blocked(_) | JobState::Paused
+        ) {
+            self.edit_control(Some(&j.id), |c| {
+                c.retry += 1;
+                c.pause = false;
+            })?;
+        }
+        Ok(j.id)
+    }
+
     /// Forgets a finished job. Worker only, like `save`.
     pub(crate) fn remove(&self, id: &str) -> Result<()> {
         for ext in ["json", "ctl"] {
@@ -186,5 +219,63 @@ mod tests {
         assert_eq!(s.jobs().unwrap().len(), 2);
         assert!(s.job("../x").is_err());
         assert!(s.edit_control(Some("all"), |c| c.cancel = true).is_err());
+    }
+
+    #[test]
+    fn enqueue_reuses_retries_and_tidies() {
+        let tmp = TempDir::new();
+        let store = Store::new(tmp.path().join("queue"));
+        let drive: DriveId = "0123-ABCD".parse().unwrap();
+        let gh = |t| JobKind::Github { transport: t };
+        let first = store.enqueue(&gh(None), &drive, 1, false).unwrap();
+        assert_eq!(
+            store
+                .enqueue(&gh(Some(crate::config::Transport::Https)), &drive, 1, false)
+                .unwrap(),
+            first,
+            "one GitHub job whatever the transport"
+        );
+        assert_eq!(
+            store.control(Some(&first)),
+            Control::default(),
+            "queued: no retry"
+        );
+        let local = store.enqueue(&JobKind::Local, &drive, 0, false).unwrap();
+        assert_ne!(local, first);
+
+        for (n, state) in [
+            JobState::Failed,
+            JobState::Blocked(crate::queue::BlockReason::NeedsTouch),
+            JobState::Paused,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut j = store.job(&first).unwrap();
+            j.state = state;
+            store.save(&mut j).unwrap();
+            store
+                .edit_control(Some(&first), |c| c.pause = true)
+                .unwrap();
+            assert_eq!(store.enqueue(&gh(None), &drive, 1, false).unwrap(), first);
+            let ctl = store.control(Some(&first));
+            assert_eq!(
+                (ctl.retry, ctl.pause),
+                (u32::try_from(n).unwrap() + 1, false)
+            );
+        }
+
+        let mut j = store.job(&first).unwrap();
+        j.state = JobState::Done;
+        store.save(&mut j).unwrap();
+        let second = store.enqueue(&gh(None), &drive, 1, false).unwrap();
+        assert_ne!(second, first);
+        assert!(store.job(&first).is_ok(), "no tidy without the lane lock");
+        let mut j = store.job(&second).unwrap();
+        j.state = JobState::Canceled;
+        store.save(&mut j).unwrap();
+        let third = store.enqueue(&gh(None), &drive, 1, true).unwrap();
+        assert!(store.job(&first).is_err() && store.job(&second).is_err());
+        assert_eq!(store.jobs().unwrap().len(), 2, "{third} and the local job");
     }
 }

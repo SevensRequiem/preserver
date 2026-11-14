@@ -1,3 +1,4 @@
+mod actions;
 mod catalog;
 pub mod cli;
 mod config;
@@ -13,6 +14,7 @@ mod platform;
 mod public;
 mod queue;
 mod resolve;
+mod schedule;
 mod status;
 #[cfg(test)]
 mod testutil;

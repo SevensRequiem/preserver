@@ -13,11 +13,12 @@ const PRIMARY: &str = "0123-ABCD";
 const OTHER: &str = "4567-EF01";
 
 /// A fake primary at `tmp/primary` and an empty target at `tmp/target`; the other drive
-/// "mounts" at `tmp/target` while `plugged` is set.
+/// "mounts" at `tmp/target` while `plugged` and `mounted` are set.
 struct Fake {
     tmp: TempDir,
     store: Store,
     plugged: AtomicBool,
+    mounted: AtomicBool,
     fstype: Mutex<String>,
     said: Mutex<String>,
     /// A target of this many bytes, one byte per cluster: free is what its files leave.
@@ -57,6 +58,7 @@ impl Fake {
             store: Store::new(tmp.path().join("queue")),
             tmp,
             plugged: AtomicBool::new(true),
+            mounted: AtomicBool::new(true),
             fstype: Mutex::new("ext4".into()),
             said: Mutex::new(String::new()),
             capacity: Mutex::new(None),
@@ -109,13 +111,15 @@ impl Fake {
     }
 
     fn with_env<T>(&self, f: impl FnOnce(&Env) -> T) -> T {
-        let mount = |id: &DriveId| {
+        let drive = |id: &DriveId| {
             if id.matches(PRIMARY) {
-                Some(self.primary())
-            } else if id.matches(OTHER) && self.plugged.load(Ordering::Relaxed) {
-                Some(self.target())
+                DriveAt::Mounted(self.primary())
+            } else if !id.matches(OTHER) || !self.plugged.load(Ordering::Relaxed) {
+                DriveAt::Absent
+            } else if self.mounted.load(Ordering::Relaxed) {
+                DriveAt::Mounted(self.target())
             } else {
-                None
+                DriveAt::Unmounted
             }
         };
         let fstype = |_: &Target, _: &Path| self.fstype.lock().unwrap().clone();
@@ -126,7 +130,7 @@ impl Fake {
             None => Ok((1 << 40, 1 << 41)),
         };
         f(&Env {
-            mount: &mount,
+            drive: &drive,
             fstype: &fstype,
             free: &free,
             cluster: &|_| if cap.is_some() { 1 } else { 4096 },
@@ -372,6 +376,24 @@ fn blocked_until_the_drive_is_plugged_in() {
         .target()
         .join("backup/preserver/public/specs/2026-11-01/intel-sdm/sdm.pdf");
     assert_eq!(read(&t), "manual");
+}
+
+#[test]
+fn an_unmounted_target_blocks_without_an_attempt() {
+    let f = Fake::new();
+    f.mounted.store(false, Ordering::Relaxed);
+    let target = Target::Drive {
+        id: OTHER.parse().unwrap(),
+        subdir: String::new(),
+        label: String::new(),
+    };
+    let id = f.job(target, &["specs"]).id;
+    f.with_env(|env| work(&f.store, env, Pass::FRESH)).unwrap();
+    let job = f.store.job(&id).unwrap();
+    assert_eq!(
+        (job.state, job.attempts),
+        (JobState::Blocked(BlockReason::Unmounted), 0)
+    );
 }
 
 #[test]
