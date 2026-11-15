@@ -76,10 +76,12 @@ fn suffixed(p: &Path, suffix: &str) -> PathBuf {
 
 #[derive(Debug)]
 pub(crate) enum Fail {
-    /// Worth another try after the backoff; `after` is the server's Retry-After.
+    /// Worth another try after the backoff; `after` is the server's Retry-After. `progressed`:
+    /// this call saved a checkpoint past where it started, so it was no wasted try.
     Retry {
         msg: String,
         after: Option<Duration>,
+        progressed: bool,
     },
     Permanent(String),
     /// A local file operation failed: the drive may be gone.
@@ -102,6 +104,7 @@ fn retry(msg: impl Into<String>) -> Fail {
     Fail::Retry {
         msg: msg.into(),
         after: None,
+        progressed: false,
     }
 }
 
@@ -120,9 +123,14 @@ impl Fail {
     /// Puts where it happened in front of the message.
     fn at(self, at: &str) -> Self {
         match self {
-            Self::Retry { msg, after } => Self::Retry {
+            Self::Retry {
+                msg,
+                after,
+                progressed,
+            } => Self::Retry {
                 msg: format!("{at}: {msg}"),
                 after,
+                progressed,
             },
             Self::Permanent(msg) => Self::Permanent(format!("{at}: {msg}")),
             other => other,
@@ -168,6 +176,8 @@ struct PartState {
 struct Part {
     file: File,
     offset: u64,
+    /// The offset the sidecar records.
+    saved: u64,
     total: Option<u64>,
     validator: Option<Validator>,
     h256: Resumable<S256>,
@@ -181,6 +191,7 @@ impl Part {
         self.file.seek(SeekFrom::Start(0)).map_err(Fail::Disk)?;
         done.fetch_sub(self.offset, Ordering::Relaxed);
         self.offset = 0;
+        self.saved = 0;
         self.total = None;
         self.validator = None;
         self.h256 = Resumable::new();
@@ -219,7 +230,7 @@ fn retry_after(h: &HeaderMap) -> Option<Duration> {
 pub(crate) struct Downloader {
     agent: Agent,
     throttle: Arc<Throttle>,
-    /// Segment length, and so the checkpoint interval; a multiple of 128 (the SHA-512 block).
+    /// Bytes between checkpoints; a multiple of 128 (the SHA-512 block).
     checkpoint: u64,
 }
 
@@ -253,28 +264,25 @@ impl Downloader {
         Duration::from_secs(600) + Duration::from_secs_f64(body)
     }
 
-    /// The next segment from `part.offset` when `ranged`, else the whole file.
+    /// The rest of the file from `part.offset` when `ranged`, else the whole file: one request
+    /// per attempt, since a mirror may throttle or drop a client that keeps reconnecting.
+    /// Returns the response, the hop that gave it and the bytes its timeout was sized for.
     fn request(
         &self,
         f: &Fetch,
         part: &Part,
         ranged: bool,
-    ) -> Result<(ureq::http::Response<ureq::Body>, String), Fail> {
+    ) -> Result<(ureq::http::Response<ureq::Body>, String, Option<u64>), Fail> {
         let mut headers = Vec::new();
-        let mut want = None;
+        let mut want = f.size;
         if ranged {
-            let mut end = part.offset + self.checkpoint - 1;
-            if let Some(total) = part.total {
-                end = end.min(total - 1);
-            }
-            want = Some(end - part.offset + 1);
-            headers.push(("Range", format!("bytes={}-{end}", part.offset)));
+            want = part.total.or(f.size).map(|t| t - part.offset);
+            headers.push(("Range", format!("bytes={}-", part.offset)));
             if let (true, Some(v)) = (part.offset > 0, &part.validator) {
                 headers.push(("If-Range", v.value().to_string()));
             }
         }
-        let timeout = self.timeout(want.or(f.size));
-        Self::call(&f.url, timeout, |hop| {
+        let (resp, hop) = Self::call(&f.url, self.timeout(want), |hop| {
             headers
                 .iter()
                 .fold(self.agent.get(hop), |r, (k, v)| r.header(*k, v))
@@ -285,7 +293,8 @@ impl Downloader {
             } else {
                 Fail::Permanent(msg)
             }
-        })
+        })?;
+        Ok((resp, hop, want))
     }
 
     /// Downloads `f` to its `.part`, verifies it and renames it to `dest`. `stop` is checked
@@ -297,7 +306,11 @@ impl Downloader {
         // A failed call takes its share back, since the retry's open counts the resumed bytes
         // again. A stop ends the run, and its count is what the paused job shows.
         done.fetch_add(part.offset, Ordering::Relaxed);
-        let r = self.transfer(f, &mut part, &side, stop, done);
+        let start = part.saved;
+        let mut r = self.transfer(f, &mut part, &side, stop, done);
+        if let Err(Fail::Retry { progressed, .. }) = &mut r {
+            *progressed = part.saved > start;
+        }
         if matches!(r, Err(Fail::Permanent(_))) {
             remove(&f.part())?;
             remove(&side)?;
@@ -327,7 +340,7 @@ impl Downloader {
             if part.total == Some(part.offset) {
                 break;
             }
-            let (resp, hop) = self.request(f, part, ranged)?;
+            let (resp, hop, want) = self.request(f, part, ranged)?;
             let at = via(&f.url, &hop);
             let status = resp.status().as_u16();
             let head = resp.headers().clone();
@@ -362,10 +375,16 @@ impl Downloader {
                     }
                     part.validator = validator;
                     part.total = Some(total);
-                    self.copy(&mut body, part, Some(last - first + 1), f, stop, done)
-                        .map_err(|e| e.at(&at))?;
-                    if part.offset < total {
-                        Self::checkpoint(f, part, side)?;
+                    // A server may send less than asked; the loop asks again from there.
+                    let mut left = last - first + 1;
+                    while left > 0 {
+                        let n = left.min(self.checkpoint);
+                        self.copy(&mut body, part, Some(n), f, stop, done)
+                            .map_err(|e| e.at(&at))?;
+                        left -= n;
+                        if part.offset < total {
+                            Self::checkpoint(f, part, side)?;
+                        }
                     }
                 }
                 200 => {
@@ -380,9 +399,9 @@ impl Downloader {
                     {
                         return Err(retry(format!("{at}: {n} bytes, expected {s}")));
                     }
-                    // A ranged request's timeout covers one segment. A server that ignores
-                    // Range sends the whole file, which gets a plain GET timed by its size.
-                    if ranged && len.is_none_or(|n| n > self.checkpoint) {
+                    // A ranged request's timeout covers the bytes it asked for. A server that
+                    // ignores Range sends the whole file, which gets a plain GET timed by its size.
+                    if ranged && want.is_some_and(|w| len.is_none_or(|n| n > w)) {
                         ranged = false;
                         continue;
                     }
@@ -402,6 +421,7 @@ impl Downloader {
                     return Err(Fail::Retry {
                         msg: format!("{at}: HTTP {status}"),
                         after: retry_after(&head),
+                        progressed: false,
                     });
                 }
                 _ => return Err(Fail::Permanent(format!("{at}: HTTP {status}"))),
@@ -424,6 +444,7 @@ impl Downloader {
         let mut p = Part {
             file,
             offset: 0,
+            saved: 0,
             total: None,
             validator: None,
             h256: Resumable::new(),
@@ -443,6 +464,7 @@ impl Downloader {
         match st {
             Some(st) => {
                 p.offset = st.offset;
+                p.saved = st.offset;
                 p.total = Some(st.total);
                 p.validator = Some(st.validator);
                 p.h256 = Resumable::resume(st.sha256, st.offset);
@@ -507,9 +529,9 @@ impl Downloader {
         }
     }
 
-    /// Makes the segment durable, then records it: sync the data, write the sidecar's tmp,
-    /// sync it, rename. A crash anywhere leaves the old sidecar or the new one, both true.
-    fn checkpoint(f: &Fetch, p: &Part, side: &Path) -> Result<(), Fail> {
+    /// Makes the bytes so far durable, then records them: sync the data, write the sidecar's
+    /// tmp, sync it, rename. A crash anywhere leaves the old sidecar or the new one, both true.
+    fn checkpoint(f: &Fetch, p: &mut Part, side: &Path) -> Result<(), Fail> {
         let (Some((sha256, _)), Some(validator), Some(total)) =
             (p.h256.midstate(), &p.validator, p.total)
         else {
@@ -530,7 +552,9 @@ impl Downloader {
         let mut t = File::create(&tmp).map_err(Fail::Disk)?;
         t.write_all(&json).map_err(Fail::Disk)?;
         t.sync_data().map_err(Fail::Disk)?;
-        std::fs::rename(&tmp, side).map_err(Fail::Disk)
+        std::fs::rename(&tmp, side).map_err(Fail::Disk)?;
+        p.saved = p.offset;
+        Ok(())
     }
 
     fn finish(f: &Fetch, p: Part, side: &Path) -> Result<(), Fail> {
@@ -724,7 +748,16 @@ mod tests {
     fn interrupted(srv: &Server, d: &Downloader, f: &Fetch, done: &AtomicU64) {
         srv.set(|b| b.die_at = Some(5 * CP / 2));
         let err = d.fetch(f, &AtomicBool::new(false), done).unwrap_err();
-        assert!(matches!(err, Fail::Retry { .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                Fail::Retry {
+                    progressed: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(done.load(Ordering::Relaxed), 0);
         assert_eq!(sidecar(f).offset, 2 * CP);
         let mut part = OpenOptions::new().append(true).open(f.part()).unwrap();
@@ -746,8 +779,10 @@ mod tests {
         d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), data);
         assert!(!f.part().exists() && !f.sidecar().exists());
+        // The rest in one request, checkpointed as it arrives.
         let hits = srv.hits();
-        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-3145727"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-"));
         assert_eq!(hits[0].if_range.as_deref(), Some("\"v1\""));
         // Only the missing 3 MiB came over the wire again.
         assert_eq!(srv.served(), data.len() as u64 - 2 * CP);
@@ -788,11 +823,11 @@ mod tests {
         srv.set(|b| b.ranges = false);
         d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), data);
-        // The whole file in answer to a segment request is not read under the segment's
+        // The whole file in answer to a request for the rest is not read under that request's
         // timeout: it is asked for again with a plain GET.
         let hits = srv.hits();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-3145727"));
+        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-"));
         assert_eq!(hits[0].status, 200);
         assert_eq!((hits[1].range.as_deref(), hits[1].status), (None, 200));
         assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
@@ -850,7 +885,7 @@ mod tests {
         d.fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
             .unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), new);
-        assert_eq!(srv.hits()[1].range.as_deref(), Some("bytes=0-1048575"));
+        assert_eq!(srv.hits()[1].range.as_deref(), Some("bytes=0-"));
     }
 
     #[test]
@@ -881,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn every_segment_follows_the_redirects_with_its_range() {
+    fn each_attempt_follows_the_redirects_once() {
         let tmp = TempDir::new();
         let data = body(3 * CP + 7, 2);
         let mirror = Server::start("127.0.0.2", Behaviour::new(data.clone()));
@@ -891,19 +926,38 @@ mod tests {
             b.redirects
                 .insert("lb/a.iso".into(), mirror.url("zim/a.iso"));
         });
+        let d = dl(0);
         let f = fetch(&srv, tmp.path(), "a.iso", &data);
-        dl(0)
-            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
-            .unwrap();
+        let done = AtomicU64::new(0);
+        interrupted(&mirror, &d, &f, &done);
+
+        // Dies again before the next checkpoint: a try that got nowhere.
+        mirror.set(|b| b.die_at = Some(5 * CP / 2));
+        let err = d.fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Fail::Retry {
+                    progressed: false,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
         assert_eq!(std::fs::read(&f.dest).unwrap(), data);
         let hops = srv.hits();
-        assert_eq!(hops.len(), 8);
+        assert_eq!(hops.len(), 6);
         assert!(hops.iter().all(|h| h.status == 302));
         let got = mirror.hits();
-        assert_eq!(got.len(), 4);
+        assert_eq!(got.len(), 2);
         assert!(got.iter().all(|h| h.status == 206));
-        assert_eq!(got[3].range.as_deref(), Some("bytes=3145728-3145734"));
-        assert_eq!(got[3].if_range.as_deref(), Some("\"v1\""));
+        assert!(
+            got.iter()
+                .all(|h| h.range.as_deref() == Some("bytes=2097152-"))
+        );
+        assert!(got.iter().all(|h| h.if_range.as_deref() == Some("\"v1\"")));
     }
 
     #[test]

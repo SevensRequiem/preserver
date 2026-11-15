@@ -141,7 +141,7 @@ src/keys.rs            embedded keyrings; stored-key pin check
 src/crypt.rs           age: init (generate + scrypt-lock), encrypt_stream(recipient.txt), open_identity(passphrase)
 src/personal/{github.rs, local.rs, restore.rs}
 src/git/{mirror.rs (gix fetch, refs state), bundle.rs (exec git bundle create; native reader), http.rs (gix Http over ureq), ssh.rs (shim + mux args)}
-src/net/{client.rs (ureq Agent, https-only incl. redirects, timeouts, doc size limits), throttle.rs (token bucket), download.rs (segmented Range/If-Range, sidecars), hash.rs (ResumableSha256/512 on sha2::compress*)}
+src/net/{client.rs (ureq Agent, https-only incl. redirects, timeouts, doc size limits), throttle.rs (token bucket), download.rs (resumable Range/If-Range, sidecars), hash.rs (ResumableSha256/512 on sha2::compress*)}
 src/queue/{job.rs, store.rs, sched.rs}
 src/resolve/{mod.rs (Item, dispatch, name/URL checks), listing.rs, github.rs, json.rs (kernel/go/rust/node/zig), hf.rs, yaml_lite.rs, static_.rs, href.rs}
 src/verify/{mod.rs (verify_item, TOFU), sums.rs (findSum port), pgp.rs, minisign.rs}
@@ -215,7 +215,7 @@ enum RepoFormat { Fedora, Debian, Alpine }    // enum + match: three walkers in 
 | Pause/resume/cancel | Applied at the next 64 KiB chunk. Pause keeps `.part` files. Cancel deletes the job's staging. `queue pause --all` writes a global ctl |
 | Unplug | A write error showing the mount is gone (ENOENT/EIO/ENODEV, or `is_mounted` false) puts every job on that drive into `Blocked(DriveAbsent)` without counting attempts. The daemon's drive watcher resumes them on replug |
 | Bandwidth | One global token bucket (default `bandwidth_mbit = 80`, 0 = off, burst 256 KiB). It is taken before each body read in `net` and in the gix Http backend. It counts payload bytes, so the wire is about 2–3% above; TCP backpressure keeps the link honest. Personal ssh fetches are unthrottled, as now |
-| Resume | Segmented GETs, each with Range + If-Range (validator) and `timeout_recv_body` 10 min. A segment end is a checkpoint: `sync_data` the part, then write the sidecar atomically. On resume: truncate the part to `offset`, restore the hashers from the midstate, continue. 200 instead of 206 means restart from 0. A part without a sidecar is re-hashed once. Without Range support it is a single stream with a size-derived timeout and no resume. BLAKE3 has no public midstate, so its sources re-hash on resume |
+| Resume | One GET per attempt for the rest of the file, with Range + If-Range (validator) and a timeout sized from the remaining bytes. Every 64 MiB of the body is a checkpoint: `sync_data` the part, then write the sidecar atomically. On resume: truncate the part to `offset`, restore the hashers from the midstate, continue. 200 instead of 206 means restart from 0. A part without a sidecar is re-hashed once. Without Range support it is a single stream with a size-derived timeout and no resume. BLAKE3 has no public midstate, so its sources re-hash on resume |
 | Midstate | **Persist it.** `ResumableSha256/512` wrap `sha2::compress256/512`. Checkpoints sit on 64 MiB boundaries, so the state is just the words plus the length, and the sidecar carries a version number |
 | Visibility | Versioned sets: `<set>/.staging/<plan16>/`, hardlinks from the previous version (copy on exFAT/FAT), SET.toml + SHA256SUMS, rename into place, prune to `keep`. Repo mirrors follow §3.4 |
 | Progress | The worker rewrites `<id>.json` every 1 s. The tray polls every 2 s while a worker lock is held, otherwise hourly. `queue list [--watch]` |

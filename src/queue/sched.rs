@@ -15,7 +15,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 pub(crate) const PER_HOST: usize = 2;
-/// Tries per file per run; after that the job is Failed and the next run retries it.
+/// Tries in a row without progress per file per run; after that the job is Failed and the
+/// next run retries it.
 pub(crate) const TRIES: u32 = 6;
 
 /// The wait after the `n`th failure (from 0): 5 s·2ⁿ capped at 10 min, less up to a quarter
@@ -161,7 +162,14 @@ impl<'a> Pool<'a> {
             }
             Err(Fail::Permanent(msg)) => st.failed.push(msg),
             Err(e @ (Fail::Retry { .. } | Fail::Disk(_))) => {
-                st.tries[i] += 1;
+                // Only tries that got nowhere count: a large file over a flaky route may need
+                // many attempts, and each one that saved a checkpoint brought it closer.
+                st.tries[i] = match e {
+                    Fail::Retry {
+                        progressed: true, ..
+                    } => 0,
+                    _ => st.tries[i] + 1,
+                };
                 if st.tries[i] >= TRIES {
                     st.failed.push(format!("{e} ({TRIES} tries)"));
                 } else {
@@ -170,7 +178,7 @@ impl<'a> Pool<'a> {
                         st.host_until.insert(h.clone(), now + *a);
                     }
                     tracing::info!("{e}; retrying");
-                    let at = now + backoff(st.tries[i] - 1, jitter());
+                    let at = now + backoff(st.tries[i].saturating_sub(1), jitter());
                     st.delayed.push((at, i));
                 }
             }
@@ -484,6 +492,40 @@ mod tests {
     }
 
     #[test]
+    fn only_tries_without_progress_count() {
+        let fetches = [Fetch {
+            url: "https://example.org/big.zim".into(),
+            dest: PathBuf::new(),
+            size: None,
+            limit: u64::MAX,
+            expect: Expect::None,
+        }];
+        let p = Pool::new(&fetches);
+        let fail = |progressed| {
+            {
+                let mut st = p.lock();
+                st.running += 1;
+                *st.active.entry(p.hosts[0].clone()).or_default() += 1;
+            }
+            let e = Fail::Retry {
+                msg: "timeout: connect".into(),
+                after: None,
+                progressed,
+            };
+            p.finish(0, Err(e), &|| true);
+        };
+        for _ in 0..2 * TRIES {
+            fail(true);
+        }
+        for _ in 1..TRIES {
+            fail(false);
+        }
+        assert_eq!(p.lock().failed, Vec::<String>::new());
+        fail(false);
+        assert_eq!(p.lock().failed.len(), 1);
+    }
+
+    #[test]
     fn backoff_schedule() {
         let secs: Vec<u64> = (0..9).map(|n| backoff(n, 0.0).as_secs()).collect();
         assert_eq!(secs, [5, 10, 20, 40, 80, 160, 320, 600, 600]);
@@ -671,9 +713,11 @@ mod tests {
         });
         let j = r.store.job(&job.id).unwrap();
         assert_eq!(j.state, JobState::Paused);
-        assert!(r.dest().with_extension("iso.part.json").exists());
-        let served = r.srv.served();
-        assert!(served < r.data.len() as u64);
+        let side = std::fs::read(r.dest().with_extension("iso.part.json")).unwrap();
+        let saved = serde_json::from_slice::<serde_json::Value>(&side).unwrap()["offset"]
+            .as_u64()
+            .unwrap();
+        assert!(saved >= CP && saved < r.data.len() as u64, "{saved}");
 
         // Paused jobs don't run until resumed.
         r.run();
@@ -687,12 +731,10 @@ mod tests {
         assert_eq!(j.state, JobState::Done, "{:?}", j.error);
         assert_eq!(j.progress.files_done, 1);
         assert_eq!(std::fs::read(r.dest()).unwrap(), r.data);
-        // At most the unfinished segment was fetched twice.
-        assert!(
-            r.srv.served() <= r.data.len() as u64 + CP,
-            "{}",
-            r.srv.served()
-        );
+        // The resume asked only for what the last checkpoint did not hold.
+        let hits = r.srv.hits();
+        let want = format!("bytes={saved}-");
+        assert_eq!(hits.last().unwrap().range.as_deref(), Some(want.as_str()));
     }
 
     #[test]
