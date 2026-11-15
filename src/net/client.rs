@@ -42,7 +42,8 @@ fn build(roots: RootCerts, loopback: bool) -> Agent {
         .https_only(true)
         .http_status_as_error(false)
         .user_agent(USER_AGENT)
-        .max_redirects(10)
+        // Downloader follows redirects itself, so an error can name the hop that failed.
+        .max_redirects(0)
         .timeout_resolve(Some(Duration::from_secs(15)))
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(60)))

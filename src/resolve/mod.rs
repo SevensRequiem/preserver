@@ -2,7 +2,7 @@
 //! the upstream index publishes. Everything read here is untrusted until `verify` has run.
 
 mod json;
-mod listing;
+pub(crate) mod listing;
 
 use crate::catalog::{Kind, Resolve, SigOver, Source};
 use crate::net::download::Downloader;

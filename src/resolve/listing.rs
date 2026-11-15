@@ -57,9 +57,10 @@ fn normalize(path: &str) -> String {
     out.join("/")
 }
 
-/// Resolves a listing's href against the page it came from (RFC 3986 section 5.2, without
-/// queries and fragments, which the href pattern never captures).
-fn join(base: &str, href: &str) -> Option<String> {
+/// Resolves a listing's href or a redirect's Location against the URL it came from (RFC 3986
+/// section 5.2). The base's query is dropped; a relative reference's own query is treated as
+/// part of its path (listing hrefs have none; an absolute one is returned untouched).
+pub(crate) fn join(base: &str, href: &str) -> Option<String> {
     let scheme_end = base.find("://")?;
     let has_scheme = href.split_once(':').is_some_and(|(s, _)| {
         s.starts_with(|c: char| c.is_ascii_alphabetic())

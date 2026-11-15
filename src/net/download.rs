@@ -7,6 +7,7 @@
 
 use super::hash::{Resumable, S256, S512};
 use super::throttle::Throttle;
+use crate::resolve::listing::join;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -14,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use ureq::Agent;
 use ureq::http::HeaderMap;
+use ureq::{Agent, RequestBuilder, typestate::WithoutBody};
 
 /// Download threads per worker.
 pub(crate) const STREAMS: usize = 4;
 pub(crate) const CHECKPOINT: u64 = 64 << 20;
+const MAX_REDIRECTS: usize = 10;
 const CHUNK: usize = 64 << 10;
 const SIDECAR_VERSION: u8 = 1;
 
@@ -100,6 +102,31 @@ fn retry(msg: impl Into<String>) -> Fail {
     Fail::Retry {
         msg: msg.into(),
         after: None,
+    }
+}
+
+/// `url`, or `url via hop` when a redirect led elsewhere. The hop's query is left out: a
+/// mirror or CDN puts signatures there.
+fn via(url: &str, at: &str) -> String {
+    let hop = at.split(['?', '#']).next().unwrap_or(at);
+    if at == url {
+        url.to_string()
+    } else {
+        format!("{url} via {hop}")
+    }
+}
+
+impl Fail {
+    /// Puts where it happened in front of the message.
+    fn at(self, at: &str) -> Self {
+        match self {
+            Self::Retry { msg, after } => Self::Retry {
+                msg: format!("{at}: {msg}"),
+                after,
+            },
+            Self::Permanent(msg) => Self::Permanent(format!("{at}: {msg}")),
+            other => other,
+        }
     }
 }
 
@@ -232,8 +259,8 @@ impl Downloader {
         f: &Fetch,
         part: &Part,
         ranged: bool,
-    ) -> Result<ureq::http::Response<ureq::Body>, Fail> {
-        let mut req = self.agent.get(&f.url);
+    ) -> Result<(ureq::http::Response<ureq::Body>, String), Fail> {
+        let mut headers = Vec::new();
         let mut want = None;
         if ranged {
             let mut end = part.offset + self.checkpoint - 1;
@@ -241,21 +268,24 @@ impl Downloader {
                 end = end.min(total - 1);
             }
             want = Some(end - part.offset + 1);
-            req = req.header("Range", format!("bytes={}-{end}", part.offset));
+            headers.push(("Range", format!("bytes={}-{end}", part.offset)));
             if let (true, Some(v)) = (part.offset > 0, &part.validator) {
-                req = req.header("If-Range", v.value());
+                headers.push(("If-Range", v.value().to_string()));
             }
         }
-        req.config()
-            .timeout_global(Some(self.timeout(want.or(f.size))))
-            .build()
-            .call()
-            .map_err(|e| match e {
-                ureq::Error::BadUri(_) | ureq::Error::RequireHttpsOnly(_) => {
-                    Fail::Permanent(format!("{}: {e}", f.url))
-                }
-                _ => retry(format!("{}: {e}", f.url)),
-            })
+        let timeout = self.timeout(want.or(f.size));
+        Self::call(&f.url, timeout, |hop| {
+            headers
+                .iter()
+                .fold(self.agent.get(hop), |r, (k, v)| r.header(*k, v))
+        })
+        .map_err(|(again, msg)| {
+            if again {
+                retry(msg)
+            } else {
+                Fail::Permanent(msg)
+            }
+        })
     }
 
     /// Downloads `f` to its `.part`, verifies it and renames it to `dest`. `stop` is checked
@@ -297,7 +327,8 @@ impl Downloader {
             if part.total == Some(part.offset) {
                 break;
             }
-            let resp = self.request(f, part, ranged)?;
+            let (resp, hop) = self.request(f, part, ranged)?;
+            let at = via(&f.url, &hop);
             let status = resp.status().as_u16();
             let head = resp.headers().clone();
             let mut body = resp.into_body().into_reader();
@@ -321,17 +352,18 @@ impl Downloader {
                     {
                         restarts += 1;
                         if restarts > 2 {
-                            return Err(retry(format!("{}: server keeps changing", f.url)));
+                            return Err(retry(format!("{at}: server keeps changing")));
                         }
                         part.reset(side, done)?;
                         continue;
                     }
                     if let Some(s) = f.size.filter(|s| *s != total) {
-                        return Err(retry(format!("{}: {total} bytes, expected {s}", f.url)));
+                        return Err(retry(format!("{at}: {total} bytes, expected {s}")));
                     }
                     part.validator = validator;
                     part.total = Some(total);
-                    self.copy(&mut body, part, Some(last - first + 1), f, stop, done)?;
+                    self.copy(&mut body, part, Some(last - first + 1), f, stop, done)
+                        .map_err(|e| e.at(&at))?;
                     if part.offset < total {
                         Self::checkpoint(f, part, side)?;
                     }
@@ -346,7 +378,7 @@ impl Downloader {
                     if let (Some(s), Some(n)) = (f.size, len)
                         && s != n
                     {
-                        return Err(retry(format!("{}: {n} bytes, expected {s}", f.url)));
+                        return Err(retry(format!("{at}: {n} bytes, expected {s}")));
                     }
                     // A ranged request's timeout covers one segment. A server that ignores
                     // Range sends the whole file, which gets a plain GET timed by its size.
@@ -354,27 +386,25 @@ impl Downloader {
                         ranged = false;
                         continue;
                     }
-                    self.copy(&mut body, part, len, f, stop, done)?;
+                    self.copy(&mut body, part, len, f, stop, done)
+                        .map_err(|e| e.at(&at))?;
                     if let Some(s) = f.size.filter(|s| part.offset > *s) {
-                        return Err(retry(format!(
-                            "{}: more than the expected {s} bytes",
-                            f.url
-                        )));
+                        return Err(retry(format!("{at}: more than the expected {s} bytes")));
                     }
                     break;
                 }
                 416 if ranged && part.offset == 0 => ranged = false,
                 416 => {
                     part.reset(side, done)?;
-                    return Err(retry(format!("{}: range rejected, restarting", f.url)));
+                    return Err(retry(format!("{at}: range rejected, restarting")));
                 }
                 408 | 429 | 500..=599 => {
                     return Err(Fail::Retry {
-                        msg: format!("{}: HTTP {status}", f.url),
+                        msg: format!("{at}: HTTP {status}"),
                         after: retry_after(&head),
                     });
                 }
-                _ => return Err(Fail::Permanent(format!("{}: HTTP {status}", f.url))),
+                _ => return Err(Fail::Permanent(format!("{at}: HTTP {status}"))),
             }
         }
         Ok(())
@@ -426,7 +456,8 @@ impl Downloader {
         Ok(p)
     }
 
-    /// Copies the body into the part: exactly `exact` bytes when given, else to EOF.
+    /// Copies the body into the part: exactly `exact` bytes when given, else to EOF. Errors
+    /// carry no URL; the caller knows which hop sent the body.
     fn copy(
         &self,
         body: &mut impl Read,
@@ -452,13 +483,10 @@ impl Downloader {
             }
             let n = body
                 .read(&mut buf[..room])
-                .map_err(|e| retry(format!("{}: read: {e}", f.url)))?;
+                .map_err(|e| retry(format!("read: {e}")))?;
             if n == 0 {
                 return match exact {
-                    Some(e) if got < e => Err(retry(format!(
-                        "{}: body ended at {got} of {e} bytes",
-                        f.url
-                    ))),
+                    Some(e) if got < e => Err(retry(format!("body ended at {got} of {e} bytes"))),
                     _ => Ok(()),
                 };
             }
@@ -473,8 +501,7 @@ impl Downloader {
             done.fetch_add(n as u64, Ordering::Relaxed);
             if p.offset > cap {
                 return Err(Fail::Permanent(format!(
-                    "{}: body is larger than the {cap} bytes allowed",
-                    f.url
+                    "body is larger than the {cap} bytes allowed"
                 )));
             }
         }
@@ -539,32 +566,69 @@ impl Downloader {
         url: &str,
         head: bool,
     ) -> Result<ureq::http::Response<ureq::Body>, (bool, String)> {
-        let req = if head {
-            self.agent.head(url)
-        } else {
-            self.agent.get(url)
-        };
-        let req = if url.starts_with("https://api.github.com/") {
-            req.header("Accept", "application/vnd.github+json")
-        } else {
-            req
-        };
-        let resp = req
-            .config()
-            .timeout_global(Some(Duration::from_secs(120)))
-            .build()
-            .call()
-            .map_err(|e| {
-                let again = !matches!(e, ureq::Error::BadUri(_) | ureq::Error::RequireHttpsOnly(_));
-                (again, format!("{url}: {e}"))
-            })?;
+        let github = url.starts_with("https://api.github.com/");
+        let (resp, at) = Self::call(url, Duration::from_secs(120), |hop| {
+            let req = if head {
+                self.agent.head(hop)
+            } else {
+                self.agent.get(hop)
+            };
+            if github {
+                req.header("Accept", "application/vnd.github+json")
+            } else {
+                req
+            }
+        })?;
         match resp.status().as_u16() {
             200 => Ok(resp),
             s => Err((
                 matches!(s, 408 | 429 | 500..=599),
-                format!("{url}: HTTP {s}"),
+                format!("{}: HTTP {s}", via(url, &at)),
             )),
         }
+    }
+
+    /// Asks for `url` and follows its redirects here, since the agent follows none: an error
+    /// then names the hop that failed (typically the mirror a download host picked), not only
+    /// the URL asked for. Returns the response and the URL that gave it.
+    fn call(
+        url: &str,
+        timeout: Duration,
+        req: impl Fn(&str) -> RequestBuilder<WithoutBody>,
+    ) -> Result<(ureq::http::Response<ureq::Body>, String), (bool, String)> {
+        let mut at = url.to_string();
+        for _ in 0..=MAX_REDIRECTS {
+            let resp = req(&at)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .call()
+                .map_err(|e| {
+                    let again =
+                        !matches!(e, ureq::Error::BadUri(_) | ureq::Error::RequireHttpsOnly(_));
+                    (again, format!("{}: {e}", via(url, &at)))
+                })?;
+            if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok((resp, at));
+            }
+            let next = resp
+                .headers()
+                .get("location")
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| join(&at, l));
+            let Some(n) = next else {
+                let s = resp.status().as_u16();
+                return Err((
+                    false,
+                    format!("{}: HTTP {s} without a usable Location", via(url, &at)),
+                ));
+            };
+            at = n;
+        }
+        Err((
+            false,
+            format!("{}: more than {MAX_REDIRECTS} redirects", via(url, &at)),
+        ))
     }
 
     fn doc_retried(
@@ -814,6 +878,68 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Fail::Stopped));
         assert!(f.part().exists() && !f.dest.exists());
+    }
+
+    #[test]
+    fn every_segment_follows_the_redirects_with_its_range() {
+        let tmp = TempDir::new();
+        let data = body(3 * CP + 7, 2);
+        let mirror = Server::start("127.0.0.2", Behaviour::new(data.clone()));
+        let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
+        srv.set(|b| {
+            b.redirects.insert("a.iso".into(), "lb/a.iso".into());
+            b.redirects
+                .insert("lb/a.iso".into(), mirror.url("zim/a.iso"));
+        });
+        let f = fetch(&srv, tmp.path(), "a.iso", &data);
+        dl(0)
+            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+            .unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        let hops = srv.hits();
+        assert_eq!(hops.len(), 8);
+        assert!(hops.iter().all(|h| h.status == 302));
+        let got = mirror.hits();
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|h| h.status == 206));
+        assert_eq!(got[3].range.as_deref(), Some("bytes=3145728-3145734"));
+        assert_eq!(got[3].if_range.as_deref(), Some("\"v1\""));
+    }
+
+    #[test]
+    fn an_error_names_the_hop_that_failed() {
+        let tmp = TempDir::new();
+        let gone = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
+        srv.set(|b| {
+            let to = format!("http://127.0.0.1:{gone}/m/a?sig=s3cr3t");
+            b.redirects.insert("a".into(), to);
+            b.redirects.insert("loop".into(), "/loop".into());
+        });
+        let f = fetch(&srv, tmp.path(), "a", &[1; 10]);
+        let err = dl(0)
+            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+            .unwrap_err();
+        let msg = err.to_string();
+        let hop = format!("{} via http://127.0.0.1:{gone}/m/a: ", f.url);
+        assert!(
+            matches!(err, Fail::Retry { .. }) && msg.starts_with(&hop),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cr3t"), "{msg}");
+
+        let f = fetch(&srv, tmp.path(), "loop", &[1; 10]);
+        let err = dl(0)
+            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Fail::Permanent(m) if m.ends_with("more than 10 redirects")),
+            "{err}"
+        );
     }
 
     #[test]

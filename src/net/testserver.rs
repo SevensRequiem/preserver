@@ -35,6 +35,8 @@ pub(crate) struct Behaviour {
     /// Bodies by request path (no leading slash, query included), each with an `ETag` of its
     /// content; any other path is a 404. `None` serves `body` everywhere.
     pub routes: Option<HashMap<String, Vec<u8>>>,
+    /// Paths answered with a 302 to the given Location, before anything else.
+    pub redirects: HashMap<String, String>,
 }
 
 impl Behaviour {
@@ -48,6 +50,7 @@ impl Behaviour {
             status: None,
             pace: Duration::ZERO,
             routes: None,
+            redirects: HashMap::new(),
         }
     }
 }
@@ -125,7 +128,7 @@ impl Drop for Active<'_> {
     }
 }
 
-fn serve(sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
+fn serve(mut sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
     let mut reader = BufReader::new(sock.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -146,6 +149,19 @@ fn serve(sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
             "if-range" => if_range = Some(v.trim().to_string()),
             _ => {}
         }
+    }
+    let to = behaviour.lock().unwrap().redirects.get(path).cloned();
+    if let Some(to) = to {
+        counts.hits.lock().unwrap().push(Hit {
+            range,
+            if_range,
+            status: 302,
+        });
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(head.as_bytes());
+        return;
     }
     let now = counts.active.fetch_add(1, Ordering::SeqCst) + 1;
     counts.max_active.fetch_max(now, Ordering::SeqCst);
