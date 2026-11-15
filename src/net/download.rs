@@ -452,10 +452,13 @@ impl Downloader {
             }
             let n = body
                 .read(&mut buf[..room])
-                .map_err(|e| retry(format!("read: {e}")))?;
+                .map_err(|e| retry(format!("{}: read: {e}", f.url)))?;
             if n == 0 {
                 return match exact {
-                    Some(e) if got < e => Err(retry(format!("body ended at {got} of {e} bytes"))),
+                    Some(e) if got < e => Err(retry(format!(
+                        "{}: body ended at {got} of {e} bytes",
+                        f.url
+                    ))),
                     _ => Ok(()),
                 };
             }
