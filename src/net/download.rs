@@ -725,12 +725,10 @@ impl Downloader {
         Ok(out)
     }
 
-    #[expect(dead_code, reason = "the git transport takes it, a later step")]
     pub(crate) fn agent(&self) -> Agent {
         self.agent.clone()
     }
 
-    #[expect(dead_code, reason = "the git transport takes it, a later step")]
     pub(crate) fn throttle(&self) -> Arc<Throttle> {
         self.throttle.clone()
     }

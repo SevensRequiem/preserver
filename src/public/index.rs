@@ -61,13 +61,6 @@ fn read_mirrors(dir: &Path) -> Mirrors {
 
 /// Replaces (or adds) the row of `m.name` in `<set_dir>/MIRRORS.toml` and drops the rows of
 /// sources that are not in `sources`. The only writer of the file.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the mirror walkers that call it arrive in later steps"
-    )
-)]
 pub(crate) fn record_mirror(set_dir: &Path, sources: &[&str], m: Mirror) -> Result<()> {
     let path = set_dir.join("MIRRORS.toml");
     let mut all: Mirrors = match read_meta(&path) {

@@ -1,8 +1,4 @@
 pub mod credential;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the mirror step builds its remote from it")
-)]
 pub(crate) mod http;
 #[cfg_attr(
     any(not(test), not(unix)),
@@ -14,7 +10,7 @@ pub(crate) mod http;
 pub(crate) mod mirror;
 pub mod ssh;
 #[cfg(test)]
-mod testcgi;
+pub(crate) mod testcgi;
 
 use crate::config::Transport;
 use crate::platform;

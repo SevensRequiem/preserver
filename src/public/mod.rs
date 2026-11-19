@@ -5,11 +5,13 @@
 pub(crate) mod index;
 pub(crate) mod versioned;
 
-use crate::catalog::{Catalog, Set, Source};
+use crate::catalog::{Catalog, Kind, Set, Source};
 use crate::config::{Config, DriveId};
+use crate::git::http::Remote;
+use crate::git::mirror::{Trust, Via, refs_state, update};
 use crate::keys;
 use crate::net::client;
-use crate::net::download::{CHECKPOINT, Downloader, Fetch};
+use crate::net::download::{CHECKPOINT, Downloader};
 use crate::net::throttle::Throttle;
 use crate::paths::Paths;
 use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Work, Worker, runnable};
@@ -17,11 +19,14 @@ use crate::resolve::{GH_API, HF_BASE, Item, Resolver};
 use crate::verify::Verifier;
 use crate::{actions, platform, status};
 use anyhow::{Context, Result, bail};
+use gix::protocol::transport::client::blocking_io::http::Http;
 use jiff::Timestamp;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 use versioned::{Prepared, Staged};
 
 type Free<'a> = &'a (dyn Fn(&Path) -> std::io::Result<(u64, u64)> + Sync);
@@ -41,6 +46,72 @@ pub(crate) struct Public<'a> {
 #[expect(clippy::cast_precision_loss, reason = "a size shown to two decimals")]
 pub(crate) fn gb(n: u64) -> String {
     format!("{:.2} GB", n as f64 / 1e9)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a catalog estimate in GB, far below u64::MAX bytes"
+)]
+fn gb_bytes(gb: f64) -> u64 {
+    (gb.max(0.0) * 1e9) as u64
+}
+
+/// FAT32 cannot hold a file of 4 GiB or more, and a big mirror's pack can be one.
+fn fat_refuses(fstype: &str, est: u64) -> bool {
+    matches!(fstype, "vfat" | "msdos") && est >= 4_000_000_000
+}
+
+/// The short id HEAD points at, or empty.
+fn short_head(repo: &Path) -> String {
+    let head = String::from_utf8(versioned::read_meta(&repo.join("HEAD")).unwrap_or_default())
+        .unwrap_or_default();
+    let head = head.trim();
+    let id = match head.strip_prefix("ref: ") {
+        None => head.to_string(),
+        Some(name) => refs_state(repo)
+            .ok()
+            .and_then(|r| String::from_utf8(r).ok())
+            .and_then(|r| {
+                r.lines()
+                    .find_map(|l| l.strip_suffix(name)?.strip_suffix(' ').map(str::to_string))
+            })
+            .unwrap_or_default(),
+    };
+    if id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        id.chars().take(7).collect()
+    } else {
+        String::new()
+    }
+}
+
+/// What a dry run says about the headers of the `info/refs` answer, or the error instead.
+fn probe_text(head: std::io::Result<String>) -> String {
+    let head = match head {
+        Ok(h) => h,
+        Err(e) => {
+            let e = e.to_string();
+            let rest = e.split_once(": ").map_or(e.as_str(), |(_, r)| r);
+            return match rest
+                .strip_prefix("HTTP 3")
+                .and_then(|r| r.split_once(" to "))
+            {
+                Some((_, to)) => {
+                    let host = to.split_once("://").map_or(to, |(_, h)| h);
+                    format!("redirect to {}", host.split('/').next().unwrap_or_default())
+                }
+                None => rest.to_string(),
+            };
+        }
+    };
+    if head
+        .to_ascii_lowercase()
+        .contains("content-type:application/x-git-upload-pack-advertisement")
+    {
+        "ok".into()
+    } else {
+        "not smart http".into()
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -72,12 +143,7 @@ impl Public<'_> {
             .filter(|s| s.on() && !s.kind().in_place())
             .map(|s| s.est)
             .sum();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a catalog estimate in GB, far below u64::MAX bytes"
-        )]
-        let estimate = (versioned.max(0.0) * 1e9) as u64;
+        let estimate = gb_bytes(versioned);
         // A resumed job's stage holds part of the set already. A stage of an older plan is
         // deleted by prepare(), so its bytes come back as free space.
         let mut staged = Vec::new();
@@ -148,10 +214,10 @@ impl Public<'_> {
 
     /// The worker's planner: what a set job has to download. A set that needs nothing (no
     /// usable source, over budget, unchanged) is recorded here and plans no files.
-    pub(crate) fn plan(&self, job: &Job, root: &Path) -> Result<Vec<Fetch>> {
+    pub(crate) fn plan(&self, job: &Job, root: &Path) -> Result<Work<'_>> {
         let name = match &job.kind {
             JobKind::Set { set } => set,
-            JobKind::Mirror { set, source } => return Ok(self.plan_mirror(set, source)),
+            JobKind::Mirror { set, source } => return self.plan_mirror(set, source, root),
             _ => bail!("not a public job"),
         };
         let set = self
@@ -162,7 +228,7 @@ impl Public<'_> {
             .with_context(|| format!("no set {name:?} in the catalog"))?;
         if !set.sources.iter().any(Source::on) {
             self.record(name, "skipped", "", "no enabled sources");
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         // The drive is writable by whoever holds it: a link in the way would send the
         // staging cleanup and the downloads out of the set.
@@ -177,7 +243,7 @@ impl Public<'_> {
             Ok(n) => n,
             Err(e) => {
                 self.record(name, "skipped", "", &format!("{e:#}"));
-                return Ok(Vec::new());
+                return Ok(Vec::new().into());
             }
         };
         let by = self.resolve_set(set)?;
@@ -188,17 +254,17 @@ impl Public<'_> {
                 "",
                 "git and repo mirrors arrive in phase 3",
             );
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
         match versioned::prepare(set, &dir, &by, allowed)? {
             Prepared::Unchanged(version) => {
                 self.record(name, "unchanged", &version, "");
-                Ok(Vec::new())
+                Ok(Vec::new().into())
             }
             Prepared::Staged(staged, fetches) => {
                 self.staged().insert(job.id.clone(), *staged);
-                Ok(fetches)
+                Ok(fetches.into())
             }
         }
     }
@@ -214,24 +280,130 @@ impl Public<'_> {
             .find(|s| s.name == source && s.on() && s.kind().in_place())
     }
 
-    /// The mirror walkers arrive in later steps of phase 3; until then an enabled source only
-    /// records that it was skipped. A source gone from the catalog ends the job in `settle`.
-    fn plan_mirror(&self, set: &str, source: &str) -> Vec<Fetch> {
-        let detail = if self.mirror_source(set, source).is_some() {
-            "arrives later in phase 3"
-        } else {
-            "source no longer in the catalog"
+    /// A git mirror is one closure job: gix fetches into the bare repo under
+    /// `<set>/git/<source>.git`. A repo source only records that it was skipped until its
+    /// walkers arrive. A source gone from the catalog ends the job in `settle`.
+    fn plan_mirror(&self, set: &str, source: &str, root: &Path) -> Result<Work<'_>> {
+        let id = format!("{set}/{source}");
+        let skip = |detail: &str| {
+            self.record(&id, "skipped", "", detail);
+            Ok(Vec::new().into())
         };
-        self.record(&format!("{set}/{source}"), "skipped", "", detail);
-        Vec::new()
+        let Some(src) = self.mirror_source(set, source) else {
+            return skip("source no longer in the catalog");
+        };
+        if src.kind() != Kind::Git {
+            return skip("arrives later in phase 3");
+        }
+        let set_dir = Self::public_dir(root).join(set);
+        let repo = set_dir.join("git").join(format!("{source}.git"));
+        versioned::plain_dirs(&[
+            &root.join("preserver"),
+            &Self::public_dir(root),
+            &set_dir,
+            &set_dir.join("git"),
+            &repo,
+            &repo.join("objects"),
+            &repo.join("objects").join("pack"),
+            &repo.join("refs"),
+        ])?;
+        let est = gb_bytes(src.est);
+        if fat_refuses(&platform::fs_type(root).unwrap_or_default(), est) {
+            bail!("needs a filesystem with files over 4 GiB");
+        }
+        // A mirror already on the drive holds part of the estimate.
+        let mut have = Vec::new();
+        if repo.is_dir() {
+            versioned::regular_files(&repo, "", &mut have)?;
+        }
+        let held: u64 = have.iter().map(|(_, len)| len).sum();
+        let left = self.room(root)?;
+        let need = est.saturating_sub(held);
+        if need > left {
+            return skip(&format!(
+                "budget: needs about {}, {} free above the {}% reserve",
+                gb(need),
+                gb(left),
+                self.reserve_percent
+            ));
+        }
+        let dl = self.resolver.dl;
+        let (source, root) = (source.to_string(), root.to_path_buf());
+        let names: Vec<&str> = self
+            .cat
+            .sets
+            .iter()
+            .filter(|s| s.name == set)
+            .flat_map(|s| &s.sources)
+            .map(|s| s.name.as_str())
+            .collect();
+        Ok(Work::Run(Box::new(move |stop, got| {
+            // Remote's request threads outlive the call and need a shared flag, so the
+            // job's flag is forwarded to it.
+            let halt = Arc::new(AtomicBool::new(false));
+            let done = AtomicBool::new(false);
+            let ran = std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        if stop.load(Ordering::Relaxed) {
+                            halt.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+                let http = Remote::new(dl.agent(), dl.throttle(), got.clone(), left, halt.clone());
+                let ran = update(
+                    &repo,
+                    &src.url,
+                    Via::Https { http, token: None },
+                    Trust::Drive,
+                    stop,
+                    &|_| (),
+                );
+                done.store(true, Ordering::Relaxed);
+                ran
+            });
+            ran?;
+            let mut files = Vec::new();
+            versioned::regular_files(&repo, "", &mut files)?;
+            let version = short_head(&repo);
+            index::record_mirror(
+                &set_dir,
+                &names,
+                index::Mirror {
+                    name: source,
+                    kind: "git".into(),
+                    url: src.url.clone(),
+                    updated: Timestamp::now().to_string(),
+                    bytes: files.iter().map(|(_, len)| len).sum(),
+                    license: src.license.clone(),
+                    ..index::Mirror::default()
+                },
+            )?;
+            self.record(&id, "ok", &version, "");
+            if let Err(e) = index::write(self.cat, &root.join("preserver")) {
+                tracing::warn!("index: {e:#}");
+            }
+            Ok(())
+        })))
     }
 
     /// Called by the worker when a job stops. A job whose downloads all arrived is verified
     /// and published here; a verification failure turns it into a failed job.
     pub(crate) fn settle(&self, job: &mut Job, root: &Path) {
         if let JobKind::Mirror { set, source } = &job.kind {
-            if job.state == JobState::Done && self.mirror_source(set, source).is_none() {
-                job.state = JobState::Canceled;
+            match job.state {
+                JobState::Done if self.mirror_source(set, source).is_none() => {
+                    job.state = JobState::Canceled;
+                }
+                JobState::Failed => self.record(
+                    &format!("{set}/{source}"),
+                    "failed",
+                    "",
+                    job.error.as_deref().unwrap_or_default(),
+                ),
+                _ => {}
             }
             return;
         }
@@ -262,6 +434,31 @@ impl Public<'_> {
         }
     }
 
+    /// One `info/refs` request: whether the URL speaks smart http, and where it says to go.
+    fn probe(&self, url: &str) -> String {
+        let dl = self.resolver.dl;
+        let mut remote = Remote::new(
+            dl.agent(),
+            dl.throttle(),
+            Arc::default(),
+            1 << 20,
+            Arc::default(),
+        );
+        let url = format!(
+            "{}/info/refs?service=git-upload-pack",
+            url.trim_end_matches('/')
+        );
+        let head = remote
+            .get(&url, &url, std::iter::empty::<&str>())
+            .map_err(std::io::Error::other)
+            .and_then(|mut r| {
+                let mut head = String::new();
+                r.headers.read_to_string(&mut head)?;
+                Ok(head)
+            });
+        probe_text(head)
+    }
+
     /// Resolves a set and prints what a real run would fetch.
     fn dry_run(&self, set: &Set, root: Option<&Path>, w: &mut dyn Write) -> Result<()> {
         writeln!(w, "== {} (estimate {:.1} GB)", set.name, set.estimate)?;
@@ -272,6 +469,17 @@ impl Public<'_> {
         for src in &set.sources {
             if !src.on() {
                 writeln!(w, "   {:<22} disabled: {}", src.name, src.todo)?;
+                continue;
+            }
+            if src.kind() == Kind::Git {
+                writeln!(
+                    w,
+                    "   {:<22} git mirror {} (estimate {:.2} GB): {}",
+                    src.name,
+                    src.url,
+                    src.est,
+                    self.probe(&src.url)
+                )?;
                 continue;
             }
             if src.kind().in_place() {
@@ -390,7 +598,7 @@ fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
     Worker {
         store,
         dl,
-        plan: &|job, root, _| p.plan(job, root).map(Work::from),
+        plan: &|job, root, _| p.plan(job, root),
         settle: &|job, root, _| p.settle(job, root),
         drive: &platform::locate,
     }

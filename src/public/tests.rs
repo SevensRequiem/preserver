@@ -76,7 +76,7 @@ impl Env {
             Worker {
                 store: &self.store,
                 dl: &self.dl,
-                plan: &|job, root, _| p.plan(job, root).map(Work::from),
+                plan: &|job, root, _| p.plan(job, root),
                 settle: &|job, root, _| p.settle(job, root),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
             }
@@ -93,7 +93,7 @@ impl Env {
             Worker {
                 store: &self.store,
                 dl: &self.dl,
-                plan: &|job, root, _| p.plan(job, root).map(Work::from),
+                plan: &|job, root, _| p.plan(job, root),
                 settle: &|job, root, _| p.settle(job, root),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
             }
@@ -473,7 +473,7 @@ fn sets_without_work_are_skipped() {
     };
     let git = Source {
         name: "repo".into(),
-        kind: Some(Kind::Git),
+        kind: Some(Kind::Repo),
         url: "https://example.invalid/r.git".into(),
         ..Source::default()
     };
@@ -875,10 +875,10 @@ fn the_set_budget_leaves_out_in_place_estimates() {
 }
 
 #[test]
-fn an_enabled_mirror_is_skipped_for_now_and_an_orphan_is_canceled() {
+fn an_enabled_repo_mirror_is_skipped_for_now_and_an_orphan_is_canceled() {
     let env = Env::new();
     let drive: DriveId = "0123-ABCD".parse().unwrap();
-    let cat = catalog(2, vec![mirror("g", Kind::Git, 1.0)]);
+    let cat = catalog(2, vec![mirror("g", Kind::Repo, 1.0)]);
     let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
     env.work_queue(&cat);
     assert_eq!(env.store.job(&ids[0].1).unwrap().state, JobState::Done);
@@ -933,4 +933,116 @@ fn record_mirror_drops_stale_rows_and_the_index_never_links_a_url() {
         !html.contains("javascript"),
         "a source that left the catalog has no row"
     );
+}
+
+#[test]
+fn the_fat_decision_table() {
+    for (fstype, est, refused) in [
+        ("vfat", 4_000_000_000, true),
+        ("vfat", 3_999_999_999, false),
+        ("msdos", 100 * GB, true),
+        ("exfat", 100 * GB, false),
+        ("ext4", 100 * GB, false),
+        ("", 100 * GB, false),
+    ] {
+        assert_eq!(fat_refuses(fstype, est), refused, "{fstype} {est}");
+    }
+}
+
+#[test]
+fn a_dry_run_probes_a_git_url() {
+    let env = Env::new();
+    let probe = "info/refs?service=git-upload-pack";
+    let smart = (
+        200,
+        "Content-Type: application/x-git-upload-pack-advertisement\r\n".to_string(),
+    );
+    env.srv.set(|b| {
+        b.replies.insert(format!("smart/{probe}"), smart);
+        b.redirects.insert(
+            format!("moved/{probe}"),
+            "https://elsewhere.example/r.git/info/refs?service=x".into(),
+        );
+        b.routes = Some(HashMap::from([(format!("dumb/{probe}"), b"x".to_vec())]));
+    });
+    let mut cat = catalog(2, Vec::new());
+    cat.sets[0].sources = ["smart", "moved", "dumb", "missing"]
+        .map(|n| Source {
+            url: env.srv.url(n),
+            ..mirror(n, Kind::Git, 0.1)
+        })
+        .into();
+    let mut out = Vec::new();
+    env.with(&cat, (50 * GB, 1000 * GB), |p| {
+        p.dry_run(&cat.sets[0], None, &mut out).unwrap();
+    });
+    let out = String::from_utf8(out).unwrap();
+    for (name, said) in [
+        ("smart", "ok"),
+        ("moved", "redirect to elsewhere.example"),
+        ("dumb", "not smart http"),
+        ("missing", "HTTP 404"),
+    ] {
+        let line = out
+            .lines()
+            .find(|l| l.contains(&format!(" {name} ")))
+            .unwrap();
+        assert!(line.ends_with(&format!("GB): {said}")), "{line}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mirror_job_publishes_a_git_repo() {
+    use crate::git::testcgi::{self, Cgi};
+    use crate::net::throttle::Throttle;
+    use crate::testutil::git;
+
+    let mut env = Env::new();
+    env.dl = Downloader::new(testcgi::agent(), Arc::new(Throttle::new(0)), CHECKPOINT);
+    let remote = TempDir::new();
+    let src = remote.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    std::fs::write(src.join("a"), "one").unwrap();
+    git(&src, &["add", "a"]);
+    git(&src, &["commit", "-q", "-m", "one"]);
+    let want = git(&src, &["rev-parse", "HEAD"]);
+    let cgi = Cgi::start(remote.path(), None);
+    let g = Source {
+        url: cgi.url("src"),
+        license: "MIT".into(),
+        ..mirror("g", Kind::Git, 0.001)
+    };
+    let cat = catalog(2, vec![g]);
+
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    let repo = env.set_dir().join("git/g.git");
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/heads/main"]).trim(),
+        want.trim()
+    );
+    let st = status::Status::read(&env.paths.status_file("public"));
+    let row = st.sets.iter().find(|s| s["name"] == "demo/g").unwrap();
+    assert_eq!(row["state"].as_str(), Some("ok"));
+    assert_eq!(row["version"].as_str(), Some(&want.trim()[..7]));
+    let rows = std::fs::read_to_string(env.set_dir().join("MIRRORS.toml")).unwrap();
+    assert!(
+        rows.contains("name = \"g\"") && rows.contains(&cgi.url("src")),
+        "{rows}"
+    );
+    assert!(env.paths.mnt.join("preserver/INDEX.html").is_file());
+
+    let job = env.sync(&catalog(
+        2,
+        vec![Source {
+            url: cgi.url("nowhere"),
+            ..mirror("g", Kind::Git, 0.001)
+        }],
+    ));
+    assert_eq!(job.state, JobState::Failed);
+    let st = status::Status::read(&env.paths.status_file("public"));
+    let row = st.sets.iter().find(|s| s["name"] == "demo/g").unwrap();
+    assert_eq!(row["state"].as_str(), Some("failed"));
 }

@@ -364,10 +364,6 @@ pub(crate) enum Work<'a> {
     Fetch(Planned),
     /// Work that is not a download (a git transfer): it gets the stop flag and a byte counter.
     /// It is never yielded, since it cannot resume; pause and cancel still stop it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the git mirror job builds it in a later step")
-    )]
     Run(Run<'a>),
 }
 
