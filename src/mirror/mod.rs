@@ -1,6 +1,7 @@
 //! In-place repository mirrors: a tree on the drive that a package manager reads, kept whole
 //! by swapping its metadata in only after every file it names has landed and verified.
 
+pub(crate) mod alpine;
 pub(crate) mod fedora;
 pub(crate) mod generation;
 

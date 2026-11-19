@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 age = { version = "=0.12.1", default-features = false }
 anyhow = "=1.0.104"
+base64ct = "=1.8.3"
 clap = { version = "=4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+flate2 = { version = "=1.1.11", default-features = false, features = ["zlib-rs"] }
 gix = { version = "=0.90.0", default-features = false, features = ["blocking-network-client", "sha1"] }
 gix-transport = { version = "=0.62.0", default-features = false, features = ["blocking-client", "http-client"] }
 jiff = { version = "=0.2.43", default-features = false, features = ["std", "serde", "tz-system", "tzdb-zoneinfo"] }
@@ -19,12 +21,14 @@ minisign-verify = "=0.3.0"
 pgp = { version = "=0.21.1", default-features = false }
 quick-xml = { version = "=0.42.0", default-features = false }
 regex = "=1.13.1"
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
 rpassword = "=7.5.5"
 ruzstd = "=0.9.1"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "=0.7.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+sha1-checked = "=0.10.0"
 sha2 = { version = "=0.10.9", features = ["compress"] }
 tar = { version = "=0.4.46", default-features = false }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "display", "serde"] }
@@ -57,7 +61,8 @@ path = "src/bin/preserver-gui.rs"
 required-features = ["gui"]
 
 [dev-dependencies]
-# Test keys only: its rand_core re-export is the RNG trait rpgp key generation wants.
+# Test keys: its rand_core re-export is the RNG trait rpgp key generation wants, and getrandom
+# lets the Alpine tests make RSA keys.
 # ureq logs through it; the http test captures that output.
 log = "=0.4.35"
 rsa = { version = "=0.9.10", default-features = false, features = ["getrandom"] }

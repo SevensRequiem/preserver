@@ -4621,8 +4621,10 @@ version = "0.1.0"
 dependencies = [
  "age",
  "anyhow",
+ "base64ct",
  "clap",
  "eframe",
+ "flate2",
  "gix",
  "gix-transport",
  "jiff",
@@ -4642,6 +4644,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha1-checked",
  "sha2 0.10.9",
  "tar",
  "toml 1.2.1+spec-1.1.0",

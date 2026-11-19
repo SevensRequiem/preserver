@@ -340,10 +340,22 @@ impl Source {
                 names("suites", &self.suites)?;
                 names("components", &self.components)?;
                 names("arches", &self.arches)?;
-                if format == RepoFormat::Debian
-                    && (self.keyring.is_empty() || self.signers.is_empty())
-                {
-                    bail!("debian needs keyring and signers");
+                if format == RepoFormat::Debian {
+                    if self.keyring.is_empty() || self.signers.is_empty() {
+                        bail!("debian needs keyring and signers");
+                    }
+                    if let Some(f) = self
+                        .signers
+                        .iter()
+                        .find(|f| !keys::listed(&self.keyring, f))
+                    {
+                        bail!(
+                            "signer {f} is not in keys/FINGERPRINTS under {}",
+                            self.keyring
+                        );
+                    }
+                } else {
+                    key_coverage(&self.arches, keys::ALPINE)?;
                 }
             }
         }
@@ -367,6 +379,17 @@ impl Source {
             Regex::new(&self.exclude)?;
         }
         Ok(())
+    }
+}
+
+/// Every arch of an Alpine source needs a pinned key, or its index could not be verified.
+fn key_coverage(arches: &[String], pinned: &[keys::RsaKey<'_>]) -> Result<()> {
+    match arches
+        .iter()
+        .find(|a| !pinned.iter().any(|k| k.arches.contains(&a.as_str())))
+    {
+        Some(a) => bail!("no pinned alpine key for {a} (keys::ALPINE)"),
+        None => Ok(()),
     }
 }
 
@@ -685,11 +708,51 @@ mod tests {
         }
         for good in [
             "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"fedora\"\ntrees = [{ path = \"releases/45/Everything\", metalink = \"repo=fedora-45&arch=x86_64\" }]",
-            "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"alpine\"\nsuites = [\"v3.24\"]\ncomponents = [\"main\"]\narches = [\"x86_64\"]",
+            "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"debian\"\nsuites = [\"trixie\"]\ncomponents = [\"main\"]\narches = [\"amd64\"]\nkeyring = \"debian-cd\"\nsigners = [\"DF9B9C49EAA9298432589D76DA87E80D6294BE9B\"]",
             "name = \"a\"\nkind = \"http\"\nresolve = \"listing\"\ndirs = \"^gcc-\\\\d+/$\"\npattern = \"{dir}x\"",
         ] {
             Catalog::parse(&one(good)).unwrap_or_else(|e| panic!("{good}: {e:#}"));
         }
+    }
+
+    #[test]
+    fn key_validation() {
+        let cases = [
+            (
+                "alpine with no pinned key",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"alpine\"\nsuites = [\"v3.24\"]\ncomponents = [\"main\"]\narches = [\"x86_64\"]",
+                "no pinned alpine key",
+            ),
+            (
+                "debian signer not in FINGERPRINTS",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"debian\"\nsuites = [\"trixie\"]\ncomponents = [\"main\"]\narches = [\"amd64\"]\nkeyring = \"debian-cd\"\nsigners = [\"0000000000000000000000000000000000000000\"]",
+                "not in keys/FINGERPRINTS",
+            ),
+            (
+                "debian signer under another keyring",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"debian\"\nsuites = [\"trixie\"]\ncomponents = [\"main\"]\narches = [\"amd64\"]\nkeyring = \"fedora\"\nsigners = [\"DF9B9C49EAA9298432589D76DA87E80D6294BE9B\"]",
+                "not in keys/FINGERPRINTS",
+            ),
+        ];
+        for (name, source, want) in cases {
+            let err = format!("{:#}", Catalog::parse(&one(source)).unwrap_err());
+            assert!(err.contains(want), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn alpine_key_coverage() {
+        let key = |arches: &'static [&'static str]| keys::RsaKey {
+            name: "k.rsa.pub",
+            arches,
+            pem: "",
+        };
+        let arches = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let pinned = [key(&["x86_64"]), key(&["aarch64", "armv7"])];
+        assert!(key_coverage(&arches(&["x86_64", "aarch64"]), &pinned).is_ok());
+        let err = key_coverage(&arches(&["x86_64", "riscv64"]), &pinned).unwrap_err();
+        assert!(err.to_string().contains("riscv64"), "{err}");
+        assert!(key_coverage(&arches(&["x86_64"]), &[]).is_err());
     }
 
     fn one_set(name: &str, prio: u32) -> String {

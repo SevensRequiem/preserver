@@ -22,3 +22,23 @@ pub(crate) fn find<'a>(rings: &[Keyring<'a>], name: &str) -> Option<&'a [u8]> {
 pub(crate) fn embedded(name: &str) -> Option<&'static [u8]> {
     find(EMBEDDED, name)
 }
+
+/// An Alpine package signing key (an RSA public key, SPKI PEM) and the architectures whose
+/// indexes and packages it signs. `name` is the file name apk puts in `.SIGN.RSA*.<name>`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RsaKey<'a> {
+    pub name: &'a str,
+    pub arches: &'a [&'a str],
+    pub pem: &'a str,
+}
+
+/// Empty until the keys are pinned by hand (H3).
+pub(crate) const ALPINE: &[RsaKey<'static>] = &[];
+
+/// Whether `keys/FINGERPRINTS` lists `fingerprint` as a primary key of the keyring `ring`.
+pub(crate) fn listed(ring: &str, fingerprint: &str) -> bool {
+    include_str!("../keys/FINGERPRINTS")
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .any(|(file, fp)| file.strip_suffix(".gpg") == Some(ring) && fp == fingerprint)
+}

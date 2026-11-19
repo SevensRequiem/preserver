@@ -41,7 +41,7 @@ pub(crate) const GH_API: &str = "https://api.github.com/repos/";
 pub(crate) const HF_BASE: &str = "https://huggingface.co/";
 
 /// A file name that is safe inside the staging directory.
-fn valid_file_name(s: &str) -> bool {
+pub(crate) fn valid_file_name(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_alphanumeric())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._+@~=,-".contains(&b))
