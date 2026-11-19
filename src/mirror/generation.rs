@@ -1008,7 +1008,7 @@ fn present(path: &Path, size: u64) -> Result<bool> {
 }
 
 /// Removes whatever is at `path`; a link is removed, not followed.
-fn remove_any(path: &Path) -> Result<()> {
+pub(crate) fn remove_any(path: &Path) -> Result<()> {
     let r = match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => Err(e),
@@ -1019,7 +1019,7 @@ fn remove_any(path: &Path) -> Result<()> {
 }
 
 /// `ensure_dir` inside the stage, which is ours: anything in the way is removed.
-fn clear_way(root: &Path, rel: &str) -> Result<()> {
+pub(crate) fn clear_way(root: &Path, rel: &str) -> Result<()> {
     let mut p = root.to_path_buf();
     for c in rel.split('/').filter(|c| !c.is_empty()) {
         p.push(c);

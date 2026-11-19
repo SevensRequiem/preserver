@@ -2,7 +2,7 @@
 //! the primary listing of packages. The parsers read nothing from disk or the network.
 
 use super::generation::{Walked, gen_of, live_path, read_header, url_of, valid_path};
-use super::{Anchor, Check, Ctx, Entry, Meta, rel_path};
+use super::{Anchor, Capped, Check, Ctx, Entry, Meta, rel_path};
 use crate::catalog::Source;
 use crate::platform;
 use crate::public::versioned::read_meta;
@@ -12,7 +12,7 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use ruzstd::decoding::StreamingDecoder;
 use sha2::{Digest, Sha256, Sha512};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 const MAX_DEPTH: usize = 32;
@@ -481,24 +481,6 @@ fn primary_of(a: &Anchor, tree: &str) -> Result<(String, u64)> {
     let repomd = parse_repomd(doc)?;
     let (d, open) = repomd.primary()?;
     Ok((format!("{tree}/{}", d.path), open))
-}
-
-/// Hands out at most `left` bytes and fails on more: a primary bigger than its open-size is
-/// a decompression bomb.
-struct Capped<R> {
-    r: R,
-    left: u64,
-}
-
-impl<R: Read> Read for Capped<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.r.read(buf)?;
-        self.left = self
-            .left
-            .checked_sub(n as u64)
-            .ok_or_else(|| io::Error::other("primary is larger than its open-size"))?;
-        Ok(n)
-    }
 }
 
 /// Every package of every tree's primary listing, from the staged metadata.

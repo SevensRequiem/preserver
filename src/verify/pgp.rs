@@ -312,10 +312,6 @@ fn claims(ring: &[SignedPublicKey], sig: &Signature) -> bool {
 /// `clearsigned`, a signature by a key outside the ring is ignored (apt and a distribution
 /// sign with several keys and a mirror holds some of them), but every signature that names a
 /// ring key must verify, and at least one must. Callers pin the returned signers.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Debian walker uses it, a later phase 3 step")
-)]
 pub(crate) fn release(ring: &[SignedPublicKey], doc: &[u8]) -> Result<(Vec<Signer>, String)> {
     let (msg, covered) = cleartext(doc)?;
     let mut signers = Vec::new();

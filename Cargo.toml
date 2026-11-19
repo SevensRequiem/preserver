@@ -67,6 +67,8 @@ required-features = ["gui"]
 log = "=0.4.35"
 rsa = { version = "=0.9.10", default-features = false, features = ["getrandom"] }
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
+# Debian test repositories compress their indexes with it
+lzma-rust2 = { version = "=0.25.0", default-features = false, features = ["std", "xz", "encoder"] }
 
 [lints.rust]
 unsafe_code = "deny"

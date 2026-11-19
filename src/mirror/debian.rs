@@ -1,18 +1,22 @@
 //! Debian `Release` model: what a signed Release says about a suite, which of its index files
 //! to read, and the pool files the indexes name. Nothing here touches the disk or the network.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Debian walker uses it, the next phase 3 step")
-)]
-
 use super::deb822::{self, Stanza};
-use super::generation::valid_path;
-use super::{Check, Entry};
+use super::generation::{Walked, clear_way, remove_any, url_of, valid_path};
+use super::{Anchor, Capped, Check, Ctx, Entry, Meta, rel_path};
 use crate::catalog::Source;
-use crate::resolve::unhex;
+use crate::keys;
+use crate::platform;
+use crate::public::versioned::{link_or_copy, read_meta};
+use crate::resolve::{hex, unhex};
+use crate::verify::pgp;
+use crate::verify::{XZ_MEM_KIB, XZ_RATIO};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufReader, Read};
+use std::path::Path;
+
+const RELEASE_CAP: u64 = 16 << 20;
 
 /// A suite's Release, reduced to what a mirror acts on. File paths are relative to the
 /// suite's `dists/<suite>/`.
@@ -37,6 +41,8 @@ fn stamp(text: &str, what: &str) -> Result<i64> {
 }
 
 fn single(text: &str) -> Result<Stanza> {
+    // A clearsigned text may carry CRLF line ends, which are part of the signed form.
+    let text = text.replace("\r\n", "\n");
     let mut stanzas = deb822::parse(text.as_bytes());
     let first = stanzas.next().context("an empty Release")??;
     ensure!(
@@ -189,6 +195,140 @@ pub(crate) fn pool_files(pool: &mut BTreeMap<String, Entry>, s: &Stanza) -> Resu
     let size = s.get("Size").context("a package with no Size")?;
     let sum = s.get("SHA256").context("a package with no SHA256")?;
     add(pool, entry(path.to_owned(), size, sum)?)
+}
+
+fn release_path(suite: &str) -> String {
+    format!("dists/{suite}/InRelease")
+}
+
+/// The `Date` of the live tree's `InRelease` for `suite`, if it has one. It is read through the
+/// keyring like a fresh one, so a live file that was changed since, or signed by a key the ring
+/// no longer trusts (revoked), does not set the bar: the fresh Release still has to pass the
+/// pinned-signer and validity checks.
+fn live_release(
+    tree: Option<&Path>,
+    ring: &[::pgp::composed::SignedPublicKey],
+    suite: &str,
+) -> Result<Option<(Vec<u8>, i64)>> {
+    let Some(path) = tree.map(|t| rel_path(t, &release_path(suite))) else {
+        return Ok(None);
+    };
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let bytes = read_meta(&path).with_context(|| format!("live {suite} InRelease"))?;
+    let text = match pgp::release(ring, &bytes) {
+        Ok((_, text)) => text,
+        Err(e) => {
+            tracing::warn!("live {suite} InRelease no longer verifies, no rollback bar: {e:#}");
+            return Ok(None);
+        }
+    };
+    Ok(Some((bytes, release_date(&text)?)))
+}
+
+/// Pins a generation to the signed `InRelease` of each suite. A signer must be one the source
+/// pins, and the Release must be newer than the live one and unexpired (`parse_release`). Each
+/// suite's `dists/<suite>` is a swap path, and its chosen indexes are the metadata, fetched by
+/// hash when the Release says it keeps them.
+pub(crate) fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    let ring = pgp::keyring(
+        keys::find(ctx.keys, &src.keyring)
+            .with_context(|| format!("no keyring {:?}", src.keyring))?,
+    );
+    let now = jiff::Timestamp::now().as_second();
+    let mut a = Anchor::default();
+    for suite in &src.suites {
+        let path = release_path(suite);
+        let bytes = ctx.dl.get(&url_of(&src.url, &path), RELEASE_CAP)?;
+        let (signers, text) =
+            pgp::release(&ring, &bytes).with_context(|| format!("{suite} InRelease"))?;
+        ensure!(
+            signers.iter().any(|s| s.pinned(&src.signers).is_ok()),
+            "{suite} InRelease is signed by no pinned key"
+        );
+        // The same Release again is no rollback: the run only completes or repairs it.
+        let live = live_release(ctx.tree, &ring, suite)?
+            .filter(|(b, _)| *b != bytes)
+            .map(|(_, d)| d);
+        let rel =
+            parse_release(&text, suite, now, live).with_context(|| format!("{suite} InRelease"))?;
+        for e in pick(&rel, src).with_context(|| suite.clone())? {
+            let Check::Sha256(h) = e.check;
+            let from = rel.by_hash.then(|| match e.path.rsplit_once('/') {
+                Some((dir, _)) => format!("dists/{suite}/{dir}/by-hash/SHA256/{}", hex(&h)),
+                None => format!("dists/{suite}/by-hash/SHA256/{}", hex(&h)),
+            });
+            a.meta.push(Meta {
+                entry: Entry {
+                    path: format!("dists/{suite}/{}", e.path),
+                    ..e
+                },
+                from,
+            });
+        }
+        a.docs.push((path, bytes));
+        a.swaps.push(format!("dists/{suite}"));
+    }
+    Ok(a)
+}
+
+fn is_listing(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next(),
+        Some("Packages.xz" | "Packages" | "Sources.xz" | "Sources")
+    )
+}
+
+/// The Packages and Sources listings, which are all `walk` reads.
+pub(crate) fn walk_meta(a: &Anchor) -> Vec<&Entry> {
+    a.meta
+        .iter()
+        .map(|m| &m.entry)
+        .filter(|e| is_listing(&e.path))
+        .collect()
+}
+
+/// Every pool file the staged listings name, and a link at each by-hash path of the metadata
+/// (declared to the commit, which accepts it only as a copy of verified metadata). A listing
+/// that is not on the disk is a dry run's, which fetched only the listings.
+pub(crate) fn walk(a: &Anchor, meta: &Path, emit: &mut dyn FnMut(Walked)) -> Result<()> {
+    let mut pool = BTreeMap::new();
+    for e in walk_meta(a) {
+        let file = platform::open_regular(&rel_path(meta, &e.path))
+            .with_context(|| format!("staged {}", e.path))?;
+        let r: Box<dyn Read> = if e.path.strip_suffix(".xz").is_some() {
+            Box::new(Capped {
+                r: lzma_rust2::XzReader::new_mem_limit(BufReader::new(file), true, XZ_MEM_KIB),
+                left: e.size.saturating_mul(XZ_RATIO),
+            })
+        } else {
+            Box::new(file)
+        };
+        for s in deb822::parse(BufReader::new(r)) {
+            pool_files(&mut pool, &s.with_context(|| e.path.clone())?)
+                .with_context(|| e.path.clone())?;
+        }
+    }
+    for m in &a.meta {
+        let Some(from) = &m.from else { continue };
+        let src = rel_path(meta, &m.entry.path);
+        if std::fs::symlink_metadata(&src).is_err() {
+            continue;
+        }
+        let dst = rel_path(meta, from);
+        let (dir, _) = from
+            .rsplit_once('/')
+            .context("a by-hash path at the root")?;
+        clear_way(meta, dir)?;
+        remove_any(&dst)?;
+        ensure!(link_or_copy(&src, &dst), "could not link {from}");
+        emit(Walked::Link(from.clone()));
+    }
+    for e in pool.into_values() {
+        emit(Walked::File(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

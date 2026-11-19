@@ -6,6 +6,8 @@ pub(crate) mod deb822;
 pub(crate) mod debian;
 pub(crate) mod fedora;
 pub(crate) mod generation;
+#[cfg(test)]
+mod testrepo;
 
 use crate::catalog::{RepoFormat, Source};
 use crate::keys::Keyring;
@@ -16,7 +18,7 @@ use generation::{Walked, live_path, read_tsv, url_of};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -122,6 +124,24 @@ pub(crate) fn rel_path(base: &Path, rel: &str) -> PathBuf {
 /// The Fedora metalink service, which production passes in `Ctx`.
 pub(crate) const FEDORA_METALINK: &str = "https://mirrors.fedoraproject.org/metalink";
 
+/// Hands out at most `left` bytes and fails on more: a stream bigger than its open size is a
+/// decompression bomb, and a silent cut would drop entries from a listing.
+pub(crate) struct Capped<R> {
+    pub r: R,
+    pub left: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.left = self
+            .left
+            .checked_sub(n as u64)
+            .ok_or_else(|| io::Error::other("file is larger than its open-size"))?;
+        Ok(n)
+    }
+}
+
 type WalkFn = fn(&Source, &Anchor, &Path, &mut dyn FnMut(Walked)) -> Result<()>;
 
 /// The three steps a format provides, so a test can stand in for a real upstream.
@@ -149,6 +169,7 @@ fn no_walker(src: &Source) -> anyhow::Error {
 fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
     match src.format {
         Some(RepoFormat::Fedora) => fedora::anchor(ctx, src),
+        Some(RepoFormat::Debian) => debian::anchor(ctx, src),
         _ => Err(no_walker(src)),
     }
 }
@@ -156,6 +177,7 @@ fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
 fn walk(src: &Source, a: &Anchor, meta: &Path, emit: &mut dyn FnMut(Walked)) -> Result<()> {
     match src.format {
         Some(RepoFormat::Fedora) => fedora::walk(src, a, meta, emit),
+        Some(RepoFormat::Debian) => debian::walk(a, meta, emit),
         _ => Err(no_walker(src)),
     }
 }
@@ -163,6 +185,7 @@ fn walk(src: &Source, a: &Anchor, meta: &Path, emit: &mut dyn FnMut(Walked)) -> 
 fn walk_meta<'a>(src: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
     match src.format {
         Some(RepoFormat::Fedora) => fedora::walk_meta(src, a),
+        Some(RepoFormat::Debian) => debian::walk_meta(a),
         _ => a.meta.iter().map(|m| &m.entry).collect(),
     }
 }
