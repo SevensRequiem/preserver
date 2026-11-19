@@ -71,10 +71,24 @@ impl Env {
         })
     }
 
+    fn work_queue(&self, cat: &Catalog) {
+        self.with(cat, (900 * GB, 1000 * GB), |p| {
+            Worker {
+                store: &self.store,
+                dl: &self.dl,
+                plan: &|job, root, _| p.plan(job, root).map(Work::from),
+                settle: &|job, root, _| p.settle(job, root),
+                drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
+            }
+            .run(Pass::FRESH)
+            .unwrap();
+        });
+    }
+
     /// One `public` run of the catalog's first set: enqueue, work the queue, return the job.
     fn sync_with(&self, cat: &Catalog, free: (u64, u64)) -> Job {
         let drive: DriveId = "0123-ABCD".parse().unwrap();
-        let ids = enqueue_all(&self.store, &[&cat.sets[0]], &drive, true).unwrap();
+        let ids = enqueue_all(&self.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
         self.with(cat, free, |p| {
             Worker {
                 store: &self.store,
@@ -86,7 +100,7 @@ impl Env {
             .run(Pass::FRESH)
             .unwrap();
         });
-        self.store.job(&ids[0]).unwrap()
+        self.store.job(&ids[0].1).unwrap()
     }
 
     fn sync(&self, cat: &Catalog) -> Job {
@@ -100,8 +114,9 @@ impl Env {
     /// The set's line in status/public.json.
     fn status(&self) -> serde_json::Value {
         let st = status::Status::read(&self.paths.status_file("public"));
-        assert_eq!(st.sets.len(), 1, "{:?}", st.sets);
-        st.sets[0].clone()
+        let sets: Vec<_> = st.sets.iter().filter(|s| s["name"] == "demo").collect();
+        assert_eq!(sets.len(), 1, "{:?}", st.sets);
+        sets[0].clone()
     }
 
     fn fixed(&self, name: &str, path: &str) -> Source {
@@ -332,7 +347,7 @@ fn budget_refusal_skips_the_set() {
         ),
     ];
     for (name, estimate, free) in cases {
-        cat.sets[0].estimate = estimate;
+        cat.sets[0].sources[0].est = estimate;
         let job = env.sync_with(&cat, free);
         assert_eq!(job.state, JobState::Done, "{name}");
         let st = env.status();
@@ -350,7 +365,7 @@ fn budget_refusal_skips_the_set() {
     assert!(env.srv.hits().is_empty(), "a refused set fetches nothing");
     assert!(!env.set_dir().exists());
 
-    cat.sets[0].estimate = 799.0;
+    cat.sets[0].sources[0].est = 799.0;
     assert_eq!(env.sync(&cat).state, JobState::Done);
     assert_eq!(env.status()["state"].as_str(), Some("ok"));
 }
@@ -462,16 +477,17 @@ fn sets_without_work_are_skipped() {
         url: "https://example.invalid/r.git".into(),
         ..Source::default()
     };
-    for (sources, want) in [
-        (vec![off.clone()], "no enabled sources"),
-        (vec![off, git], "git and repo mirrors arrive in phase 3"),
-    ] {
-        let job = env.sync(&catalog(2, sources));
-        assert_eq!(job.state, JobState::Done);
-        let st = env.status();
-        assert_eq!(st["state"].as_str(), Some("skipped"));
-        assert_eq!(st["detail"].as_str(), Some(want));
-    }
+    let job = env.sync(&catalog(2, vec![off.clone()]));
+    assert_eq!(job.state, JobState::Done);
+    let st = env.status();
+    assert_eq!(st["state"].as_str(), Some("skipped"));
+    assert_eq!(st["detail"].as_str(), Some("no enabled sources"));
+
+    env.sync(&catalog(2, vec![off, git]));
+    let st = status::Status::read(&env.paths.status_file("public"));
+    let row = st.sets.iter().find(|s| s["name"] == "demo/repo").unwrap();
+    assert_eq!(row["state"].as_str(), Some("skipped"));
+    assert_eq!(row["detail"].as_str(), Some("arrives later in phase 3"));
     assert!(env.srv.hits().is_empty());
 }
 
@@ -494,20 +510,20 @@ fn enqueue_reuses_waiting_jobs_and_drops_finished_ones() {
     let cat = catalog(2, Vec::new());
     let drive: DriveId = "0123-ABCD".parse().unwrap();
     let sets = [&cat.sets[0]];
-    let first = enqueue_all(&env.store, &sets, &drive, false).unwrap();
+    let first = enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap();
     assert_eq!(
-        enqueue_all(&env.store, &sets, &drive, false).unwrap(),
+        enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap(),
         first
     );
-    let mut job = env.store.job(&first[0]).unwrap();
+    let mut job = env.store.job(&first[0].1).unwrap();
     job.state = JobState::Done;
     env.store.save(&mut job).unwrap();
     // Without the worker lock a finished job is left for the worker to tidy.
-    let second = enqueue_all(&env.store, &sets, &drive, false).unwrap();
+    let second = enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap();
     assert_ne!(second, first);
     assert_eq!(env.store.jobs().unwrap().len(), 2);
     assert_eq!(
-        enqueue_all(&env.store, &sets, &drive, true).unwrap(),
+        enqueue_all(&env.store, &sets, &drive, true, &|_| false).unwrap(),
         second
     );
     assert_eq!(env.store.jobs().unwrap().len(), 1);
@@ -519,9 +535,12 @@ fn enqueue_while_the_daemon_works_retries_a_stopped_job_through_its_control() {
     let cat = catalog(2, Vec::new());
     let drive: DriveId = "0123-ABCD".parse().unwrap();
     let sets = [&cat.sets[0]];
-    let ids = enqueue_all(&env.store, &sets, &drive, false).unwrap();
-    let retries = || env.store.control(Some(&ids[0])).retry;
-    assert_eq!(enqueue_all(&env.store, &sets, &drive, false).unwrap(), ids);
+    let ids = enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap();
+    let retries = || env.store.control(Some(&ids[0].1)).retry;
+    assert_eq!(
+        enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap(),
+        ids
+    );
     assert_eq!(retries(), 0, "a queued job needs no retry");
     for (n, state) in [
         JobState::Failed,
@@ -531,13 +550,16 @@ fn enqueue_while_the_daemon_works_retries_a_stopped_job_through_its_control() {
     .enumerate()
     {
         // The worker applied every earlier retry before the job stopped again.
-        let mut job = env.store.job(&ids[0]).unwrap();
+        let mut job = env.store.job(&ids[0].1).unwrap();
         job.state = state;
         job.retry_seen = retries();
         env.store.save(&mut job).unwrap();
-        assert_eq!(enqueue_all(&env.store, &sets, &drive, false).unwrap(), ids);
+        assert_eq!(
+            enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap(),
+            ids
+        );
         assert_eq!(retries(), u32::try_from(n).unwrap() + 1, "{state:?}");
-        enqueue_all(&env.store, &sets, &drive, false).unwrap();
+        enqueue_all(&env.store, &sets, &drive, false, &|_| false).unwrap();
         assert_eq!(
             retries(),
             u32::try_from(n).unwrap() + 1,
@@ -555,7 +577,7 @@ fn a_daemon_pass_skips_an_idle_queue_without_touching_the_status() {
     // A CLI run holds the queue: the pass leaves it alone, even with work waiting.
     let cat = catalog(2, Vec::new());
     let drive: DriveId = "0123-ABCD".parse().unwrap();
-    enqueue_all(&env.store, &[&cat.sets[0]], &drive, false).unwrap();
+    enqueue_all(&env.store, &[&cat.sets[0]], &drive, false, &|_| false).unwrap();
     let _held = status::try_lock(&env.paths.lock_file("queue"))
         .unwrap()
         .unwrap();
@@ -579,7 +601,9 @@ fn dry_run_lists_what_would_be_fetched() {
         pattern: "x".into(),
         ..gone
     };
-    let cat = catalog(2, vec![env.fixed("src", "d/a.bin"), off, gone]);
+    let mut src = env.fixed("src", "d/a.bin");
+    src.est = 100.0;
+    let cat = catalog(2, vec![src, off, gone]);
     let mut out = Vec::new();
     env.with(&cat, (50 * GB, 1000 * GB), |p| {
         p.dry_run(&cat.sets[0], Some(&env.paths.mnt), &mut out)
@@ -774,4 +798,139 @@ fn list_measures_the_newest_version_per_variant() {
         .collect::<Vec<_>>();
     assert!(isos[0].contains("newest 2026-11-01"), "{text}");
     assert!(isos[1].contains("measured 0"), "{text}");
+}
+
+fn mirror(name: &str, kind: Kind, est: f64) -> Source {
+    Source {
+        name: name.into(),
+        kind: Some(kind),
+        url: "https://example.invalid/m".into(),
+        est,
+        ..Source::default()
+    }
+}
+
+#[test]
+fn enqueue_all_makes_a_set_job_and_a_mirror_job_per_in_place_source() {
+    let env = Env::new();
+    let drive: DriveId = "0123-ABCD".parse().unwrap();
+    let mut cat = catalog(
+        2,
+        vec![
+            env.fixed("src", "d/a.bin"),
+            mirror("g", Kind::Git, 1.0),
+            mirror("r", Kind::Repo, 1.0),
+            Source {
+                enabled: Some(false),
+                todo: "later".into(),
+                ..mirror("off", Kind::Git, 1.0)
+            },
+        ],
+    );
+    let queue = |cat: &Catalog, skip: &dyn Fn(&JobKind) -> bool| {
+        let sets: Vec<&Set> = cat.sets.iter().collect();
+        enqueue_all(&env.store, &sets, &drive, false, skip).unwrap()
+    };
+    let first = queue(&cat, &|_| false);
+    let names: Vec<&str> = first.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["demo", "demo/g", "demo/r"]);
+    assert_eq!(queue(&cat, &|_| false), first, "waiting jobs are reused");
+    assert_eq!(env.store.jobs().unwrap().len(), 3);
+
+    let paused = JobKind::Mirror {
+        set: "demo".into(),
+        source: "g".into(),
+    };
+    let rest = queue(&cat, &|k| *k == paused);
+    assert_eq!(rest.len(), 2, "a paused mirror is skipped: {rest:?}");
+
+    cat.sets[0].sources.remove(0);
+    let names: Vec<String> = queue(&cat, &|_| false)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        names,
+        ["demo/g", "demo/r"],
+        "repo-only sets get mirror jobs only"
+    );
+}
+
+#[test]
+fn the_set_budget_leaves_out_in_place_estimates() {
+    let env = Env::new();
+    env.routes(&[("d/a.bin", b"x")]);
+    let mut cat = catalog(
+        2,
+        vec![env.fixed("src", "d/a.bin"), mirror("g", Kind::Git, 800.0)],
+    );
+    cat.sets[0].sources[0].est = 100.0;
+    let job = env.sync_with(&cat, (900 * GB, 1000 * GB));
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(env.status()["state"].as_str(), Some("ok"));
+    cat.sets[0].sources.remove(1);
+    cat.sets[0].sources[0].est = 950.0;
+    env.sync_with(&cat, (900 * GB, 1000 * GB));
+    assert_eq!(env.status()["state"].as_str(), Some("skipped"));
+}
+
+#[test]
+fn an_enabled_mirror_is_skipped_for_now_and_an_orphan_is_canceled() {
+    let env = Env::new();
+    let drive: DriveId = "0123-ABCD".parse().unwrap();
+    let cat = catalog(2, vec![mirror("g", Kind::Git, 1.0)]);
+    let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
+    env.work_queue(&cat);
+    assert_eq!(env.store.job(&ids[0].1).unwrap().state, JobState::Done);
+    let st = status::Status::read(&env.paths.status_file("public"));
+    assert_eq!(st.sets[0]["name"].as_str(), Some("demo/g"));
+    assert_eq!(st.sets[0]["state"].as_str(), Some("skipped"));
+
+    env.store.remove(&ids[0].1).unwrap();
+    let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
+    env.work_queue(&catalog(2, Vec::new()));
+    assert_eq!(env.store.job(&ids[0].1).unwrap().state, JobState::Canceled);
+    let st = status::Status::read(&env.paths.status_file("public"));
+    assert_eq!(
+        st.sets[0]["detail"].as_str(),
+        Some("source no longer in the catalog")
+    );
+}
+
+#[test]
+fn record_mirror_drops_stale_rows_and_the_index_never_links_a_url() {
+    let env = Env::new();
+    let dir = env.paths.mnt.join("preserver/public/demo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let row = |name: &str, url: &str| index::Mirror {
+        name: name.into(),
+        kind: "git".into(),
+        url: url.into(),
+        bytes: 5,
+        files: Some(2),
+        generation: Some("g1".into()),
+        ..index::Mirror::default()
+    };
+    index::record_mirror(&dir, &["old", "g"], row("old", "https://a")).unwrap();
+    index::record_mirror(&dir, &["g"], row("g", "javascript:alert(1)<b>")).unwrap();
+    let text = std::fs::read_to_string(dir.join("MIRRORS.toml")).unwrap();
+    assert!(!text.contains("old"), "{text}");
+    assert!(text.contains("gen = \"g1\""), "{text}");
+    index::record_mirror(&dir, &["g"], row("g", "https://b")).unwrap();
+    let text = std::fs::read_to_string(dir.join("MIRRORS.toml")).unwrap();
+    assert_eq!(text.matches("[[mirror]]").count(), 1, "{text}");
+
+    index::record_mirror(&dir, &["g"], row("g", "javascript:alert(1)<b>")).unwrap();
+    let cat = catalog(2, vec![mirror("g", Kind::Git, 1.0)]);
+    index::write(&cat, &env.paths.mnt.join("preserver")).unwrap();
+    let html = std::fs::read_to_string(env.paths.mnt.join("preserver/INDEX.html")).unwrap();
+    assert!(html.contains("javascript:alert(1)&lt;b&gt;"), "{html}");
+    assert!(!html.contains("href=\"javascript"), "{html}");
+    assert!(html.contains("href=\"public/demo/git/g.git/\""), "{html}");
+    index::write(&catalog(2, Vec::new()), &env.paths.mnt.join("preserver")).unwrap();
+    let html = std::fs::read_to_string(env.paths.mnt.join("preserver/INDEX.html")).unwrap();
+    assert!(
+        !html.contains("javascript"),
+        "a source that left the catalog has no row"
+    );
 }

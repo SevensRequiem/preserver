@@ -52,7 +52,8 @@ pub(crate) fn real_env<T>(
 pub(crate) fn label(kind: &JobKind) -> &'static str {
     match kind {
         JobKind::Local => "local folders",
-        _ => "GitHub",
+        JobKind::Github { .. } => "GitHub",
+        JobKind::Set { .. } | JobKind::Mirror { .. } | JobKind::Copy { .. } => "job",
     }
 }
 

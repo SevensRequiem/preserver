@@ -138,6 +138,23 @@ pub(crate) enum Extract {
     Zig,
 }
 
+/// The layout of a `repo` source, which picks its walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RepoFormat {
+    Fedora,
+    Debian,
+    Alpine,
+}
+
+/// One tree of a Fedora source: its path under the mirror and the metalink that names it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Tree {
+    pub path: String,
+    pub metalink: String,
+}
+
 /// What a detached signature covers when it isn't the file as downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -177,6 +194,18 @@ pub(crate) struct Source {
     pub minisign: String,
     /// The embedded keyring a downloaded key file must still match.
     pub stored: String,
+
+    /// Repo sources only.
+    pub format: Option<RepoFormat>,
+    pub suites: Vec<String>,
+    pub components: Vec<String>,
+    pub arches: Vec<String>,
+    pub trees: Vec<Tree>,
+    /// Listing sources: a regex (`^…/$`) over the directories to descend into, how many of
+    /// the newest to take, and a regex for the ones to leave out.
+    pub dirs: String,
+    pub dir_top: usize,
+    pub exclude: String,
 }
 
 impl Source {
@@ -202,6 +231,15 @@ impl Source {
             }
             return Ok(());
         }
+        if !self.todo.is_empty() {
+            bail!("enabled with a todo: disable it or finish it");
+        }
+        if let Some(u) = std::iter::once(&self.url)
+            .chain(&self.urls)
+            .find(|u| !u.is_empty() && !u.starts_with("https://"))
+        {
+            bail!("{u:?} is not an https url");
+        }
         match kind {
             Kind::Git | Kind::Repo if self.url.is_empty() => bail!("needs url"),
             Kind::Hf if self.repo.is_empty() || self.assets.is_empty() => {
@@ -214,8 +252,19 @@ impl Source {
             },
             _ => {}
         }
+        if kind.in_place() {
+            let version_dir = Regex::new(r"^\d{4}-\d{2}-\d{2}(-\d+)?$")?;
+            if self.name == "git" || version_dir.is_match(&self.name) {
+                bail!("reserved name for an in-place source");
+            }
+        }
+        self.validate_format(kind)?;
+        self.validate_listing()?;
         if !self.pattern.is_empty() {
-            Regex::new(&self.pattern)?;
+            Regex::new(&self.pattern.replace("{dir}", "x"))?;
+        }
+        if self.pattern.contains("{dir}") && self.dirs.is_empty() {
+            bail!("{{dir}} in pattern needs dirs");
         }
         if let Some(f) = self.signers.iter().find(|f| !valid_fingerprint(f)) {
             bail!("bad signer fingerprint {f:?}");
@@ -232,6 +281,90 @@ impl Source {
             if !ring.is_empty() && keys::embedded(ring).is_none() {
                 bail!("keyring {ring:?} is not in keys/ (fetch and pin it, see keys/fetch.sh)");
             }
+        }
+        Ok(())
+    }
+}
+
+impl Source {
+    fn validate_format(&self, kind: Kind) -> Result<()> {
+        let Some(format) = self.format else {
+            if kind == Kind::Repo {
+                bail!("repo needs format");
+            }
+            if !(self.suites.is_empty()
+                && self.components.is_empty()
+                && self.arches.is_empty()
+                && self.trees.is_empty())
+            {
+                bail!("suites, components, arches and trees are for repo sources");
+            }
+            return Ok(());
+        };
+        if kind != Kind::Repo {
+            bail!("format is for repo sources");
+        }
+        let names = |what: &str, v: &[String]| {
+            if v.is_empty() || v.iter().any(|n| !valid_name(n)) {
+                bail!("{format:?} needs {what}, each a plain name");
+            }
+            Ok(())
+        };
+        match format {
+            RepoFormat::Fedora => {
+                if !(self.suites.is_empty() && self.components.is_empty() && self.arches.is_empty())
+                {
+                    bail!("fedora takes trees only");
+                }
+                if self.trees.is_empty() {
+                    bail!("fedora needs trees");
+                }
+                for t in &self.trees {
+                    if t.path.is_empty() || t.path.split('/').any(|seg| !valid_name(seg)) {
+                        bail!("bad tree path {:?}", t.path);
+                    }
+                    if t.metalink.is_empty()
+                        || !t
+                            .metalink
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"=&_.-".contains(&b))
+                    {
+                        bail!("bad metalink {:?}", t.metalink);
+                    }
+                }
+            }
+            RepoFormat::Debian | RepoFormat::Alpine => {
+                if !self.trees.is_empty() {
+                    bail!("trees are for fedora");
+                }
+                names("suites", &self.suites)?;
+                names("components", &self.components)?;
+                names("arches", &self.arches)?;
+                if format == RepoFormat::Debian
+                    && (self.keyring.is_empty() || self.signers.is_empty())
+                {
+                    bail!("debian needs keyring and signers");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_listing(&self) -> Result<()> {
+        if self.dirs.is_empty() && self.dir_top == 0 && self.exclude.is_empty() {
+            return Ok(());
+        }
+        if self.resolve != Some(Resolve::Listing) {
+            bail!("dirs, dir_top and exclude need resolve = \"listing\"");
+        }
+        if !self.dirs.is_empty() {
+            if !(self.dirs.starts_with('^') && self.dirs.ends_with("/$")) {
+                bail!("dirs must look like ^...../$");
+            }
+            Regex::new(&self.dirs)?;
+        }
+        if !self.exclude.is_empty() {
+            Regex::new(&self.exclude)?;
         }
         Ok(())
     }
@@ -386,12 +519,12 @@ mod tests {
             ("unknown kind", "name = \"a\"\nkind = \"ftp\"", "catalog"),
             (
                 "bad name",
-                "name = \"../a\"\nkind = \"git\"\nurl = \"u\"",
+                "name = \"../a\"\nkind = \"git\"\nurl = \"https://x\"",
                 "bad name",
             ),
             (
                 "hidden name",
-                "name = \".a\"\nkind = \"git\"\nurl = \"u\"",
+                "name = \".a\"\nkind = \"git\"\nurl = \"https://x\"",
                 "bad name",
             ),
             (
@@ -446,7 +579,7 @@ mod tests {
             ),
             (
                 "unknown field",
-                "name = \"a\"\nkind = \"git\"\nurl = \"u\"\nurll = \"x\"",
+                "name = \"a\"\nkind = \"git\"\nurl = \"https://x\"\nurll = \"x\"",
                 "catalog",
             ),
         ];
@@ -461,10 +594,102 @@ mod tests {
         assert_eq!(ok.sets[0].keep, 2);
         let dup = format!(
             "{}{}",
-            one("name = \"a\"\nkind = \"git\"\nurl = \"u\""),
+            one("name = \"a\"\nkind = \"git\"\nurl = \"https://x\""),
             one("")
         );
         assert!(Catalog::parse(&dup).is_err(), "duplicate set");
+    }
+
+    #[test]
+    fn mirror_source_validation() {
+        let cases = [
+            (
+                "git over http",
+                "name = \"a\"\nkind = \"git\"\nurl = \"http://x\"",
+                "not an https url",
+            ),
+            (
+                "static url over ftp",
+                "name = \"a\"\nkind = \"http\"\nresolve = \"static\"\nurls = [\"https://x\", \"ftp://y\"]",
+                "not an https url",
+            ),
+            (
+                "enabled with a todo",
+                "name = \"a\"\nkind = \"git\"\nurl = \"https://x\"\ntodo = \"later\"",
+                "enabled with a todo",
+            ),
+            (
+                "reserved name git",
+                "name = \"git\"\nkind = \"git\"\nurl = \"https://x\"",
+                "reserved name",
+            ),
+            (
+                "version-like name",
+                "name = \"2026-11-18-2\"\nkind = \"git\"\nurl = \"https://x\"",
+                "reserved name",
+            ),
+            (
+                "repo without format",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"",
+                "needs format",
+            ),
+            (
+                "format on a git source",
+                "name = \"a\"\nkind = \"git\"\nurl = \"https://x\"\nformat = \"alpine\"",
+                "format is for repo",
+            ),
+            (
+                "fedora without trees",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"fedora\"",
+                "fedora needs trees",
+            ),
+            (
+                "fedora tree path escapes",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"fedora\"\ntrees = [{ path = \"../x\", metalink = \"repo=f45\" }]",
+                "bad tree path",
+            ),
+            (
+                "fedora metalink with a slash",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"fedora\"\ntrees = [{ path = \"a/b\", metalink = \"x/y\" }]",
+                "bad metalink",
+            ),
+            (
+                "debian without signers",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"debian\"\nsuites = [\"trixie\"]\ncomponents = [\"main\"]\narches = [\"amd64\"]\nkeyring = \"fedora\"",
+                "keyring and signers",
+            ),
+            (
+                "alpine without arches",
+                "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"alpine\"\nsuites = [\"v3.24\"]\ncomponents = [\"main\"]",
+                "needs arches",
+            ),
+            (
+                "dirs without listing",
+                "name = \"a\"\nkind = \"http\"\nresolve = \"static\"\ndirs = \"^a/$\"",
+                "need resolve",
+            ),
+            (
+                "bad dirs shape",
+                "name = \"a\"\nkind = \"http\"\nresolve = \"listing\"\ndirs = \"a\"",
+                "dirs must look like",
+            ),
+            (
+                "dir in pattern without dirs",
+                "name = \"a\"\nkind = \"http\"\nresolve = \"listing\"\npattern = \"{dir}x\"",
+                "needs dirs",
+            ),
+        ];
+        for (name, source, want) in cases {
+            let err = format!("{:#}", Catalog::parse(&one(source)).unwrap_err());
+            assert!(err.contains(want), "{name}: {err}");
+        }
+        for good in [
+            "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"fedora\"\ntrees = [{ path = \"releases/45/Everything\", metalink = \"repo=fedora-45&arch=x86_64\" }]",
+            "name = \"a\"\nkind = \"repo\"\nurl = \"https://x\"\nformat = \"alpine\"\nsuites = [\"v3.24\"]\ncomponents = [\"main\"]\narches = [\"x86_64\"]",
+            "name = \"a\"\nkind = \"http\"\nresolve = \"listing\"\ndirs = \"^gcc-\\\\d+/$\"\npattern = \"{dir}x\"",
+        ] {
+            Catalog::parse(&one(good)).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
     }
 
     fn one_set(name: &str, prio: u32) -> String {
@@ -490,8 +715,8 @@ mod tests {
     #[test]
     fn variants() {
         let base = "[[set]]\nname = \"s\"\ntitle = \"t\"\npriority = 0\nestimate = 9\n\
-            [[set.source]]\nname = \"a\"\nkind = \"git\"\nurl = \"u\"\nest = 1\n\
-            [[set.source]]\nname = \"b\"\nkind = \"git\"\nurl = \"u\"\nest = 2\n";
+            [[set.source]]\nname = \"a\"\nkind = \"git\"\nurl = \"https://x\"\nest = 1\n\
+            [[set.source]]\nname = \"b\"\nkind = \"git\"\nurl = \"https://x\"\nest = 2\n";
         let with = |v: &str| format!("{base}{v}");
         let c = Catalog::parse(&with(
             "[[set.variant]]\nname = \"small\"\nsources = [\"a\"]\n",

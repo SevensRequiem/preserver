@@ -10,6 +10,11 @@ pub(crate) enum JobKind {
     Set {
         set: String,
     },
+    /// One in-place (`git` or `repo`) source of a set.
+    Mirror {
+        set: String,
+        source: String,
+    },
     /// `preserver copy`: the archive from the primary (`Job::drive`) to `target`.
     Copy {
         target: Target,
@@ -117,7 +122,7 @@ pub(crate) enum Lane {
 impl JobKind {
     pub(crate) fn lane(&self) -> Lane {
         match self {
-            Self::Set { .. } => Lane::Download,
+            Self::Set { .. } | Self::Mirror { .. } => Lane::Download,
             Self::Copy { .. } => Lane::Copy,
             Self::Github { .. } | Self::Local => Lane::Personal,
         }
@@ -246,6 +251,14 @@ mod tests {
         }
         let gh: JobKind = serde_json::from_str(r#"{"github":{}}"#).unwrap();
         assert_eq!(gh, JobKind::Github { transport: None });
+        let mirror = JobKind::Mirror {
+            set: "s".into(),
+            source: "x".into(),
+        };
+        let k: JobKind = serde_json::from_str(&serde_json::to_string(&mirror).unwrap()).unwrap();
+        assert_eq!(k, mirror);
+        assert_eq!(k.lane(), Lane::Download);
+        assert!(!k.same(&JobKind::Set { set: "s".into() }));
         let old: JobKind = serde_json::from_str(r#"{"set":{"set":"a"}}"#).unwrap();
         assert_eq!(old.lane(), Lane::Download);
         let old: JobState = serde_json::from_str(r#"{"blocked":"drive_absent"}"#).unwrap();

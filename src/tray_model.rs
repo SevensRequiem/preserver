@@ -194,6 +194,15 @@ fn job_label(j: &queue::Job) -> String {
             p.files_total
         )
     };
+    let public = || match percent(p) {
+        Some(pc) => format!(
+            "{pc}% ({}/{} GB)",
+            gb(p.bytes_done, 2),
+            gb(p.bytes_total, 2)
+        ),
+        None if p.files_total > 0 => format!("files {}/{}", p.files_done, p.files_total),
+        None => "running".to_string(),
+    };
     let (name, running) = match &j.kind {
         JobKind::Github { .. } => (
             "GitHub".to_string(),
@@ -211,18 +220,8 @@ fn job_label(j: &queue::Job) -> String {
                 "starting".to_string()
             },
         ),
-        JobKind::Set { set } => (
-            format!("Public {set}"),
-            match percent(p) {
-                Some(pc) => format!(
-                    "{pc}% ({}/{} GB)",
-                    gb(p.bytes_done, 2),
-                    gb(p.bytes_total, 2)
-                ),
-                None if p.files_total > 0 => format!("files {}/{}", p.files_done, p.files_total),
-                None => "running".to_string(),
-            },
-        ),
+        JobKind::Set { set } => (format!("Public {set}"), public()),
+        JobKind::Mirror { set, source } => (format!("Public {set}/{source}"), public()),
         JobKind::Copy { target, .. } => (
             format!("Copy to {}", target.name()),
             percent(p).map_or_else(|| "copying".to_string(), |pc| format!("{pc}%")),
@@ -279,7 +278,7 @@ fn commands(i: &Inputs) -> Vec<CommandItem> {
         || running(|j| j.kind == JobKind::Local);
     let public = starts(&Command::Public)
         || i.public.running()
-        || running(|j| matches!(j.kind, JobKind::Set { .. }));
+        || running(|j| matches!(j.kind, JobKind::Set { .. } | JobKind::Mirror { .. }));
     let mut out = vec![
         CommandItem {
             cmd: Command::Personal,

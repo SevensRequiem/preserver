@@ -635,6 +635,7 @@ kind = "git"
 url = "https://github.com/fosslinux/live-bootstrap"
 est = 0.1
 license = "GPL-3.0"
+enabled = false
 todo = "the stage0-posix and builder-hex0 submodules are not mirrored by a bare mirror: add them as their own git sources"
 
 [[set.source]]
@@ -870,7 +871,7 @@ kind = "git"
 url = "https://github.com/leejet/stable-diffusion.cpp"
 est = 0.1
 license = "MIT"
-todo = "submodules are not mirrored by a bare mirror"
+# submodules are not mirrored by a bare mirror (out of scope)
 
 [[set.source]]
 name = "ollama"
@@ -1442,7 +1443,8 @@ kind = "git"
 url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 est = 6
 license = "GPL-2.0"
-todo = "seeding from clone.bundle would save time; a plain mirror works but the first fetch is slow"
+enabled = false
+todo = "closure-check cost measured (H7); clone.bundle stays a note: gix 0.90 cannot read bundles"
 
 [[set.source]]
 name = "llvm-bin"

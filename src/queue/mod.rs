@@ -21,6 +21,7 @@ fn print(jobs: &[Job]) {
         let p = &j.progress;
         let what = match &j.kind {
             JobKind::Set { set } => format!("set {set}"),
+            JobKind::Mirror { set, source } => format!("mirror {set}/{source}"),
             JobKind::Copy { target, .. } => format!("copy -> {}", target.name()),
             JobKind::Github { .. } => "github".to_string(),
             JobKind::Local => "local folders".to_string(),

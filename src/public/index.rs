@@ -1,10 +1,12 @@
 use super::gb;
 use super::versioned::{plain_dirs, read_meta, read_set_file, version_dirs};
 use crate::catalog::Catalog;
+use crate::platform;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::Path;
 
 const HEAD: &str = r#"<!doctype html>
@@ -28,21 +30,61 @@ td,th{text-align:left;padding:.2rem .6rem .2rem 0;border-bottom:1px solid var(--
 <p class="dim">Everything under <code>public/</code> is plaintext. Each version directory holds <code>SET.toml</code> (sources, versions, signer, license) and <code>SHA256SUMS</code>. Check a copy with <code>cd public/SET/VERSION &amp;&amp; sha256sum -c SHA256SUMS</code>. Upstream signatures sit next to their files.</p>
 "#;
 
-/// `MIRRORS.toml`, which git and repo mirrors keep next to their set.
-#[derive(Default, Deserialize)]
+/// One row of `MIRRORS.toml`, which git and repo mirrors keep next to their set.
+#[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
-struct Mirror {
-    name: String,
-    kind: String,
-    updated: String,
-    bytes: u64,
-    license: String,
+pub(crate) struct Mirror {
+    pub name: String,
+    pub kind: String,
+    pub url: String,
+    pub updated: String,
+    pub bytes: u64,
+    pub files: Option<u64>,
+    #[serde(rename = "gen")]
+    pub generation: Option<String>,
+    pub license: String,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
-struct Mirrors {
-    mirror: Vec<Mirror>,
+pub(crate) struct Mirrors {
+    pub mirror: Vec<Mirror>,
+}
+
+fn read_mirrors(dir: &Path) -> Mirrors {
+    read_meta(&dir.join("MIRRORS.toml"))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Replaces (or adds) the row of `m.name` in `<set_dir>/MIRRORS.toml` and drops the rows of
+/// sources that are not in `sources`. The only writer of the file.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the mirror walkers that call it arrive in later steps"
+    )
+)]
+pub(crate) fn record_mirror(set_dir: &Path, sources: &[&str], m: Mirror) -> Result<()> {
+    let path = set_dir.join("MIRRORS.toml");
+    let mut all: Mirrors = match read_meta(&path) {
+        Ok(b) => toml::from_str(&String::from_utf8(b)?)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Mirrors::default(),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    all.mirror
+        .retain(|x| x.name != m.name && sources.contains(&x.name.as_str()));
+    all.mirror.push(m);
+    let tmp = set_dir.join(".MIRRORS.toml.tmp");
+    let mut f = std::fs::File::create(&tmp).with_context(|| tmp.display().to_string())?;
+    f.write_all(toml::to_string(&all)?.as_bytes())?;
+    f.sync_all()?;
+    let dest = set_dir.join("MIRRORS.toml");
+    std::fs::rename(&tmp, &dest).with_context(|| dest.display().to_string())?;
+    platform::sync_dir(set_dir).with_context(|| set_dir.display().to_string())
 }
 
 /// Text from the drive and the catalog, made safe for element content and attribute values.
@@ -93,19 +135,25 @@ fn render(cat: &Catalog, public: &Path) -> String {
                 v = esc(&v),
             );
         }
-        let mirrors: Mirrors = read_meta(&dir.join("MIRRORS.toml"))
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default();
         let mut rows = String::new();
-        for m in &mirrors.mirror {
+        for m in &read_mirrors(&dir).mirror {
+            // Rows of sources that left the catalog are dropped, and only a current source
+            // name becomes a link; the url is text, never a link.
+            if !set.sources.iter().any(|s| s.name == m.name) {
+                continue;
+            }
             license(&m.license);
+            let name = esc(&m.name);
+            let shown = if m.kind == "git" {
+                format!("public/{}/git/{name}.git/", esc(&set.name))
+            } else {
+                format!("public/{}/{name}/", esc(&set.name))
+            };
             let _ = writeln!(
                 rows,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                esc(&m.name),
+                "<tr><td><a href=\"{shown}\">{name}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&m.kind),
+                esc(&m.url),
                 gb(m.bytes),
                 esc(&m.updated)
             );
@@ -134,7 +182,7 @@ fn render(cat: &Catalog, public: &Path) -> String {
         }
         if !rows.is_empty() {
             out.push_str(
-                "<table>\n<tr><th>Mirror</th><th>Kind</th><th>Size</th><th>Updated</th></tr>\n",
+                "<table>\n<tr><th>Mirror</th><th>Kind</th><th>Source</th><th>Size</th><th>Updated</th></tr>\n",
             );
             out.push_str(&rows);
             out.push_str("</table>\n");

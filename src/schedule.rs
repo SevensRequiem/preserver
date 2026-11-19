@@ -191,20 +191,16 @@ fn try_tick(paths: &Paths, now: &Zoned, public_queued: &mut Option<Timestamp>) -
     }
     // Every set, also when some have not finished: `enqueue` reuses a set's waiting job and
     // retries a stopped one. A set a person paused stays paused.
-    let paused: Vec<&str> = jobs
+    let paused: Vec<&JobKind> = jobs
         .iter()
-        .filter_map(|j| match &j.kind {
-            JobKind::Set { set } if j.state == JobState::Paused => Some(set.as_str()),
-            _ => None,
-        })
+        .filter(|j| j.state == JobState::Paused)
+        .map(|j| &j.kind)
         .collect();
     let cat = Catalog::embedded()?;
-    let sets: Vec<_> = cat
-        .select(&[], false)?
-        .into_iter()
-        .filter(|set| !paused.contains(&set.name.as_str()))
-        .collect();
-    let ids = public::enqueue_all(&store, &sets, &cfg.primary_uuid, false)?;
+    let sets: Vec<_> = cat.select(&[], false)?.into_iter().collect();
+    let ids = public::enqueue_all(&store, &sets, &cfg.primary_uuid, false, &|k| {
+        paused.contains(&k)
+    })?;
     *public_queued = Some(now.timestamp());
     tracing::info!("schedule: queued {} public sets", ids.len());
     Ok(())
@@ -381,12 +377,23 @@ mod tests {
         assert_eq!(ctl(&stopped[2]).retry, 0, "paused stays paused");
         assert_eq!(queued, Some(now.timestamp()));
         let jobs = store.jobs().unwrap();
-        for name in &names {
+        for set in cat.select(&[], false).unwrap() {
+            let on = |s: &&crate::catalog::Source| s.on();
+            let mirrors = set
+                .sources
+                .iter()
+                .filter(on)
+                .filter(|s| s.kind().in_place())
+                .count();
+            let versioned = set.sources.iter().filter(on).any(|s| !s.kind().in_place());
+            let want = mirrors + usize::from(versioned || mirrors == 0);
             let n = jobs
                 .iter()
-                .filter(|j| matches!(&j.kind, JobKind::Set { set } if set == name))
+                .filter(|j| {
+                    matches!(&j.kind, JobKind::Set { set: n } | JobKind::Mirror { set: n, .. } if *n == set.name)
+                })
                 .count();
-            assert_eq!(n, 1, "{name}");
+            assert_eq!(n, want, "{}", set.name);
         }
     }
 

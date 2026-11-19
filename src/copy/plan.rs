@@ -345,7 +345,7 @@ pub(crate) fn plan(inp: &Inputs) -> Result<Plan> {
     for s in &inp.sets {
         if s.version.is_empty() {
             p.dropped
-                .push((s.name.clone(), "not mirrored on the primary".into()));
+                .push((s.name.clone(), "no versioned files on the primary (git and repo mirror trees are not copied until phase 4)".into()));
             continue;
         }
         let mut sk = Vec::new();
@@ -938,7 +938,7 @@ mod tests {
             p.dropped,
             [
                 ("kit".to_string(), "not on the primary yet".to_string()),
-                ("s".to_string(), "not mirrored on the primary".to_string())
+                ("s".to_string(), "no versioned files on the primary (git and repo mirror trees are not copied until phase 4)".to_string())
             ]
         );
         assert!(render(&p, "T", &inp.limits).contains("left out:"));

@@ -55,17 +55,29 @@ impl Public<'_> {
         root.join("preserver").join("public")
     }
 
-    /// Refuses a set whose estimate would eat into the reserve. Otherwise returns how many
-    /// bytes the set may still take, the reserve kept free.
-    fn budget(&self, set: &Set, root: &Path) -> Result<u64> {
+    /// Bytes the drive can still take with the reserve kept free.
+    fn room(&self, root: &Path) -> Result<u64> {
         let (free, total) = (self.free)(root)?;
-        let reserve = total / 100 * u64::from(self.reserve_percent);
+        Ok(free.saturating_sub(total / 100 * u64::from(self.reserve_percent)))
+    }
+
+    /// Refuses a set whose estimate would eat into the reserve. Otherwise returns how many
+    /// bytes the set may still take, the reserve kept free. In-place sources are budgeted by
+    /// their own jobs, so their estimates are left out here.
+    fn budget(&self, set: &Set, root: &Path) -> Result<u64> {
+        let left = self.room(root)?;
+        let versioned: f64 = set
+            .sources
+            .iter()
+            .filter(|s| s.on() && !s.kind().in_place())
+            .map(|s| s.est)
+            .sum();
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "a catalog estimate in GB, far below u64::MAX bytes"
         )]
-        let estimate = (set.estimate * 1e9) as u64;
+        let estimate = (versioned.max(0.0) * 1e9) as u64;
         // A resumed job's stage holds part of the set already. A stage of an older plan is
         // deleted by prepare(), so its bytes come back as free space.
         let mut staged = Vec::new();
@@ -75,15 +87,15 @@ impl Public<'_> {
         }
         let held: u64 = staged.iter().map(|(_, len)| len).sum();
         let need = estimate.saturating_sub(held);
-        if free < reserve || need > free - reserve {
+        if need > left {
             bail!(
                 "budget: needs about {}, {} free above the {}% reserve",
                 gb(need),
-                gb(free.saturating_sub(reserve)),
+                gb(left),
                 self.reserve_percent
             );
         }
-        Ok(free - reserve + held)
+        Ok(left + held)
     }
 
     /// The set's line in `status/public.json`.
@@ -137,8 +149,10 @@ impl Public<'_> {
     /// The worker's planner: what a set job has to download. A set that needs nothing (no
     /// usable source, over budget, unchanged) is recorded here and plans no files.
     pub(crate) fn plan(&self, job: &Job, root: &Path) -> Result<Vec<Fetch>> {
-        let JobKind::Set { set: name } = &job.kind else {
-            bail!("not a set job");
+        let name = match &job.kind {
+            JobKind::Set { set } => set,
+            JobKind::Mirror { set, source } => return Ok(self.plan_mirror(set, source)),
+            _ => bail!("not a public job"),
         };
         let set = self
             .cat
@@ -189,9 +203,38 @@ impl Public<'_> {
         }
     }
 
+    /// The enabled in-place source a Mirror job names, if the catalog still has it.
+    fn mirror_source(&self, set: &str, source: &str) -> Option<&Source> {
+        self.cat
+            .sets
+            .iter()
+            .find(|s| s.name == set)?
+            .sources
+            .iter()
+            .find(|s| s.name == source && s.on() && s.kind().in_place())
+    }
+
+    /// The mirror walkers arrive in later steps of phase 3; until then an enabled source only
+    /// records that it was skipped. A source gone from the catalog ends the job in `settle`.
+    fn plan_mirror(&self, set: &str, source: &str) -> Vec<Fetch> {
+        let detail = if self.mirror_source(set, source).is_some() {
+            "arrives later in phase 3"
+        } else {
+            "source no longer in the catalog"
+        };
+        self.record(&format!("{set}/{source}"), "skipped", "", detail);
+        Vec::new()
+    }
+
     /// Called by the worker when a job stops. A job whose downloads all arrived is verified
     /// and published here; a verification failure turns it into a failed job.
     pub(crate) fn settle(&self, job: &mut Job, root: &Path) {
+        if let JobKind::Mirror { set, source } = &job.kind {
+            if job.state == JobState::Done && self.mirror_source(set, source).is_none() {
+                job.state = JobState::Canceled;
+            }
+            return;
+        }
         let JobKind::Set { set } = &job.kind else {
             return;
         };
@@ -267,22 +310,46 @@ impl Public<'_> {
     }
 }
 
-/// Queues a job per set (`Store::enqueue`, earlier sets first) and returns the ids in set order.
+/// Queues a Set job per set that has a versioned source (or no enabled in-place one) and a Mirror job per
+/// enabled in-place source, earlier sets first, except the jobs `skip` names. Returns each
+/// job's name (`set` or `set/source`) and id.
 pub(crate) fn enqueue_all(
     store: &Store,
     sets: &[&Set],
     drive: &DriveId,
     tidy: bool,
-) -> Result<Vec<String>> {
-    sets.iter()
-        .enumerate()
-        .map(|(i, set)| {
-            let kind = JobKind::Set {
-                set: set.name.clone(),
-            };
-            store.enqueue(&kind, drive, u32::try_from(i).unwrap_or(u32::MAX), tidy)
-        })
-        .collect()
+    skip: &dyn Fn(&JobKind) -> bool,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (i, set) in sets.iter().enumerate() {
+        let prio = u32::try_from(i).unwrap_or(u32::MAX);
+        let in_place = |s: &&Source| s.on() && s.kind().in_place();
+        let set_job = (!set.sources.iter().any(|s| in_place(&s))
+            || set.sources.iter().any(|s| s.on() && !s.kind().in_place()))
+        .then(|| {
+            (
+                set.name.clone(),
+                JobKind::Set {
+                    set: set.name.clone(),
+                },
+            )
+        });
+        let mirrors = set.sources.iter().filter(in_place).map(|s| {
+            (
+                format!("{}/{}", set.name, s.name),
+                JobKind::Mirror {
+                    set: set.name.clone(),
+                    source: s.name.clone(),
+                },
+            )
+        });
+        for (name, kind) in set_job.into_iter().chain(mirrors) {
+            if !skip(&kind) {
+                out.push((name, store.enqueue(&kind, drive, prio, tidy)?));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn downloader(cfg: &Config) -> Downloader {
@@ -366,14 +433,19 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
         work(&public(&cat, paths, &cfg, &dl), &store, &dl, pass)?;
         let mut errs = Vec::new();
         for j in store.jobs()? {
-            let JobKind::Set { set } = &j.kind else {
-                continue;
+            let name = match &j.kind {
+                JobKind::Mirror { set, source } => format!("{set}/{source}"),
+                JobKind::Set { set } => set.clone(),
+                _ => continue,
             };
             match j.state {
                 // Nobody waits on the result here, unlike run(): the worker tidies up.
                 JobState::Done | JobState::Canceled => store.remove(&j.id)?,
                 JobState::Failed if j.updated >= start => {
-                    errs.push(format!("{set}: {}", j.error.as_deref().unwrap_or_default()));
+                    errs.push(format!(
+                        "{name}: {}",
+                        j.error.as_deref().unwrap_or_default()
+                    ));
                 }
                 _ => {}
             }
@@ -472,7 +544,8 @@ pub(crate) fn run(
     actions::mount(&cfg.primary_uuid);
     let store = Store::new(paths.queue.clone());
     let Some((_lock, ids)) = actions::handoff(paths, "queue", foreground, |tidy| {
-        enqueue_all(&store, &sets, &cfg.primary_uuid, tidy)
+        let jobs = enqueue_all(&store, &sets, &cfg.primary_uuid, tidy, &|_| false)?;
+        Ok(jobs.into_iter().map(|(_, id)| id).collect())
     })?
     else {
         return Ok(());
@@ -481,14 +554,19 @@ pub(crate) fn run(
     status::job(paths, "public", |paths| {
         work(&public(&cat, paths, cfg, &dl), &store, &dl, Pass::FRESH)?;
         let mut errs = Vec::new();
-        for (set, id) in sets.iter().zip(&ids) {
+        for id in &ids {
             let job = store.job(id)?;
+            let name = match &job.kind {
+                JobKind::Mirror { set, source } => format!("{set}/{source}"),
+                JobKind::Set { set } => set.clone(),
+                _ => continue,
+            };
             match job.state {
                 JobState::Done => {}
                 JobState::Failed => {
-                    errs.push(format!("{}: {}", set.name, job.error.unwrap_or_default()));
+                    errs.push(format!("{name}: {}", job.error.unwrap_or_default()));
                 }
-                s => println!("{}: {s} (job {id})", set.name),
+                s => println!("{name}: {s} (job {id})"),
             }
         }
         if errs.is_empty() {

@@ -89,12 +89,14 @@ pub(crate) fn enqueue_public(
     mount(&cfg.primary_uuid);
     let cat = Catalog::embedded()?;
     let sets = cat.select(sets, false)?;
-    public::enqueue_all(
+    let jobs = public::enqueue_all(
         &Store::new(paths.queue.clone()),
         &sets,
         &cfg.primary_uuid,
         tidy,
-    )
+        &|_| false,
+    )?;
+    Ok(jobs.into_iter().map(|(_, id)| id).collect())
 }
 
 /// Queues one run of a saved copy rule, ahead of its schedule.
