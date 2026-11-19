@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
+  <revision>1763459000</revision>
+  <tags>
+    <distro cpeid="cpe:/o:fedoraproject:fedora:45">Fedora 45</distro>
+  </tags>
+  <data type="primary">
+    <checksum type="sha256">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</checksum>
+    <open-checksum type="sha256">bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</open-checksum>
+    <location href="repodata/aaaaaaaa-primary.xml.zst"/>
+    <timestamp>1763459000</timestamp>
+    <size>1000</size>
+    <open-size>9000</open-size>
+  </data>
+  <data type="filelists">
+    <checksum type="sha256">cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc</checksum>
+    <location href="repodata/cccccccc-filelists.xml.zst"/>
+    <timestamp>1763459000</timestamp>
+    <size>2000</size>
+    <open-size>20000</open-size>
+  </data>
+</repomd>

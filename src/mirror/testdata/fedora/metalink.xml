@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<metalink version="3.0" xmlns="http://www.metalinker.org/" xmlns:mm0="http://fedorahosted.org/mirrormanager" type="dynamic" pubdate="Wed, 18 Nov 2026 10:00:00 GMT" generator="mirrormanager">
+  <files>
+    <file name="repomd.xml">
+      <mm0:timestamp>1763460000</mm0:timestamp>
+      <size>4321</size>
+      <verification>
+        <hash type="md5">0123456789abcdef0123456789abcdef</hash>
+        <hash type="sha1">0123456789abcdef0123456789abcdef01234567</hash>
+        <hash type="sha256">1111111111111111111111111111111111111111111111111111111111111111</hash>
+        <hash type="sha512">22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222</hash>
+      </verification>
+      <mm0:alternates>
+        <mm0:alternate>
+          <mm0:timestamp>1763456400</mm0:timestamp>
+          <size>4300</size>
+          <verification>
+            <hash type="sha256">3333333333333333333333333333333333333333333333333333333333333333</hash>
+            <hash type="sha512">44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444</hash>
+          </verification>
+        </mm0:alternate>
+      </mm0:alternates>
+      <resources maxconnections="1">
+        <url protocol="https" type="https" location="US" preference="100">https://mirrors.kernel.org/fedora/releases/45/Everything/x86_64/os/repodata/repomd.xml</url>
+        <url protocol="rsync" type="rsync" location="US" preference="99"/>
+      </resources>
+    </file>
+  </files>
+</metalink>

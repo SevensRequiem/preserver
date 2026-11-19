@@ -1,6 +1,14 @@
 //! In-place repository mirrors: a tree on the drive that a package manager reads, kept whole
 //! by swapping its metadata in only after every file it names has landed and verified.
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Fedora walker that uses these arrives with the next step"
+    )
+)]
+pub(crate) mod fedora;
 pub(crate) mod generation;
 
 use crate::catalog::{RepoFormat, Source};

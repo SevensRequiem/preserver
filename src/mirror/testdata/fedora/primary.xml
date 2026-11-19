@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="2">
+<package type="rpm">
+  <name>bash</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="5.3" rel="1.fc45"/>
+  <checksum type="sha256" pkgid="YES">dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd</checksum>
+  <summary>The GNU Bourne Again shell &amp; more</summary>
+  <description>A shell.</description>
+  <size package="1800000" installed="7000000" archive="7100000"/>
+  <location href="Packages/b/bash-5.3-1.fc45.x86_64.rpm"/>
+  <format>
+    <rpm:provides>
+      <rpm:entry name="bash" flags="EQ" epoch="0" ver="5.3" rel="1.fc45"/>
+    </rpm:provides>
+    <file>/usr/bin/bash</file>
+  </format>
+</package>
+<package type="rpm">
+  <name>zsh</name>
+  <arch>x86_64</arch>
+  <checksum type="sha256" pkgid="YES">eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee</checksum>
+  <size package="3300000" installed="9000000" archive="9100000"/>
+  <location href="Packages/z/zsh-5.9-1.fc45.x86_64.rpm"/>
+  <format/>
+</package>
+</metadata>
