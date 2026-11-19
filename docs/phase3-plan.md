@@ -319,7 +319,7 @@ Dependency graph:
   - `Entry { path, size, check }`;
   - `Meta { entry: Entry, from: Option<String> }`, where `from` is a fetch path relative to the base, such as a by-hash path (C6, F7);
   - `Anchor { docs: Vec<(String, Vec<u8>)>, meta: Vec<Meta>, swaps: Vec<String> }`;
-  - `Ctx<'a> { dl, keys: &'a [Keyring], rsa: &'a [RsaKey<'a>], metalink: &'a str, plain_http, tree: Option<&'a Path> }` (C7);
+  - `Ctx<'a> { dl, keys: &'a [Keyring], metalink: &'a str, plain_http, tree: Option<&'a Path> }` (C7); `rsa: &'a [RsaKey<'a>]` arrives with `RsaKey` in S12, so the walker steps before it do not have it;
   - `rel_path`.
 - `generation.rs`:
   - `path_cmp` and `url_of`.
@@ -630,7 +630,7 @@ Dependency graph:
 | C4 | `Run` never outranked | D2, S1 |
 | C5 | vfat refusal before fetch | S5 |
 | C6 | `Meta.from` | S7 |
-| C7 | `Ctx.metalink` and `Ctx.rsa` | S7 |
+| C7 | `Ctx.metalink` and `Ctx.rsa` | S7 (`Ctx.rsa` in S12) |
 | C8 | key-coverage validation and FINGERPRINTS test | S12 |
 | C9 | revision rule when nothing matches | D7, S11 |
 | C10 | D7 kept; split is catalog-only; question dropped | D7 |

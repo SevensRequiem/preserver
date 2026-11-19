@@ -3,7 +3,7 @@
 //! (`exec.rs`), once or on a schedule (`rules.rs`). Copy jobs run in their own daemon lane, so
 //! a long copy never holds up downloads.
 
-mod exec;
+pub(crate) mod exec;
 pub(crate) mod plan;
 pub(crate) mod rules;
 

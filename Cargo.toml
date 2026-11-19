@@ -60,6 +60,7 @@ required-features = ["gui"]
 # ureq logs through it; the http test captures that output.
 log = "=0.4.35"
 rsa = { version = "=0.9.10", default-features = false, features = ["getrandom"] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 
 [lints.rust]
 unsafe_code = "deny"

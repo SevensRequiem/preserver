@@ -185,7 +185,7 @@ fn expect(it: &Item) -> Result<Expect> {
 
 /// A hard link, or a copy where the filesystem has none (FAT, exFAT). The copy is renamed
 /// into place, so a file under its final name is always whole.
-fn link_or_copy(from: &Path, to: &Path) -> bool {
+pub(crate) fn link_or_copy(from: &Path, to: &Path) -> bool {
     if std::fs::hard_link(from, to).is_ok() {
         return true;
     }
@@ -376,7 +376,7 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     }
 }
 
-fn write_synced(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_synced(path: &Path, data: &[u8]) -> Result<()> {
     let mut f = File::create(path).with_context(|| path.display().to_string())?;
     f.write_all(data)?;
     f.sync_all()?;

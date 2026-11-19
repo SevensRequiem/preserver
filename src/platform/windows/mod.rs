@@ -181,3 +181,12 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     }
     Ok(f)
 }
+
+/// No atomic exchange here: the caller renames the old path aside, then the new one in.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the linux fn, which can fail"
+)]
+pub(crate) fn exchange(_a: &Path, _b: &Path) -> io::Result<bool> {
+    Ok(false)
+}

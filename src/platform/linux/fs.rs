@@ -118,6 +118,23 @@ pub(crate) fn drop_cache(f: &File) -> io::Result<()> {
     )?)
 }
 
+/// Swaps two paths in one step (`RENAME_EXCHANGE`). `Ok(false)` when the filesystem cannot,
+/// so the caller renames one aside instead.
+pub(crate) fn exchange(a: &Path, b: &Path) -> io::Result<bool> {
+    use rustix::io::Errno;
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        a,
+        rustix::fs::CWD,
+        b,
+        rustix::fs::RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => Ok(true),
+        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Opens a file for reading, refusing a symlink as the last component.
 pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     OpenOptions::new()
@@ -165,6 +182,18 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("f")), 0o600);
+    }
+
+    #[test]
+    fn exchange_swaps_a_file_and_a_directory() {
+        let tmp = TempDir::new();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::write(&a, b"file").unwrap();
+        std::fs::create_dir(&b).unwrap();
+        assert!(exchange(&a, &b).unwrap(), "tmpfs supports RENAME_EXCHANGE");
+        assert!(a.is_dir());
+        assert_eq!(std::fs::read(&b).unwrap(), b"file");
+        assert!(exchange(&a, &tmp.path().join("absent")).is_err());
     }
 
     #[test]

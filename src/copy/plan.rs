@@ -81,7 +81,7 @@ impl Limits {
     }
 }
 
-fn bad_windows_name(c: &str) -> bool {
+pub(crate) fn bad_windows_name(c: &str) -> bool {
     if c.chars()
         .any(|ch| ch.is_control() || r#"<>:"\|?*"#.contains(ch))
         || c.ends_with(['.', ' '])

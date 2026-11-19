@@ -10,6 +10,11 @@ mod git;
 #[cfg(feature = "gui")]
 pub mod gui;
 mod keys;
+#[expect(
+    dead_code,
+    reason = "the generation state machine and the walkers use it, later phase 3 steps"
+)]
+mod mirror;
 mod net;
 mod paths;
 mod personal;
