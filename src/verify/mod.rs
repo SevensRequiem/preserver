@@ -6,7 +6,7 @@ mod sums;
 pub(crate) mod testkey;
 
 use crate::catalog::{SigOver, Source};
-use crate::keys::{self, Keyring};
+use crate::keys::{self, Keyring, RsaKey};
 use crate::platform;
 use crate::resolve::{Item, hex, url_base};
 use anyhow::{Context, Result, bail};
@@ -25,6 +25,7 @@ pub(crate) const XZ_MEM_KIB: u32 = 256 << 10;
 
 pub(crate) struct Verifier<'a> {
     pub keys: &'a [Keyring<'a>],
+    pub rsa: &'a [RsaKey<'a>],
     /// `tofu.json`: the hash first seen for each url that nothing else vouches for.
     pub tofu: &'a Path,
     /// Raises a desktop notification: urgent, title, body.
@@ -298,6 +299,7 @@ mod tests {
             };
             f(&Verifier {
                 keys,
+                rsa: &[],
                 tofu: &tofu,
                 note: &note,
             })

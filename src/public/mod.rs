@@ -469,6 +469,7 @@ impl Public<'_> {
             let ctx = Ctx {
                 dl: self.resolver.dl,
                 keys: self.verifier.keys,
+                rsa: self.verifier.rsa,
                 metalink: self.metalink,
                 plain_http: self.resolver.plain_http,
                 tree: tree.is_dir().then_some(tree.as_path()),
@@ -702,6 +703,7 @@ impl Public<'_> {
                 let ctx = Ctx {
                     dl: self.resolver.dl,
                     keys: self.verifier.keys,
+                    rsa: self.verifier.rsa,
                     metalink: self.metalink,
                     plain_http: self.resolver.plain_http,
                     tree: tree.as_deref().filter(|t| t.is_dir()),
@@ -804,6 +806,7 @@ fn public<'a>(cat: &'a Catalog, paths: &'a Paths, cfg: &Config, dl: &'a Download
         },
         verifier: Verifier {
             keys: keys::EMBEDDED,
+            rsa: keys::ALPINE,
             tofu: &paths.tofu,
             note: &notify,
         },

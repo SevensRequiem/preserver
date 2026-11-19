@@ -4,8 +4,11 @@
 //! SHA-1, and `.PKGINFO` in the control member pins the data member by `datahash`.
 //! Nothing here reads the network or the disk except through the reader it is handed.
 
-use crate::catalog::valid_name;
+use super::generation::{Walked, url_of};
+use super::{Anchor, Check, Ctx, Entry, rel_path};
+use crate::catalog::{Source, valid_name};
 use crate::keys::RsaKey;
+use crate::public::versioned::read_meta;
 use crate::resolve::{hex, valid_file_name};
 use anyhow::{Context, Result, bail, ensure};
 use base64ct::{Base64, Encoding};
@@ -226,7 +229,92 @@ pub(crate) fn index(data: &[u8], keys: &[RsaKey<'_>], arch: &str) -> Result<Vec<
         .find(|k| k.name == name && k.arches.contains(&arch))
         .with_context(|| format!("no pinned key {name:?} for {arch}"))?;
     verify(key, hash, signed, &sig)?;
+    packages(signed)
+}
+
+/// The mtime in the tar header of the `APKINDEX` entry of a document that `index` verified: it
+/// is inside the signed member, so it only grows from one published index to the next.
+fn index_mtime(signed: &[u8]) -> Result<u64> {
+    let mut c = Counted {
+        inner: signed,
+        n: 0,
+    };
+    read_tar(&mut c, INDEX_INFLATE_CAP, |ar| {
+        for e in ar.entries()? {
+            let e = e?;
+            if regular(&e)? == "APKINDEX" {
+                return Ok(e.header().mtime()?);
+            }
+        }
+        bail!("no APKINDEX in the index")
+    })
+}
+
+/// The mtime of the live tree's index at `path`, if it has one that still verifies; one that
+/// does not sets no bar.
+fn live_mtime(ctx: &Ctx<'_>, path: &str, arch: &str) -> Result<Option<u64>> {
+    let Some(file) = ctx.tree.map(|t| rel_path(t, path)) else {
+        return Ok(None);
+    };
+    if std::fs::symlink_metadata(&file).is_err() {
+        return Ok(None);
+    }
+    let bytes = read_meta(&file).with_context(|| format!("live {path}"))?;
+    if let Err(e) = index(&bytes, ctx.rsa, arch) {
+        tracing::warn!("live {path} no longer verifies, no rollback bar: {e:#}");
+        return Ok(None);
+    }
+    Ok(Some(index_mtime(
+        &bytes[first_member(&bytes, SIG_INFLATE_CAP)?..],
+    )?))
+}
+
+/// The packages of the index member of a document that `index` verified.
+fn packages(signed: &[u8]) -> Result<Vec<Package>> {
     parse(&apkindex(signed, INDEX_INFLATE_CAP)?)
+}
+
+fn index_path(suite: &str, repo: &str, arch: &str) -> String {
+    format!("{suite}/{repo}/{arch}/APKINDEX.tar.gz")
+}
+
+/// Pins a generation to the signed `APKINDEX.tar.gz` of each suite, repository and arch. Each
+/// index file is its own swap path; the apks next to it are payload.
+pub(crate) fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    let mut a = Anchor::default();
+    for suite in &src.suites {
+        for repo in &src.components {
+            for arch in &src.arches {
+                let path = index_path(suite, repo, arch);
+                let bytes = ctx.dl.get(&url_of(&src.url, &path), INDEX_CAP)?;
+                index(&bytes, ctx.rsa, arch).with_context(|| path.clone())?;
+                if let Some(live) = live_mtime(ctx, &path, arch)? {
+                    let got = index_mtime(&bytes[first_member(&bytes, SIG_INFLATE_CAP)?..])?;
+                    ensure!(got >= live, "{path} is older than the one on the drive");
+                }
+                a.swaps.push(path.clone());
+                a.docs.push((path, bytes));
+            }
+        }
+    }
+    Ok(a)
+}
+
+/// Every apk the anchored indexes name, each pinned by its `Q1`. The indexes were verified at
+/// the anchor and the commit re-checks their bytes, so they are read here without the key.
+pub(crate) fn walk(a: &Anchor, emit: &mut dyn FnMut(Walked)) -> Result<()> {
+    for (path, bytes) in &a.docs {
+        let (dir, _) = path.rsplit_once('/').context("an index at the root")?;
+        let signed = &bytes[first_member(bytes, SIG_INFLATE_CAP)?..];
+        for p in packages(signed).with_context(|| path.clone())? {
+            emit(Walked::File(Entry {
+                path: format!("{dir}/{}", p.file()),
+                size: p.size,
+                check: Check::ApkQ1(p.q1),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Stanzas of `X:value` lines, a blank line between them. Every package needs `P`, `V`, `A`,
@@ -337,6 +425,18 @@ fn datahash(pkginfo: &str) -> Result<&str> {
     found.context("no datahash in .PKGINFO")
 }
 
+/// `check_apk` for callers that must tell a read fault from a bad package: an error from the
+/// OS (EIO, a pulled drive) is `Err`, anything else that fails the check is `Ok(false)`.
+pub(crate) fn apk_holds<R: Read + Seek>(file: R, q1: &[u8; 20]) -> io::Result<bool> {
+    match check_apk(file, q1) {
+        Ok(()) => Ok(true),
+        Err(e) => match e.downcast::<io::Error>() {
+            Ok(io) if io.raw_os_error().is_some() => Err(io),
+            _ => Ok(false),
+        },
+    }
+}
+
 /// Checks an apk against the `Q1` its signed index gave: the control member hashes to it, and
 /// the data member, taken as raw bytes to the end of the file and never inflated, hashes to
 /// the `datahash` the control member carries.
@@ -443,12 +543,17 @@ mod tests {
     }
 
     fn tar_of(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        tar_at(entries, 0)
+    }
+
+    fn tar_at(entries: &[(&str, tar::EntryType, &[u8])], mtime: u64) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         for (name, ty, data) in entries {
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(*ty);
             h.set_size(data.len() as u64);
             h.set_mode(0o644);
+            h.set_mtime(mtime);
             if *ty == tar::EntryType::Symlink {
                 h.set_link_name("x").unwrap();
             }
@@ -771,6 +876,27 @@ mod tests {
         }
     }
 
+    struct Faulty;
+    impl Read for Faulty {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(5))
+        }
+    }
+    impl Seek for Faulty {
+        fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+            Ok(100)
+        }
+    }
+
+    #[test]
+    fn apk_holds_tells_a_read_fault_from_a_bad_package() {
+        let a = apk(&[], b"payload", None);
+        assert!(apk_holds(Cursor::new(&a.bytes), &a.q1).unwrap());
+        assert!(!apk_holds(Cursor::new(&a.bytes), &[0; 20]).unwrap());
+        assert!(!apk_holds(Cursor::new(&a.bytes[..40]), &a.q1).unwrap());
+        assert!(apk_holds(Faulty, &a.q1).is_err());
+    }
+
     fn check(bytes: &[u8], q1: &[u8; 20]) -> Result<()> {
         check_apk(Cursor::new(bytes), q1)
     }
@@ -872,5 +998,285 @@ mod tests {
             .try_into()
             .unwrap();
         assert!(check(&bytes, &q).is_err(), "no datahash");
+    }
+
+    mod site {
+        use super::*;
+        use crate::catalog::{Kind, RepoFormat};
+        use crate::mirror::generation::{self, Next, begin, read_tsv};
+        use crate::net::download::{Expect, Fetch};
+        use crate::net::testserver::{Behaviour, Server, body};
+        use crate::resolve::tests::downloader;
+        use crate::testutil::TempDir;
+        use std::collections::HashMap;
+        use std::fmt::Write as _;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        struct Site {
+            srv: Server,
+            routes: HashMap<String, Vec<u8>>,
+            stamp: u64,
+            src: Source,
+            tmp: TempDir,
+        }
+
+        impl Site {
+            fn new() -> Self {
+                let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
+                let src = Source {
+                    name: "a".into(),
+                    kind: Some(Kind::Repo),
+                    format: Some(RepoFormat::Alpine),
+                    url: srv.url("alp"),
+                    suites: vec!["v3.24".into()],
+                    components: vec!["main".into()],
+                    arches: vec!["x86_64".into()],
+                    ..Source::default()
+                };
+                Self {
+                    srv,
+                    routes: HashMap::new(),
+                    stamp: 1000,
+                    src,
+                    tmp: TempDir::new(),
+                }
+            }
+
+            fn tree(&self) -> std::path::PathBuf {
+                self.tmp.path().join("tree")
+            }
+
+            fn serve(&mut self) {
+                let routes = self.routes.clone();
+                self.srv.set(|b| b.routes = Some(routes));
+            }
+
+            /// Publishes a signed index naming these `(file stem, payload)` packages.
+            /// Returns each apk's served bytes.
+            fn publish(&mut self, pkgs: &[(&str, &[u8])]) {
+                let mut text = String::new();
+                for (stem, data) in pkgs {
+                    let a = apk(&[], data, None);
+                    let (name, ver) = stem.split_once('=').unwrap();
+                    let _ = write!(
+                        text,
+                        "C:Q1{}\nP:{name}\nV:{ver}\nA:x86_64\nS:{}\n\n",
+                        Base64::encode_string(&a.q1),
+                        a.bytes.len()
+                    );
+                    self.routes
+                        .insert(format!("alp/v3.24/main/x86_64/{name}-{ver}.apk"), a.bytes);
+                }
+                let second = gz(&tar_at(
+                    &[
+                        ("APKINDEX", tar::EntryType::Regular, text.as_bytes()),
+                        ("DESCRIPTION", tar::EntryType::Regular, b"main"),
+                    ],
+                    self.stamp,
+                ));
+                self.routes.insert(
+                    "alp/v3.24/main/x86_64/APKINDEX.tar.gz".into(),
+                    signed(&K2048, Hash::Sha256, &entry(Hash::Sha256), &second),
+                );
+                self.serve();
+            }
+
+            fn run(&self) -> Result<()> {
+                let dl = downloader();
+                let tree = self.tree();
+                let keys = [ring(&K2048)];
+                let ctx = Ctx {
+                    dl: &dl,
+                    keys: &[],
+                    rsa: &keys,
+                    metalink: "",
+                    plain_http: true,
+                    tree: tree.is_dir().then_some(tree.as_path()),
+                };
+                let mut g = begin(&tree, &self.src.url, anchor(&ctx, &self.src)?)?;
+                let (stop, done) = (AtomicBool::new(false), Arc::new(AtomicU64::new(0)));
+                let mut ok = Vec::new();
+                loop {
+                    let mut w = |a: &Anchor, _: &Path, e: &mut dyn FnMut(Walked)| walk(a, e);
+                    match g.next(&ok, &mut w, u64::MAX, "ext4")? {
+                        Next::Batch(p) => {
+                            ok.clear();
+                            for (i, f) in p.fetches.iter().enumerate() {
+                                if dl.fetch(f, &stop, &done).is_ok() {
+                                    ok.push(i);
+                                }
+                            }
+                            if ok.len() < p.fetches.len() {
+                                g.land(&ok)?;
+                                bail!("a download failed");
+                            }
+                        }
+                        Next::Ready => return g.commit(),
+                        Next::OverBudget { .. } => bail!("over budget"),
+                    }
+                }
+            }
+
+            fn live(&self) -> Vec<String> {
+                read_tsv(&generation::live_path(&self.tree()))
+                    .unwrap()
+                    .entries
+                    .into_iter()
+                    .map(|e| e.path)
+                    .collect()
+            }
+        }
+
+        #[test]
+        fn fresh_tree_holds_the_index_and_the_apks() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"aaa"), ("b=2-r0", b"bbbb")]);
+            s.run().unwrap();
+            let dir = s.tree().join("v3.24/main/x86_64");
+            assert_eq!(
+                std::fs::read(dir.join("APKINDEX.tar.gz")).unwrap(),
+                s.routes["alp/v3.24/main/x86_64/APKINDEX.tar.gz"]
+            );
+            assert_eq!(
+                std::fs::read(dir.join("b-2-r0.apk")).unwrap(),
+                s.routes["alp/v3.24/main/x86_64/b-2-r0.apk"]
+            );
+            assert_eq!(
+                s.live(),
+                [
+                    "v3.24/main/x86_64/a-1-r0.apk",
+                    "v3.24/main/x86_64/b-2-r0.apk"
+                ]
+            );
+            let tsv = std::fs::read_to_string(generation::live_path(&s.tree())).unwrap();
+            assert!(tsv.contains("\napkq1:"), "{tsv}");
+        }
+
+        #[test]
+        fn a_tampered_apk_is_never_visible() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"aaa")]);
+            let evil = apk(&[], b"xxx", None).bytes;
+            s.routes
+                .insert("alp/v3.24/main/x86_64/a-1-r0.apk".into(), evil);
+            s.serve();
+            assert!(s.run().is_err());
+            let dir = s.tree().join("v3.24/main/x86_64");
+            assert!(!dir.join("a-1-r0.apk").exists());
+            assert!(!dir.join("APKINDEX.tar.gz").exists());
+        }
+
+        #[test]
+        fn a_changed_q1_is_replaced_at_the_swap() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"old")]);
+            s.run().unwrap();
+            s.publish(&[("a=1-r0", b"new!")]);
+            s.run().unwrap();
+            let dir = s.tree().join("v3.24/main/x86_64");
+            assert_eq!(
+                std::fs::read(dir.join("a-1-r0.apk")).unwrap(),
+                s.routes["alp/v3.24/main/x86_64/a-1-r0.apk"]
+            );
+            assert_eq!(s.live().len(), 1);
+        }
+
+        #[test]
+        fn a_removed_package_is_pruned() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"aaa"), ("b=1-r0", b"bbb")]);
+            s.run().unwrap();
+            s.publish(&[("a=1-r0", b"aaa")]);
+            s.run().unwrap();
+            let dir = s.tree().join("v3.24/main/x86_64");
+            assert!(dir.join("a-1-r0.apk").exists());
+            assert!(!dir.join("b-1-r0.apk").exists());
+        }
+
+        #[test]
+        fn an_older_index_than_the_live_one_is_refused() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"aaa")]);
+            s.run().unwrap();
+            let newer = s.routes.clone();
+            s.stamp = 500;
+            s.publish(&[("a=1-r0", b"aaa"), ("b=1-r0", b"bbb")]);
+            let err = format!("{:#}", s.run().unwrap_err());
+            assert!(err.contains("older"), "{err}");
+            assert!(
+                !s.live()
+                    .contains(&"v3.24/main/x86_64/b-1-r0.apk".to_owned())
+            );
+            s.routes = newer;
+            s.serve();
+            s.run().unwrap();
+        }
+
+        #[test]
+        fn an_unpinned_signer_is_refused() {
+            let mut s = Site::new();
+            s.publish(&[("a=1-r0", b"aaa")]);
+            let dl = downloader();
+            let other = make(2048);
+            let keys = [ring(&other)];
+            let ctx = Ctx {
+                dl: &dl,
+                keys: &[],
+                rsa: &keys,
+                metalink: "",
+                plain_http: true,
+                tree: None,
+            };
+            assert!(anchor(&ctx, &s.src).is_err());
+        }
+
+        const CP: u64 = 1 << 20;
+
+        fn fetch(srv: &Server, dir: &Path, q1: [u8; 20], len: usize) -> Fetch {
+            Fetch {
+                url: srv.url("x.apk"),
+                dest: dir.join("x.apk"),
+                size: Some(len as u64),
+                limit: u64::MAX,
+                expect: Expect::Apk(q1),
+            }
+        }
+
+        #[test]
+        fn an_apk_mismatch_is_never_visible() {
+            let tmp = TempDir::new();
+            let good = apk(&[], &body(3 * CP, 1), None);
+            let evil = apk(&[], &body(3 * CP, 2), None);
+            let srv = Server::start("127.0.0.1", Behaviour::new(evil.bytes.clone()));
+            let f = fetch(&srv, tmp.path(), good.q1, evil.bytes.len());
+            let err = downloader().fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0));
+            assert!(err.is_err());
+            assert!(!f.dest.exists() && !f.part().exists() && !f.sidecar().exists());
+        }
+
+        #[test]
+        fn an_interrupted_apk_resumes_and_passes() {
+            let tmp = TempDir::new();
+            let a = apk(&[], &body(3 * CP, 3), None);
+            let srv = Server::start("127.0.0.1", Behaviour::new(a.bytes.clone()));
+            let d = downloader();
+            let f = fetch(&srv, tmp.path(), a.q1, a.bytes.len());
+            srv.set(|b| b.die_at = Some(5 * CP / 2));
+            assert!(
+                d.fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+                    .is_err()
+            );
+            assert!(f.part().exists() && f.sidecar().exists());
+            srv.set(|b| b.die_at = None);
+            d.fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+                .unwrap();
+            assert_eq!(std::fs::read(&f.dest).unwrap(), a.bytes);
+            assert_eq!(
+                srv.hits().last().unwrap().range.as_deref(),
+                Some("bytes=2097152-")
+            );
+        }
     }
 }

@@ -1084,6 +1084,7 @@ mod walk_tests {
             Ctx {
                 dl,
                 keys: &[],
+                rsa: &[],
                 metalink: ml,
                 plain_http: true,
                 tree: tree.is_dir().then_some(tree),

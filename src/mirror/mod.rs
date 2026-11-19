@@ -10,7 +10,7 @@ pub(crate) mod generation;
 mod testrepo;
 
 use crate::catalog::{RepoFormat, Source};
-use crate::keys::Keyring;
+use crate::keys::{Keyring, RsaKey};
 use crate::net::download::Downloader;
 use crate::resolve::hex;
 use anyhow::{Context, Result, bail};
@@ -27,12 +27,15 @@ use std::str::FromStr;
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum Check {
     Sha256([u8; 32]),
+    /// An Alpine apk, by the `Q1` SHA-1 its signed index gives for the control member.
+    ApkQ1([u8; 20]),
 }
 
 impl fmt::Display for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Check::Sha256(h) => write!(f, "sha256:{}", hex(h)),
+            Check::ApkQ1(h) => write!(f, "apkq1:{}", hex(h)),
         }
     }
 }
@@ -41,24 +44,32 @@ impl FromStr for Check {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        let h = s
-            .strip_prefix("sha256:")
+        let (kind, h) = s
+            .split_once(':')
             .ok_or_else(|| format!("unknown check {s:?}"))?;
-        let b = h.as_bytes();
-        if b.len() != 64 {
-            return Err(format!("sha256 of {} characters", b.len()));
+        match kind {
+            "sha256" => unhex_check::<32>(h).map(Check::Sha256),
+            "apkq1" => unhex_check::<20>(h).map(Check::ApkQ1),
+            _ => Err(format!("unknown check {s:?}")),
         }
-        let nib = |c: u8| match c {
-            b'0'..=b'9' => Ok(c - b'0'),
-            b'a'..=b'f' => Ok(c - b'a' + 10),
-            _ => Err(format!("not lowercase hex: {h:?}")),
-        };
-        let mut out = [0u8; 32];
-        for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
-            *o = (nib(pair[0])? << 4) | nib(pair[1])?;
-        }
-        Ok(Check::Sha256(out))
     }
+}
+
+fn unhex_check<const N: usize>(h: &str) -> Result<[u8; N], String> {
+    let b = h.as_bytes();
+    if b.len() != 2 * N {
+        return Err(format!("{} hex characters, want {}", b.len(), 2 * N));
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        _ => Err(format!("not lowercase hex: {h:?}")),
+    };
+    let mut out = [0u8; N];
+    for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
+        *o = (nib(pair[0])? << 4) | nib(pair[1])?;
+    }
+    Ok(out)
 }
 
 impl TryFrom<String> for Check {
@@ -107,6 +118,7 @@ pub(crate) struct Anchor {
 pub(crate) struct Ctx<'a> {
     pub dl: &'a Downloader,
     pub keys: &'a [Keyring<'a>],
+    pub rsa: &'a [RsaKey<'a>],
     /// The metalink service; production passes the Fedora constant, tests a loopback server.
     pub metalink: &'a str,
     pub plain_http: bool,
@@ -170,6 +182,7 @@ fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
     match src.format {
         Some(RepoFormat::Fedora) => fedora::anchor(ctx, src),
         Some(RepoFormat::Debian) => debian::anchor(ctx, src),
+        Some(RepoFormat::Alpine) => alpine::anchor(ctx, src),
         _ => Err(no_walker(src)),
     }
 }
@@ -178,6 +191,7 @@ fn walk(src: &Source, a: &Anchor, meta: &Path, emit: &mut dyn FnMut(Walked)) -> 
     match src.format {
         Some(RepoFormat::Fedora) => fedora::walk(src, a, meta, emit),
         Some(RepoFormat::Debian) => debian::walk(a, meta, emit),
+        Some(RepoFormat::Alpine) => alpine::walk(a, emit),
         _ => Err(no_walker(src)),
     }
 }
@@ -186,6 +200,7 @@ fn walk_meta<'a>(src: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
     match src.format {
         Some(RepoFormat::Fedora) => fedora::walk_meta(src, a),
         Some(RepoFormat::Debian) => debian::walk_meta(a),
+        Some(RepoFormat::Alpine) => Vec::new(),
         _ => a.meta.iter().map(|m| &m.entry).collect(),
     }
 }
@@ -232,7 +247,9 @@ fn dry_walk(
             .and_then(|m| m.from.as_deref())
             .unwrap_or(&e.path);
         let body = ctx.dl.get(&url_of(&src.url, from), e.size)?;
-        let Check::Sha256(want) = e.check;
+        let Check::Sha256(want) = e.check else {
+            bail!("{}: metadata is checked by SHA-256", e.path);
+        };
         if body.len() as u64 != e.size || <[u8; 32]>::from(Sha256::digest(&body)) != want {
             bail!("{}: does not match the anchor", e.path);
         }

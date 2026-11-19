@@ -31,6 +31,8 @@ pub(crate) enum Expect {
     Sha256([u8; 32]),
     Sha512([u8; 64]),
     Both([u8; 32], [u8; 64]),
+    /// An Alpine apk with this `Q1`: the whole part is read back and checked in `finish`.
+    Apk([u8; 20]),
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +573,11 @@ impl Downloader {
             Expect::Sha256(w) => sha256 == w,
             Expect::Sha512(w) => sha512.as_deref() == Some(w),
             Expect::Both(a, b) => sha256 == a && sha512.as_deref() == Some(b),
+            Expect::Apk(q) => {
+                // The part is read whole even when resumed: the midstate covers only SHA-256.
+                p.file.sync_data().map_err(Fail::Disk)?;
+                crate::mirror::alpine::apk_holds(&p.file, q).map_err(Fail::Disk)?
+            }
         };
         if !ok {
             remove(side)?;

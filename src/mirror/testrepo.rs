@@ -126,6 +126,7 @@ impl Site {
         Ctx {
             dl,
             keys: ring,
+            rsa: &[],
             metalink: "",
             plain_http: true,
             tree: tree.is_dir().then_some(tree),

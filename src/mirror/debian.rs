@@ -254,7 +254,9 @@ pub(crate) fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
         let rel =
             parse_release(&text, suite, now, live).with_context(|| format!("{suite} InRelease"))?;
         for e in pick(&rel, src).with_context(|| suite.clone())? {
-            let Check::Sha256(h) = e.check;
+            let Check::Sha256(h) = e.check else {
+                bail!("{}: a Release names SHA-256 hashes", e.path);
+            };
             let from = rel.by_hash.then(|| match e.path.rsplit_once('/') {
                 Some((dir, _)) => format!("dists/{suite}/{dir}/by-hash/SHA256/{}", hex(&h)),
                 None => format!("dists/{suite}/by-hash/SHA256/{}", hex(&h)),

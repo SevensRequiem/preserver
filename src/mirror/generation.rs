@@ -6,7 +6,7 @@
 //! - `staging/<gen16>/{meta,old,live.tsv}`: the new swap paths, what they replace, and the
 //!   `live.tsv` that goes with them.
 
-use super::{Anchor, Check, Entry, rel_path};
+use super::{Anchor, Check, Entry, alpine, rel_path};
 use crate::copy::exec::{ensure_dir, safe_rel};
 use crate::copy::plan::{Limits, bad_windows_name};
 use crate::net::download::{Expect, Fetch};
@@ -562,8 +562,8 @@ fn exact(root: &Path, s: &Step) -> Result<bool> {
     if found != want {
         return Ok(false);
     }
-    for (p, Check::Sha256(h)) in &s.files {
-        if sha256_of(&rel_path(root, p))? != *h {
+    for (p, c) in &s.files {
+        if !holds(&rel_path(root, p), *c)? {
             return Ok(false);
         }
     }
@@ -982,6 +982,7 @@ pub(crate) fn gen_of(a: &Anchor) -> String {
 fn expect_of(c: Check) -> Expect {
     match c {
         Check::Sha256(h) => Expect::Sha256(h),
+        Check::ApkQ1(q) => Expect::Apk(q),
     }
 }
 
@@ -993,9 +994,18 @@ fn matches(path: &Path, e: &Entry) -> Result<bool> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err).with_context(|| path.display().to_string()),
     }
-    Ok(match e.check {
-        Check::Sha256(h) => sha256_of(path)? == h,
-    })
+    holds(path, e.check)
+}
+
+/// The regular file at `path` is what `c` says; an apk that fails its check is not an I/O error.
+fn holds(path: &Path, c: Check) -> Result<bool> {
+    match c {
+        Check::Sha256(h) => Ok(sha256_of(path)? == h),
+        Check::ApkQ1(q) => {
+            let f = platform::open_regular(path).with_context(|| path.display().to_string())?;
+            Ok(alpine::apk_holds(f, &q).with_context(|| path.display().to_string())?)
+        }
+    }
 }
 
 /// `path` is a regular file of `size` bytes.
@@ -1489,7 +1499,9 @@ impl Gen {
                     e.path
                 );
             }
-            let Check::Sha256(h) = e.check;
+            let Check::Sha256(h) = e.check else {
+                bail!("{}: metadata is checked by SHA-256", e.path);
+            };
             known.insert(&e.path, h);
         }
         let sums: HashSet<[u8; 32]> = known.values().copied().collect();
@@ -1567,8 +1579,7 @@ impl Gen {
         }
         for w in self.want.iter().filter(|w| w.incoming) {
             let (p, from) = (&w.entry.path, self.dest(w));
-            let Check::Sha256(h) = w.entry.check;
-            if sha256_of(&from)? != h {
+            if !holds(&from, w.entry.check)? {
                 bail!("{p}: the staged file no longer matches");
             }
             clear_way(&meta, parent(p))?;
@@ -2113,7 +2124,9 @@ mod tests {
         fn publish(&mut self, payload: &[(&str, &[u8])], tag: &str) -> Anchor {
             let mut list = String::new();
             for (p, b) in payload {
-                let Check::Sha256(h) = sha(b);
+                let Check::Sha256(h) = sha(b) else {
+                    unreachable!()
+                };
                 let _ = writeln!(list, "{} {} {p}", hex(&h), b.len());
                 self.files.insert(p.to_string(), b.to_vec());
             }
@@ -2151,7 +2164,9 @@ mod tests {
                     .map_err(|e: String| anyhow!(e))?,
             }));
         }
-        let Check::Sha256(h) = sha(text.as_bytes());
+        let Check::Sha256(h) = sha(text.as_bytes()) else {
+            unreachable!()
+        };
         let rel = format!("dists/s/by-hash/{}", hex(&h));
         let link = rel_path(meta, &rel);
         fs::create_dir_all(link.parent().unwrap())?;
@@ -2229,7 +2244,9 @@ mod tests {
         assert_eq!(drive(tree, a, &mut up), End::Committed);
         assert_eq!(up.take_hits(), [LIST, "pool/a", "pool/b/c"]);
         let list = up.files[LIST].clone();
-        let Check::Sha256(h) = sha(&list);
+        let Check::Sha256(h) = sha(&list) else {
+            unreachable!()
+        };
         let want: BTreeMap<String, Vec<u8>> = [
             ("dists/s/Release".to_string(), doc),
             (LIST.to_string(), list.clone()),

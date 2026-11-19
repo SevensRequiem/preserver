@@ -66,6 +66,7 @@ impl Env {
             },
             verifier: Verifier {
                 keys: &[("test", &ring)],
+                rsa: &[],
                 tofu: &self.paths.tofu,
                 note: &note,
             },
