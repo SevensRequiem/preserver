@@ -43,6 +43,9 @@ pub(crate) struct Public<'a> {
     free: Free<'a>,
     /// The stage each planned job is filling, until the worker settles the job.
     staged: Mutex<HashMap<String, Staged>>,
+    /// What each planned set job resolved, per source name, so a re-plan after a pause,
+    /// yield or retry does not list the upstream again.
+    resolved: Mutex<HashMap<String, HashMap<String, Vec<Item>>>>,
     /// The generation each planned repo mirror job is filling, until the worker settles it.
     gens: Mutex<HashMap<String, Gen>>,
     walkers: Walkers,
@@ -196,7 +199,7 @@ impl Public<'_> {
         }
     }
 
-    fn resolve_set<'s>(&self, set: &'s Set) -> Result<Vec<(&'s Source, Vec<Item>)>> {
+    fn resolve_set<'s>(&self, job: &str, set: &'s Set) -> Result<Vec<(&'s Source, Vec<Item>)>> {
         let mut by = Vec::new();
         let mut errs = Vec::new();
         for src in set
@@ -204,8 +207,23 @@ impl Public<'_> {
             .iter()
             .filter(|s| s.on() && !s.kind().in_place())
         {
+            let cached = self
+                .resolved()
+                .get(job)
+                .and_then(|m| m.get(&src.name))
+                .cloned();
+            if let Some(items) = cached {
+                by.push((src, items));
+                continue;
+            }
             match self.resolver.resolve(src) {
-                Ok(items) => by.push((src, items)),
+                Ok(items) => {
+                    self.resolved()
+                        .entry(job.to_string())
+                        .or_default()
+                        .insert(src.name.clone(), items.clone());
+                    by.push((src, items));
+                }
                 Err(e) => errs.push(format!("{}: resolve: {e:#}", src.name)),
             }
         }
@@ -213,6 +231,10 @@ impl Public<'_> {
             bail!(errs.join("; "));
         }
         Ok(by)
+    }
+
+    fn resolved(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<String, Vec<Item>>>> {
+        self.resolved.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn gens(&self) -> std::sync::MutexGuard<'_, HashMap<String, Gen>> {
@@ -259,7 +281,7 @@ impl Public<'_> {
                 return Ok(Vec::new().into());
             }
         };
-        let by = self.resolve_set(set)?;
+        let by = self.resolve_set(&job.id, set)?;
         if by.is_empty() {
             self.record(
                 name,
@@ -506,6 +528,12 @@ impl Public<'_> {
             return;
         };
         let staged = self.staged().remove(&job.id);
+        if matches!(
+            job.state,
+            JobState::Done | JobState::Failed | JobState::Canceled
+        ) {
+            self.resolved().remove(&job.id);
+        }
         match job.state {
             JobState::Done => {
                 let Some(staged) = staged else { return };
@@ -782,6 +810,7 @@ fn public<'a>(cat: &'a Catalog, paths: &'a Paths, cfg: &Config, dl: &'a Download
         reserve_percent: cfg.reserve_percent,
         free: &platform::disk_free,
         staged: Mutex::new(HashMap::new()),
+        resolved: Mutex::new(HashMap::new()),
         gens: Mutex::new(HashMap::new()),
         walkers: WALKERS,
         metalink: mirror::FEDORA_METALINK,

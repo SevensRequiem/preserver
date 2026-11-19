@@ -114,35 +114,156 @@ struct Candidate {
     item: Item,
 }
 
+/// The `href`s of a directory index, `./` stripped, in page order.
+fn hrefs(body: &str) -> Vec<&str> {
+    HREF.captures_iter(body)
+        .filter_map(|m| m.get(1))
+        .map(|x| x.as_str().strip_prefix("./").unwrap_or(x.as_str()))
+        .collect()
+}
+
+/// Keeps the newest `top` versions of each family.
+fn pick(cands: Vec<Candidate>, top: usize) -> Vec<Item> {
+    let mut vers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for c in &cands {
+        let v = vers.entry(&c.family).or_default();
+        if !v.contains(&c.ver.as_str()) {
+            v.push(&c.ver);
+        }
+    }
+    let mut keep = HashSet::new();
+    for (fam, vs) in &mut vers {
+        vs.sort_by(|a, b| newest_first(a, b));
+        for v in vs.iter().take(top.max(1)) {
+            keep.insert(((*fam).to_string(), (*v).to_string()));
+        }
+    }
+    cands
+        .into_iter()
+        .filter(|c| keep.contains(&(c.family.clone(), c.ver.clone())))
+        .map(|c| c.item)
+        .collect()
+}
+
+/// Under `prefix` as a string and as a path: a `.` or `..` segment (possibly percent-encoded)
+/// would let the server resolve the URL outside it.
+fn confined(url: &str, prefix: &str) -> bool {
+    url.strip_prefix(prefix).is_some_and(|rest| {
+        let path = rest.split(['?', '#']).next().unwrap_or_default();
+        percent_decode(path).is_some_and(|d| d.split('/').all(|seg| seg != "." && seg != ".."))
+    })
+}
+
+fn newest_first(a: &str, b: &str) -> Ordering {
+    if ver_less(b, a) {
+        Ordering::Less
+    } else if ver_less(a, b) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
 impl Resolver<'_> {
     /// Picks the highest versions out of an HTML directory index. One capture group is the
     /// version; two or more mean (family, ..., version), so each family gets its own newest.
     pub(super) fn listing(&self, s: &Source) -> Result<Vec<Item>> {
+        if !s.dirs.is_empty() {
+            return self.two_level(s);
+        }
+        let re = Regex::new(&s.pattern)?;
+        let items = self.one_dir(s, &s.url, &re, "", None)?;
+        if items.is_empty() {
+            bail!("{}: no entry matches {}", s.url, s.pattern);
+        }
+        Ok(items)
+    }
+
+    /// Descends into the newest `dir_top` directories (all when 0) whose names match `dirs`,
+    /// and picks files from each. A link that leaves `s.url`, or a name that decodes to a
+    /// path, is not followed: parent links are normal on an index page.
+    fn two_level(&self, s: &Source) -> Result<Vec<Item>> {
+        let prefix = if s.url.ends_with('/') {
+            s.url.clone()
+        } else {
+            format!("{}/", s.url)
+        };
+        let dirs_re = Regex::new(&s.dirs)?;
+        let exclude = (!s.exclude.is_empty())
+            .then(|| Regex::new(&s.exclude))
+            .transpose()?;
         let body = self.get(&s.url, DOC_LIMIT)?;
         let body = String::from_utf8_lossy(&body);
-        let re = Regex::new(&s.pattern)?;
-        let mut cands: Vec<Candidate> = Vec::new();
-        let mut all = Vec::new();
         let mut seen = HashSet::new();
-        for m in HREF.captures_iter(&body) {
-            let Some(href) = m.get(1).map(|x| x.as_str()) else {
+        let mut dirs: Vec<(String, String, String)> = Vec::new();
+        for href in hrefs(&body) {
+            let Some(g) = dirs_re.captures(href) else {
                 continue;
             };
-            let href = href.strip_prefix("./").unwrap_or(href);
-            all.push(href);
-            let Some(g) = re.captures(href) else { continue };
-            if !seen.insert(href) {
+            let Some(url) = join(&s.url, href).filter(|u| u.starts_with(&prefix)) else {
+                continue;
+            };
+            let Some(name) = percent_decode(href.trim_end_matches('/')) else {
+                continue;
+            };
+            if name.is_empty()
+                || name.starts_with('.')
+                || name.contains('/')
+                || exclude.as_ref().is_some_and(|e| e.is_match(href))
+                || !seen.insert(href)
+            {
                 continue;
             }
-            let Some(url) = join(&s.url, href) else {
+            let ver = g.get(1).map_or(name.as_str(), |m| m.as_str()).to_string();
+            dirs.push((url, name, ver));
+        }
+        dirs.sort_by(|a, b| newest_first(&a.2, &b.2));
+        if s.dir_top > 0 {
+            dirs.truncate(s.dir_top);
+        }
+        let mut out = Vec::new();
+        for (url, name, ver) in &dirs {
+            let re = Regex::new(&s.pattern.replace("{dir}", &regex::escape(name)))?;
+            out.extend(self.one_dir(s, url, &re, ver, Some(url))?);
+        }
+        if out.is_empty() {
+            bail!("{}: no entry matches {}", s.url, s.pattern);
+        }
+        Ok(out)
+    }
+
+    /// One directory index: the newest matching entries. `inside` confines every entry to
+    /// that URL prefix.
+    fn one_dir(
+        &self,
+        s: &Source,
+        url: &str,
+        re: &Regex,
+        dir_ver: &str,
+        inside: Option<&str>,
+    ) -> Result<Vec<Item>> {
+        let body = self.get(url, DOC_LIMIT)?;
+        let body = String::from_utf8_lossy(&body);
+        let all = hrefs(&body);
+        let mut cands: Vec<Candidate> = Vec::new();
+        let mut seen = HashSet::new();
+        for href in &all {
+            let Some(g) = re.captures(href) else { continue };
+            if !seen.insert(*href) {
+                continue;
+            }
+            let Some(item_url) = join(url, href) else {
                 continue;
             };
-            let Some(name) = percent_decode(url_base(&url)) else {
+            if inside.is_some_and(|p| !confined(&item_url, p)) {
+                continue;
+            }
+            let Some(name) = percent_decode(url_base(&item_url)) else {
                 continue;
             };
             let group = |i: usize| g.get(i).map_or("", |m| m.as_str()).to_string();
             let (family, ver) = match g.len() {
-                1 => (String::new(), String::new()),
+                1 => (String::new(), dir_ver.to_string()),
                 2 => (String::new(), group(1)),
                 n => (group(1), group(n - 1)),
             };
@@ -150,57 +271,32 @@ impl Resolver<'_> {
                 family,
                 item: Item {
                     name,
-                    url,
+                    url: item_url,
                     version: ver.clone(),
                     ..Item::default()
                 },
                 ver,
             });
         }
+        if cands.is_empty() {
+            return Ok(cands.into_iter().map(|c| c.item).collect());
+        }
         let sums_url = if s.sums.contains('*') {
             let h = all
                 .iter()
                 .find(|h| glob(&s.sums, url_base(h)))
-                .with_context(|| format!("{}: no entry matches {}", s.url, s.sums))?;
-            join(&s.url, h)
+                .with_context(|| format!("{url}: no entry matches {}", s.sums))?;
+            join(url, h).filter(|u| inside.is_none_or(|p| confined(u, p)))
         } else {
             None
         };
-        if cands.is_empty() {
-            bail!("{}: no entry matches {}", s.url, s.pattern);
-        }
-        let mut vers: HashMap<&str, Vec<&str>> = HashMap::new();
-        for c in &cands {
-            let v = vers.entry(&c.family).or_default();
-            if !v.contains(&c.ver.as_str()) {
-                v.push(&c.ver);
+        let mut items = pick(cands, s.top);
+        if sums_url.is_some() {
+            for it in &mut items {
+                it.sums_url.clone_from(&sums_url);
             }
         }
-        let mut keep = HashSet::new();
-        for (fam, vs) in &mut vers {
-            vs.sort_by(|a, b| {
-                if ver_less(b, a) {
-                    Ordering::Less
-                } else if ver_less(a, b) {
-                    Ordering::Greater
-                } else {
-                    Ordering::Equal
-                }
-            });
-            for v in vs.iter().take(s.top.max(1)) {
-                keep.insert(((*fam).to_string(), (*v).to_string()));
-            }
-        }
-        Ok(cands
-            .into_iter()
-            .filter(|c| keep.contains(&(c.family.clone(), c.ver.clone())))
-            .map(|mut c| {
-                if sums_url.is_some() {
-                    c.item.sums_url.clone_from(&sums_url);
-                }
-                c.item
-            })
-            .collect())
+        Ok(items)
     }
 }
 
@@ -311,5 +407,94 @@ mod tests {
             .resolve(&source(srv.url("d/"), r"-([\d.]+)$"))
             .unwrap_err();
         assert!(format!("{err:#}").contains("bad or duplicate"), "{err:#}");
+    }
+
+    fn two(srv: &crate::net::testserver::Server, dirs: &str, pattern: &str) -> Source {
+        let mut s = source(srv.url("p/"), pattern);
+        s.dirs = dirs.into();
+        s
+    }
+
+    fn names(items: &[Item]) -> Vec<&str> {
+        items.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    #[test]
+    fn two_level_series() {
+        let srv = serve(&[
+            (
+                "p/",
+                br#"<a href="../">up</a> <a href="gcc-13.3.0/">a</a> <a href="gcc-14.2.0/">b</a>
+                <a href="gcc-14.1.0/">c</a> <a href="gcc-9.5.0/">d</a> <a href="other/">e</a>"#,
+            ),
+            (
+                "p/gcc-14.2.0/",
+                br#"<a href="gcc-14.2.0.tar.xz">x</a> <a href="gcc-14.2.0.tar.xz.sig">s</a>"#,
+            ),
+            ("p/gcc-14.1.0/", br#"<a href="gcc-14.1.0.tar.xz">x</a>"#),
+        ]);
+        let dl = downloader();
+        let r = resolver(&dl, "");
+        let mut s = two(&srv, r"^gcc-(\d+\.\d+\.\d+)/$", r"^{dir}\.tar\.xz$");
+        s.dir_top = 2;
+        let items = r.resolve(&s).unwrap();
+        assert_eq!(names(&items), ["gcc-14.2.0.tar.xz", "gcc-14.1.0.tar.xz"]);
+        assert_eq!(items[0].url, srv.url("p/gcc-14.2.0/gcc-14.2.0.tar.xz"));
+    }
+
+    #[test]
+    fn two_level_every_dir() {
+        let srv = serve(&[
+            ("p/", br#"<a href="a/">a</a> <a href="b/">b</a> <a href="skip/">c</a> <a href="empty/">e</a>"#),
+            ("p/a/", br#"<a href="a-1.0.tgz">x</a> <a href="a-2.0.tgz">y</a>"#),
+            ("p/b/", br#"<a href="b-3.tgz">x</a>"#),
+            ("p/empty/", br"nothing"),
+        ]);
+        let dl = downloader();
+        let r = resolver(&dl, "");
+        let mut s = two(&srv, r"^[a-z]+/$", r"^[a-z]-([\d.]+)\.tgz$");
+        s.exclude = "^skip/$".into();
+        let items = r.resolve(&s).unwrap();
+        let mut got = names(&items);
+        got.sort_unstable();
+        assert_eq!(got, ["a-2.0.tgz", "b-3.tgz"]);
+        assert!(srv.hits().iter().all(|h| !h.path.contains("skip")));
+    }
+
+    #[test]
+    fn two_level_version_from_dir() {
+        let srv = serve(&[
+            ("p/", br#"<a href="v1.9/">a</a> <a href="v1.10/">b</a>"#),
+            ("p/v1.9/", br#"<a href="tool.tgz">x</a>"#),
+            ("p/v1.10/", br#"<a href="tool.tgz">x</a>"#),
+        ]);
+        let dl = downloader();
+        let r = resolver(&dl, "");
+        let mut s = two(&srv, r"^v([\d.]+)/$", r"^tool\.tgz$");
+        s.dir_top = 1;
+        let items = r.resolve(&s).unwrap();
+        assert_eq!(items[0].version, "1.10");
+        assert_eq!(items[0].url, srv.url("p/v1.10/tool.tgz"));
+    }
+
+    #[test]
+    fn two_level_refuses_escape() {
+        let srv = serve(&[
+            (
+                "p/",
+                br#"<a href="..%2F/">a</a> <a href="https://other/x/">b</a> <a href="//other/x/">c</a>
+                <a href="../">d</a> <a href="ok/">e</a>"#,
+            ),
+            ("p/ok/", br#"<a href="f.tgz">x</a> <a href="https://other/f.tgz">y</a> <a href="../f.tgz">z</a>
+                <a href="https://HOST/p/ok/../../evil/f.tgz">u</a> <a href="%2e%2e/%2e%2e/evil/f.tgz">v</a>"#),
+        ]);
+        let dl = downloader();
+        let r = resolver(&dl, "");
+        let items = r.resolve(&two(&srv, r"^.*/$", r"f\.tgz$")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, srv.url("p/ok/f.tgz"));
+        let paths: Vec<_> = srv.hits().into_iter().map(|h| h.path).collect();
+        assert!(paths.iter().all(|p| p.starts_with("p/")), "{paths:?}");
+        assert_eq!(paths.len(), 2, "{paths:?}");
     }
 }

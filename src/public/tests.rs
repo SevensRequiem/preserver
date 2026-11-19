@@ -72,6 +72,7 @@ impl Env {
             reserve_percent: 10,
             free: &free,
             staged: Mutex::new(HashMap::new()),
+            resolved: Mutex::new(HashMap::new()),
             gens: Mutex::new(HashMap::new()),
             walkers: self.walkers,
             metalink: "",
@@ -1304,4 +1305,75 @@ fn list_shows_repo_and_git_rows() {
     );
     let text = list_text(&cat, None, &status::Status::default()).unwrap();
     assert!(row_of(&text, "r ").contains("mirror -  gen -  -"), "{text}");
+}
+
+#[test]
+fn resolve_cached_across_replans() {
+    let env = Env::new();
+    env.routes(&[
+        ("d/", br#"<a href="v1/">v1</a>"#),
+        ("d/v1/", br#"<a href="f-1.tar.gz">f</a>"#),
+    ]);
+    let mut src = env.fixed("src", "d/");
+    src.resolve = Some(Resolve::Listing);
+    src.urls = Vec::new();
+    src.url = env.srv.url("d/");
+    src.dirs = r"^v\d+/$".into();
+    src.pattern = r"^f-([\d.]+)\.tar\.gz$".into();
+    let cat = catalog(2, vec![src]);
+    env.with(&cat, (900 * GB, 1000 * GB), |p| {
+        let first = p.resolve_set("job", &cat.sets[0]).unwrap();
+        let listings = env.srv.hits().len();
+        assert_eq!(listings, 2);
+        let again = p.resolve_set("job", &cat.sets[0]).unwrap();
+        assert_eq!(env.srv.hits().len(), listings, "a re-plan lists nothing");
+        assert_eq!(first[0].1, again[0].1);
+        p.resolve_set("other", &cat.sets[0]).unwrap();
+        assert_eq!(env.srv.hits().len(), 2 * listings, "the cache is per job");
+    });
+}
+
+#[test]
+fn resolve_cache_survives_a_stop_and_ends_with_the_job() {
+    let env = Env::new();
+    env.routes(&[
+        ("d/", br#"<a href="v1/">v1</a>"#),
+        ("d/v1/", br#"<a href="f-1.tar.gz">f</a>"#),
+    ]);
+    let mut src = env.fixed("src", "d/");
+    src.resolve = Some(Resolve::Listing);
+    src.urls = Vec::new();
+    src.url = env.srv.url("d/");
+    src.dirs = r"^v\d+/$".into();
+    src.pattern = r"^f-([\d.]+)\.tar\.gz$".into();
+    let cat = catalog(2, vec![src]);
+    let drive: DriveId = "0123-ABCD".parse().unwrap();
+    let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
+    let mut job = env.store.job(&ids[0].1).unwrap();
+    env.with(&cat, (900 * GB, 1000 * GB), |p| {
+        p.resolve_set(&job.id, &cat.sets[0]).unwrap();
+        let listings = env.srv.hits().len();
+        for state in [
+            JobState::Paused,
+            JobState::Queued,
+            JobState::Blocked(crate::queue::BlockReason::DriveAbsent),
+        ] {
+            job.state = state;
+            p.settle(&mut job, &env.paths.mnt, &[]);
+            p.resolve_set(&job.id, &cat.sets[0]).unwrap();
+            assert_eq!(
+                env.srv.hits().len(),
+                listings,
+                "{state:?} keeps the listing"
+            );
+        }
+        job.state = JobState::Canceled;
+        p.settle(&mut job, &env.paths.mnt, &[]);
+        p.resolve_set(&job.id, &cat.sets[0]).unwrap();
+        assert_eq!(
+            env.srv.hits().len(),
+            2 * listings,
+            "a finished job starts over"
+        );
+    });
 }
