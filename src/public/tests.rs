@@ -79,8 +79,8 @@ impl Env {
             Worker {
                 store: &self.store,
                 dl: &self.dl,
-                plan: &|job, root| p.plan(job, root),
-                settle: &|job, root| p.settle(job, root),
+                plan: &|job, root, _| p.plan(job, root).map(Work::from),
+                settle: &|job, root, _| p.settle(job, root),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
             }
             .run(Pass::FRESH)

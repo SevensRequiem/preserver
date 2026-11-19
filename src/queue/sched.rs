@@ -6,12 +6,13 @@ use super::store::Store;
 use crate::config::DriveId;
 use crate::net::download::{Downloader, Fail, Fetch, STREAMS};
 use crate::platform::DriveAt;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 pub(crate) const PER_HOST: usize = 2;
@@ -45,6 +46,8 @@ struct State {
     running: usize,
     current: BTreeSet<usize>,
     files_done: u64,
+    /// Plan positions that finished verified.
+    ok: Vec<usize>,
     failed: Vec<String>,
     drive_gone: bool,
 }
@@ -154,7 +157,10 @@ impl<'a> Pool<'a> {
         st.running -= 1;
         st.current.remove(&i);
         match r {
-            Ok(()) => st.files_done += 1,
+            Ok(()) => {
+                st.files_done += 1;
+                st.ok.push(i);
+            }
             Err(Fail::Stopped) => {}
             Err(_) if gone => {
                 st.drive_gone = true;
@@ -338,19 +344,60 @@ fn outranked(store: &Store, job: &Job) -> bool {
     })
 }
 
+/// A job's size as the planner knows it, when it is more than the current batch.
+pub(crate) struct Whole {
+    pub files: u64,
+    pub bytes: u64,
+    pub files_done: u64,
+    pub bytes_done: u64,
+}
+
+/// One batch of downloads; `more` asks the worker to plan again once they all verified.
+#[derive(Default)]
+pub(crate) struct Planned {
+    pub fetches: Vec<Fetch>,
+    pub more: bool,
+    pub whole: Option<Whole>,
+}
+
+pub(crate) enum Work<'a> {
+    Fetch(Planned),
+    /// Work that is not a download (a git transfer): it gets the stop flag and a byte counter.
+    /// It is never yielded, since it cannot resume; pause and cancel still stop it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the git mirror job builds it in a later step")
+    )]
+    Run(Run<'a>),
+}
+
+pub(crate) type Run<'a> = Box<dyn FnOnce(&AtomicBool, &Arc<AtomicU64>) -> Result<()> + Send + 'a>;
+pub(crate) type Planner<'a> = dyn Fn(&Job, &Path, &[usize]) -> Result<Work<'a>> + Sync + 'a;
+
+impl From<Vec<Fetch>> for Work<'_> {
+    fn from(fetches: Vec<Fetch>) -> Self {
+        Self::Fetch(Planned {
+            fetches,
+            ..Planned::default()
+        })
+    }
+}
+
 pub(crate) struct Worker<'a> {
     pub store: &'a Store,
     pub dl: &'a Downloader,
-    /// The job's files, given the root of its mounted drive.
-    pub plan: &'a (dyn Fn(&Job, &Path) -> Result<Vec<Fetch>> + Sync),
-    /// Called with the job's outcome before it is saved, whenever a job stops. It finishes
-    /// what the downloads were for, and may turn a Done job into a Failed one.
-    pub settle: &'a (dyn Fn(&mut Job, &Path) + Sync),
+    /// The job's next work, given the root of its mounted drive and the positions in the
+    /// previous batch that finished verified (empty for the first call).
+    pub plan: &'a Planner<'a>,
+    /// Called with the job's outcome before it is saved, whenever a job stops, and with the
+    /// last batch's verified positions. It finishes what the downloads were for, and may turn
+    /// a Done job into a Failed one.
+    pub settle: &'a (dyn Fn(&mut Job, &Path, &[usize]) + Sync),
     /// Where the drive is; the worker never mounts it.
     pub drive: &'a (dyn Fn(&DriveId) -> DriveAt + Sync),
 }
 
-impl Worker<'_> {
+impl<'a> Worker<'a> {
     /// The download lane's jobs: the worker never resets or saves another lane's.
     fn jobs(&self) -> Result<Vec<Job>> {
         let mut jobs = self.store.jobs()?;
@@ -381,6 +428,10 @@ impl Worker<'_> {
         }
     }
 
+    fn drive_ok(&self, job: &Job) -> bool {
+        matches!((self.drive)(&job.drive), DriveAt::Mounted(r) if r.exists())
+    }
+
     fn run_job(&self, mut job: Job) -> Result<()> {
         let root = match (self.drive)(&job.drive) {
             DriveAt::Mounted(root) => root,
@@ -393,12 +444,16 @@ impl Worker<'_> {
                 return self.store.save(&mut job);
             }
         };
-        let fetches = match (self.plan)(&job, &root) {
-            Ok(f) => f,
+        let mut work = match (self.plan)(&job, &root, &[]) {
+            Ok(w) => w,
+            Err(_) if !self.drive_ok(&job) => {
+                job.state = JobState::Blocked(BlockReason::DriveAbsent);
+                return self.store.save(&mut job);
+            }
             Err(e) => {
                 job.state = JobState::Failed;
                 job.error = Some(format!("{e:#}"));
-                (self.settle)(&mut job, &root);
+                (self.settle)(&mut job, &root, &[]);
                 return self.store.save(&mut job);
             }
         };
@@ -407,60 +462,185 @@ impl Worker<'_> {
         };
         job.attempts += 1;
         job.error = None;
-        job.progress = Progress {
-            files_total: fetches.len() as u64,
-            bytes_total: fetches.iter().filter_map(|f| f.size).sum(),
-            ..Progress::default()
-        };
-        self.store.save(&mut job)?;
+        // Files and bytes finished in earlier batches, when the planner gives no total.
+        let mut seen = (0, 0);
+        let mut ok = Vec::new();
+        let state = loop {
+            let planned = match work {
+                Work::Run(f) => {
+                    job.progress = Progress::default();
+                    self.store.save(&mut job)?;
+                    break self.run_closure(&mut job, f);
+                }
+                Work::Fetch(p) => p,
+            };
+            let Planned {
+                fetches,
+                more,
+                whole,
+            } = planned;
+            if more && fetches.is_empty() {
+                job.error = Some("planner returned an empty batch".into());
+                break JobState::Failed;
+            }
+            let base = whole
+                .as_ref()
+                .map_or(seen, |w| (w.files_done, w.bytes_done));
+            job.progress = Progress {
+                files_total: whole
+                    .as_ref()
+                    .map_or(seen.0 + fetches.len() as u64, |w| w.files),
+                bytes_total: whole.as_ref().map_or_else(
+                    || seen.1 + fetches.iter().filter_map(|f| f.size).sum::<u64>(),
+                    |w| w.bytes,
+                ),
+                files_done: base.0,
+                bytes_done: base.1,
+                ..Progress::default()
+            };
+            self.store.save(&mut job)?;
 
-        let pool = Pool::new(&fetches);
+            let (st, halt, bytes) = self.batch(&job, &fetches, base);
+            job.progress.bytes_done = base.1 + bytes;
+            job.progress.files_done = base.0 + st.files_done;
+            job.progress.rate_bps = 0;
+            job.progress.current.clear();
+            seen = (seen.0 + st.files_done, seen.1 + bytes);
+            ok.clone_from(&st.ok);
+            ok.sort_unstable();
+            let state = stopped(&mut job, st, halt, &fetches);
+            if state != JobState::Done || !more {
+                break state;
+            }
+            match halt_requested(self.store, &job.id) {
+                Some(Halt::Cancel) => break JobState::Canceled,
+                Some(_) => break JobState::Paused,
+                None => {}
+            }
+            match (self.plan)(&job, &root, &ok) {
+                Ok(w) => work = w,
+                Err(_) if !self.drive_ok(&job) => {
+                    job.attempts -= 1;
+                    break JobState::Blocked(BlockReason::DriveAbsent);
+                }
+                Err(e) => {
+                    job.error = Some(format!("{e:#}"));
+                    break JobState::Failed;
+                }
+            }
+        };
+        job.state = state;
+        (self.settle)(&mut job, &root, &ok);
+        self.store.save(&mut job)
+    }
+
+    /// Downloads one batch over the pool, saving progress every second until it ends. Returns
+    /// the pool's state, what halted it and the bytes fetched.
+    fn batch(&self, job: &Job, fetches: &[Fetch], base: (u64, u64)) -> (State, Option<Halt>, u64) {
+        let pool = Pool::new(fetches);
         let done = AtomicU64::new(0);
-        let drive_ok = || matches!((self.drive)(&job.drive), DriveAt::Mounted(r) if r.exists());
+        let drive_ok = || self.drive_ok(job);
         let mut halt = None;
         std::thread::scope(|s| {
             for _ in 0..STREAMS {
                 s.spawn(|| pool.work(self.dl, &done, &drive_ok));
             }
-            let mut last = (Instant::now(), 0);
+            let mut last = (Instant::now(), base.1);
             while !pool.wait(Duration::from_secs(1)) {
                 if let Some(h) = halt_requested(self.store, &job.id)
-                    .or_else(|| outranked(self.store, &job).then_some(Halt::Yield))
+                    .or_else(|| outranked(self.store, job).then_some(Halt::Yield))
                 {
                     halt = Some(h);
                     pool.halt();
                 }
-                let bytes = done.load(Ordering::Relaxed);
-                let secs = last.0.elapsed().as_secs_f64();
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    clippy::cast_precision_loss,
-                    reason = "a displayed rate"
-                )]
-                let rate = (bytes.saturating_sub(last.1) as f64 / secs) as u64;
-                last = (Instant::now(), bytes);
                 let st = pool.lock();
-                let mut j = job.clone();
-                j.progress.bytes_done = bytes;
-                j.progress.rate_bps = rate;
-                j.progress.files_done = st.files_done;
-                j.progress.current = st.current.iter().map(|i| fetches[*i].url.clone()).collect();
+                let files = base.0 + st.files_done;
+                let current = st.current.iter().map(|i| fetches[*i].url.clone()).collect();
                 drop(st);
-                if let Err(e) = self.store.save(&mut j) {
-                    tracing::warn!("progress: {e:#}");
-                }
+                self.progress(
+                    job,
+                    &mut last,
+                    base.1 + done.load(Ordering::Relaxed),
+                    files,
+                    current,
+                );
             }
         });
-
         let st = pool.st.into_inner().unwrap_or_else(PoisonError::into_inner);
+        (st, halt, done.load(Ordering::Relaxed))
+    }
+
+    /// Runs a `Work::Run` job on a scoped thread, saving progress and applying the controls
+    /// every second.
+    fn run_closure(&self, job: &mut Job, f: Run<'a>) -> JobState {
+        let stop = AtomicBool::new(false);
+        let done = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = channel();
+        let mut halt = None;
+        let mut last = (Instant::now(), 0);
+        let r = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(f(&stop, &done));
+            });
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(r) => return r,
+                    Err(RecvTimeoutError::Disconnected) => return Err(anyhow!("job thread died")),
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                if halt.is_none()
+                    && let Some(h) = halt_requested(self.store, &job.id)
+                {
+                    halt = Some(h);
+                    // Relaxed: the job only needs to see it soon.
+                    stop.store(true, Ordering::Relaxed);
+                }
+                self.progress(job, &mut last, done.load(Ordering::Relaxed), 0, Vec::new());
+            }
+        });
         job.progress.bytes_done = done.load(Ordering::Relaxed);
-        job.progress.files_done = st.files_done;
         job.progress.rate_bps = 0;
         job.progress.current.clear();
-        job.state = stopped(&mut job, st, halt, &fetches);
-        (self.settle)(&mut job, &root);
-        self.store.save(&mut job)
+        match r {
+            Ok(()) => JobState::Done,
+            Err(_) if !self.drive_ok(job) => {
+                job.attempts -= 1;
+                JobState::Blocked(BlockReason::DriveAbsent)
+            }
+            Err(_) if halt == Some(Halt::Cancel) => JobState::Canceled,
+            Err(_) if halt == Some(Halt::Pause) => JobState::Paused,
+            Err(e) => {
+                job.error = Some(format!("{e:#}"));
+                JobState::Failed
+            }
+        }
+    }
+
+    fn progress(
+        &self,
+        job: &Job,
+        last: &mut (Instant, u64),
+        bytes: u64,
+        files: u64,
+        current: Vec<String>,
+    ) {
+        let secs = last.0.elapsed().as_secs_f64();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "a displayed rate"
+        )]
+        let rate = (bytes.saturating_sub(last.1) as f64 / secs) as u64;
+        *last = (Instant::now(), bytes);
+        let mut j = job.clone();
+        j.progress.bytes_done = bytes;
+        j.progress.rate_bps = rate;
+        j.progress.files_done = files;
+        j.progress.current = current;
+        if let Err(e) = self.store.save(&mut j) {
+            tracing::warn!("progress: {e:#}");
+        }
     }
 }
 
@@ -618,6 +798,7 @@ mod tests {
         data: Vec<u8>,
         store: Store,
         dl: Downloader,
+        drive: Box<dyn Fn(&DriveId) -> DriveAt + Sync>,
     }
 
     impl Rig {
@@ -627,12 +808,20 @@ mod tests {
             let data = body(len, 42);
             let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
             let store = Store::new(tmp.path().join("queue"));
+            let mnt = tmp.path().join("mnt");
             Self {
                 tmp,
                 srv,
                 data,
                 store,
                 dl: dl(rate),
+                drive: Box::new(move |_| {
+                    if mnt.exists() {
+                        DriveAt::Mounted(mnt.clone())
+                    } else {
+                        DriveAt::Absent
+                    }
+                }),
             }
         }
 
@@ -677,12 +866,12 @@ mod tests {
         }
 
         fn run_on(&self, pass: Pass, drive: &(dyn Fn(&DriveId) -> DriveAt + Sync)) {
-            let plan = |_: &Job, root: &Path| Ok(vec![self.fetch(root)]);
+            let plan = |_: &Job, root: &Path, _: &[usize]| Ok(vec![self.fetch(root)].into());
             Worker {
                 store: &self.store,
                 dl: &self.dl,
                 plan: &plan,
-                settle: &|_, _| {},
+                settle: &|_, _, _| {},
                 drive,
             }
             .run(pass)
@@ -775,7 +964,7 @@ mod tests {
             .unwrap();
         let order = Mutex::new(Vec::new());
         let mnt = r.mnt();
-        let plan = |j: &Job, root: &Path| {
+        let plan = |j: &Job, root: &Path, _: &[usize]| {
             let JobKind::Set { set } = &j.kind else {
                 unreachable!()
             };
@@ -783,13 +972,14 @@ mod tests {
             Ok(vec![Fetch {
                 dest: root.join(format!("staging/{set}.iso")),
                 ..r.fetch(root)
-            }])
+            }]
+            .into())
         };
         let worker = Worker {
             store: &r.store,
             dl: &r.dl,
             plan: &plan,
-            settle: &|_, _| {},
+            settle: &|_, _, _| {},
             drive: &|_| DriveAt::Mounted(mnt.clone()),
         };
         let mut small = None;
@@ -997,5 +1187,299 @@ mod tests {
         r.run();
         let j = r.store.job(&job.id).unwrap();
         assert_eq!((j.state, j.attempts), (JobState::Done, 1));
+    }
+    fn run_plan<'a>(r: &'a Rig, plan: &'a Planner<'a>) {
+        run_settle(r, plan, &|_, _, _| {});
+    }
+
+    fn run_settle<'a>(
+        r: &'a Rig,
+        plan: &'a Planner<'a>,
+        settle: &'a (dyn Fn(&mut Job, &Path, &[usize]) + Sync),
+    ) {
+        Worker {
+            store: &r.store,
+            dl: &r.dl,
+            plan,
+            settle,
+            drive: &*r.drive,
+        }
+        .run(Pass::FRESH)
+        .unwrap();
+    }
+
+    #[test]
+    fn batches_run_until_the_planner_stops_asking() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let calls = Mutex::new(Vec::new());
+        let plan = |_: &Job, root: &Path, ok: &[usize]| {
+            let mut c = calls.lock().unwrap();
+            c.push(ok.to_vec());
+            let n = c.len();
+            let fetches = (0..n)
+                .map(|i| Fetch {
+                    dest: root.join(format!("staging/f{n}-{i}")),
+                    ..r.fetch(root)
+                })
+                .collect();
+            Ok(Work::Fetch(Planned {
+                fetches,
+                more: n < 3,
+                whole: Some(Whole {
+                    files: 6,
+                    bytes: 6000,
+                    files_done: (n * (n - 1) / 2) as u64,
+                    bytes_done: 1000 * (n * (n - 1) / 2) as u64,
+                }),
+            }))
+        };
+        let settled = Mutex::new(Vec::new());
+        run_settle(&r, &plan, &|_, _, ok| {
+            settled.lock().unwrap().push(ok.to_vec());
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Done, "{:?}", j.error);
+        assert_eq!(*calls.lock().unwrap(), [vec![], vec![0], vec![0, 1]]);
+        assert_eq!(*settled.lock().unwrap(), [vec![0, 1, 2]]);
+        assert_eq!((j.progress.files_done, j.progress.files_total), (6, 6));
+        assert_eq!(j.attempts, 1);
+    }
+
+    #[test]
+    fn an_empty_batch_that_wants_more_fails_the_job() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        run_plan(&r, &|_, _, _| {
+            Ok(Work::Fetch(Planned {
+                more: true,
+                ..Planned::default()
+            }))
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Failed);
+        assert_eq!(j.error.as_deref(), Some("planner returned an empty batch"));
+    }
+
+    #[test]
+    fn a_failed_batch_stops_the_job_before_the_next_plan() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        r.srv.set(|b| b.status = Some(404));
+        let calls = Mutex::new(0);
+        run_plan(&r, &|_, root, _| {
+            *calls.lock().unwrap() += 1;
+            Ok(Work::Fetch(Planned {
+                fetches: vec![r.fetch(root)],
+                more: true,
+                whole: None,
+            }))
+        });
+        assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Failed);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_closure_job_ends_done_or_failed() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        run_plan(&r, &|_, _, _| {
+            Ok(Work::Run(Box::new(|_, done| {
+                done.store(77, Ordering::Relaxed);
+                Ok(())
+            })))
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.progress.bytes_done), (JobState::Done, 77));
+
+        let job = r.job();
+        run_plan(&r, &|_, _, _| {
+            Ok(Work::Run(Box::new(|_, _| Err(anyhow!("git said no")))))
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Failed);
+        assert_eq!(j.error.as_deref(), Some("git said no"));
+    }
+
+    #[test]
+    fn a_closure_job_stops_on_cancel_and_pause() {
+        for cancel in [true, false] {
+            let r = Rig::new(1000, 0);
+            let job = r.job();
+            let plan = |_: &Job, _: &Path, _: &[usize]| {
+                Ok(Work::Run(Box::new(
+                    |stop: &AtomicBool, _: &Arc<AtomicU64>| {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(anyhow!("stopped"))
+                    },
+                )))
+            };
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    r.store
+                        .edit_control(Some(&job.id), |c| {
+                            c.cancel = cancel;
+                            c.pause = !cancel;
+                        })
+                        .unwrap();
+                });
+                run_plan(&r, &plan);
+            });
+            let want = if cancel {
+                JobState::Canceled
+            } else {
+                JobState::Paused
+            };
+            assert_eq!(r.store.job(&job.id).unwrap().state, want, "cancel={cancel}");
+        }
+    }
+
+    #[test]
+    fn a_closure_job_with_the_drive_gone_blocks_without_an_attempt() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let gone = r.tmp.path().join("gone");
+        run_plan(&r, &|_, _, _| {
+            Ok(Work::Run(Box::new(|_, _| {
+                std::fs::rename(r.mnt(), &gone).unwrap();
+                Err(anyhow!("write failed"))
+            })))
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(
+            (j.state, j.attempts),
+            (JobState::Blocked(BlockReason::DriveAbsent), 0)
+        );
+    }
+
+    #[test]
+    fn a_halt_between_batches_stops_without_planning_again() {
+        for cancel in [true, false] {
+            let r = Rig::new(1000, 0);
+            let job = r.job();
+            let calls = Mutex::new(0);
+            let plan = |_: &Job, root: &Path, _: &[usize]| {
+                *calls.lock().unwrap() += 1;
+                r.store
+                    .edit_control(Some(&job.id), |c| {
+                        c.cancel = cancel;
+                        c.pause = !cancel;
+                    })
+                    .unwrap();
+                Ok(Work::Fetch(Planned {
+                    fetches: vec![r.fetch(root)],
+                    more: true,
+                    whole: None,
+                }))
+            };
+            run_plan(&r, &plan);
+            let want = if cancel {
+                JobState::Canceled
+            } else {
+                JobState::Paused
+            };
+            assert_eq!(r.store.job(&job.id).unwrap().state, want, "cancel={cancel}");
+            assert_eq!(*calls.lock().unwrap(), 1, "cancel={cancel}");
+        }
+    }
+
+    #[test]
+    fn a_drive_gone_between_batches_blocks_without_an_attempt() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let gone = r.tmp.path().join("gone");
+        let calls = Mutex::new(0);
+        run_plan(&r, &|_, root, _| {
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            if *n == 2 {
+                std::fs::rename(r.mnt(), &gone).unwrap();
+                return Err(anyhow!("read failed"));
+            }
+            Ok(Work::Fetch(Planned {
+                fetches: vec![r.fetch(root)],
+                more: true,
+                whole: None,
+            }))
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(
+            (j.state, j.attempts),
+            (JobState::Blocked(BlockReason::DriveAbsent), 0)
+        );
+    }
+
+    #[test]
+    fn a_running_closure_job_is_not_outranked() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let mut urgent = r.job();
+        urgent.priority = 0;
+        urgent.state = JobState::Paused;
+        r.store.save(&mut urgent).unwrap();
+        let plan = |j: &Job, _: &Path, _: &[usize]| {
+            let first = j.id == job.id;
+            let (store, urgent_id) = (&r.store, urgent.id.clone());
+            Ok(Work::Run(Box::new(
+                move |_: &AtomicBool, _: &Arc<AtomicU64>| {
+                    if first {
+                        store
+                            .edit_control(Some(&urgent_id), |c| c.pause = false)
+                            .unwrap();
+                        std::thread::sleep(Duration::from_millis(2500));
+                    }
+                    Ok(())
+                },
+            )))
+        };
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.attempts), (JobState::Done, 1));
+        assert_eq!(r.store.job(&urgent.id).unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn a_paused_closure_job_runs_to_done_once_resumed() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let runs = Mutex::new(0);
+        let plan = |_: &Job, _: &Path, _: &[usize]| {
+            let first = {
+                let mut n = runs.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            Ok(Work::Run(Box::new(
+                move |stop: &AtomicBool, _: &Arc<AtomicU64>| {
+                    if !first {
+                        return Ok(());
+                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(anyhow!("stopped"))
+                },
+            )))
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                r.store
+                    .edit_control(Some(&job.id), |c| c.pause = true)
+                    .unwrap();
+            });
+            run_plan(&r, &plan);
+        });
+        assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Paused);
+        r.store
+            .edit_control(Some(&job.id), |c| c.pause = false)
+            .unwrap();
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Done, "{:?}", j.error);
+        assert_eq!(*runs.lock().unwrap(), 2);
     }
 }

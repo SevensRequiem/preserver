@@ -12,7 +12,7 @@ use crate::net::client;
 use crate::net::download::{CHECKPOINT, Downloader, Fetch};
 use crate::net::throttle::Throttle;
 use crate::paths::Paths;
-use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Worker, runnable};
+use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Work, Worker, runnable};
 use crate::resolve::{GH_API, HF_BASE, Item, Resolver};
 use crate::verify::Verifier;
 use crate::{actions, platform, status};
@@ -323,8 +323,8 @@ fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
     Worker {
         store,
         dl,
-        plan: &|job, root| p.plan(job, root),
-        settle: &|job, root| p.settle(job, root),
+        plan: &|job, root, _| p.plan(job, root).map(Work::from),
+        settle: &|job, root, _| p.settle(job, root),
         drive: &platform::locate,
     }
     .run(pass)

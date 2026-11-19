@@ -8,7 +8,7 @@ use crate::paths::Paths;
 use crate::{actions, public};
 use anyhow::{Result, bail};
 pub(crate) use job::{BlockReason, Job, JobKind, JobState, Lane, Progress, Target};
-pub(crate) use sched::{Halt, Pass, Worker, apply_control, halt_requested, reset, runnable};
+pub(crate) use sched::{Halt, Pass, Work, Worker, apply_control, halt_requested, reset, runnable};
 use std::time::Duration;
 pub(crate) use store::Store;
 
