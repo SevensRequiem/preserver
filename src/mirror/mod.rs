@@ -2,6 +2,7 @@
 //! by swapping its metadata in only after every file it names has landed and verified.
 
 pub(crate) mod alpine;
+pub(crate) mod deb822;
 pub(crate) mod fedora;
 pub(crate) mod generation;
 

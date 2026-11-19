@@ -114,6 +114,43 @@ impl TestKey {
             .unwrap()
     }
 
+    pub(crate) fn clearsign_subkey(&self, text: &str) -> String {
+        CleartextSignedMessage::sign(
+            OsRng,
+            text,
+            &self.secret.secret_subkeys[0].key,
+            &Password::empty(),
+        )
+        .unwrap()
+        .to_armored_string(pgp::composed::ArmorOptions::default())
+        .unwrap()
+    }
+
+    /// One clearsigned text with a signature per entry: made by `.0`'s primary key, claiming to
+    /// be from `.1` (by fingerprint and key id, or by key id alone when `.2` is false).
+    pub(crate) fn clearsign_many(text: &str, parts: &[(&TestKey, &TestKey, bool)]) -> String {
+        CleartextSignedMessage::new_many(text, |normalized| {
+            Ok(parts
+                .iter()
+                .map(|(signer, claimed, with_fp)| {
+                    let key = &signer.secret.primary_key;
+                    let mut cfg =
+                        SignatureConfig::from_key(OsRng, key, SignatureType::Text).unwrap();
+                    let (mut hashed, unhashed) = claimed.subpackets(Timestamp::from_secs(now()));
+                    if !with_fp {
+                        hashed.pop();
+                    }
+                    (cfg.hashed_subpackets, cfg.unhashed_subpackets) = (hashed, unhashed);
+                    cfg.sign(key, &Password::empty(), normalized.as_bytes())
+                        .unwrap()
+                })
+                .collect())
+        })
+        .unwrap()
+        .to_armored_string(pgp::composed::ArmorOptions::default())
+        .unwrap()
+    }
+
     fn subpackets(&self, created: Timestamp) -> (Vec<Subpacket>, Vec<Subpacket>) {
         let key = &self.secret.primary_key;
         (

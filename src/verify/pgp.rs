@@ -170,19 +170,10 @@ fn check(
     if sig.hash_alg() == Some(HashAlgorithm::Md5) {
         bail!("MD5 signature");
     }
-    let fps = sig.issuer_fingerprint();
-    let ids = sig.issuer_key_id();
-    if fps.is_empty() && ids.is_empty() {
+    if sig.issuer_fingerprint().is_empty() && sig.issuer_key_id().is_empty() {
         bail!("signature does not name its issuer");
     }
-    // The fingerprint when the signature has one; the 64-bit key id only as a fallback.
-    let issued = |fp: pgp::types::Fingerprint, id: pgp::types::KeyId| {
-        if fps.is_empty() {
-            ids.iter().any(|i| **i == id)
-        } else {
-            fps.iter().any(|f| **f == fp)
-        }
-    };
+    let issued = |fp, id| names(sig, &fp, id);
     let mut last = None;
     for key in ring {
         let primary = &key.primary_key;
@@ -249,9 +240,9 @@ pub(crate) fn detached(
     signer.context("bad signature: the file holds no signature")
 }
 
-/// Checks a clearsigned document and returns the signer with the text the signature covers.
-/// Only that text may be trusted: whatever surrounds the signed block is not returned.
-pub(crate) fn clearsigned(ring: &[SignedPublicKey], doc: &[u8]) -> Result<(Signer, String)> {
+/// The signed block of a clearsigned file and the text its signatures cover. Whatever
+/// surrounds the block is dropped.
+fn cleartext(doc: &[u8]) -> Result<(CleartextSignedMessage, String)> {
     let text = std::str::from_utf8(doc).context("clearsigned file is not text")?;
     let start = text
         .find("-----BEGIN PGP SIGNED MESSAGE-----")
@@ -262,15 +253,82 @@ pub(crate) fn clearsigned(ring: &[SignedPublicKey], doc: &[u8]) -> Result<(Signe
     let (msg, _) = CleartextSignedMessage::from_string(&text[start..end])
         .map_err(|e| anyhow::anyhow!("unreadable clearsigned file: {e}"))?;
     let covered = msg.signed_text();
+    Ok((msg, covered))
+}
+
+fn cursor(covered: &str) -> impl FnMut() -> Result<Box<dyn Read>> {
+    let covered = covered.to_owned();
+    move || Ok(Box::new(std::io::Cursor::new(covered.clone())) as Box<dyn Read>)
+}
+
+/// Checks a clearsigned document and returns the signer with the text the signature covers.
+/// Only that text may be trusted: whatever surrounds the signed block is not returned.
+pub(crate) fn clearsigned(ring: &[SignedPublicKey], doc: &[u8]) -> Result<(Signer, String)> {
+    let (msg, covered) = cleartext(doc)?;
     let mut signer = None;
     for s in msg.signatures() {
-        let mut open = || Ok(Box::new(std::io::Cursor::new(covered.clone())) as Box<dyn Read>);
-        signer = Some(check(ring, s, &mut open).context("bad signature")?);
+        signer = Some(check(ring, s, &mut cursor(&covered)).context("bad signature")?);
     }
     Ok((
         signer.context("bad signature: the file holds no signature")?,
         covered,
     ))
+}
+
+/// Whether the signature names this key: by the hashed issuer fingerprint when it has one (the
+/// unhashed area is not covered by the signature, so a fingerprint there proves nothing), by
+/// the 64-bit key id only as a fallback.
+fn names(sig: &Signature, fp: &pgp::types::Fingerprint, id: pgp::types::KeyId) -> bool {
+    let hashed: Vec<_> = sig
+        .config()
+        .into_iter()
+        .flat_map(pgp::packet::SignatureConfig::hashed_subpackets)
+        .filter_map(|p| match &p.data {
+            pgp::packet::SubpacketData::IssuerFingerprint(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    if hashed.is_empty() {
+        sig.issuer_key_id().iter().any(|i| **i == id)
+    } else {
+        hashed.iter().any(|f| **f == *fp)
+    }
+}
+
+fn claims(ring: &[SignedPublicKey], sig: &Signature) -> bool {
+    ring.iter().any(|k| {
+        names(
+            sig,
+            &k.primary_key.fingerprint(),
+            k.primary_key.legacy_key_id(),
+        ) || k
+            .public_subkeys
+            .iter()
+            .any(|s| names(sig, &s.key.fingerprint(), s.key.legacy_key_id()))
+    })
+}
+
+/// Checks a clearsigned `Release` and returns every signer with the signed text. Unlike
+/// `clearsigned`, a signature by a key outside the ring is ignored (apt and a distribution
+/// sign with several keys and a mirror holds some of them), but every signature that names a
+/// ring key must verify, and at least one must. Callers pin the returned signers.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Debian walker uses it, a later phase 3 step")
+)]
+pub(crate) fn release(ring: &[SignedPublicKey], doc: &[u8]) -> Result<(Vec<Signer>, String)> {
+    let (msg, covered) = cleartext(doc)?;
+    let mut signers = Vec::new();
+    for s in msg.signatures() {
+        if !claims(ring, s) {
+            continue;
+        }
+        signers.push(check(ring, s, &mut cursor(&covered)).context("bad signature")?);
+    }
+    if signers.is_empty() {
+        bail!("bad signature: no signature by a key of the keyring");
+    }
+    Ok((signers, covered))
 }
 
 #[cfg(test)]
@@ -465,6 +523,91 @@ mod tests {
             clearsigned(&ring, text.as_bytes()).is_err(),
             "unsigned text"
         );
+    }
+
+    #[test]
+    fn release_signatures() {
+        let text = "Codename: trixie\nSuite: stable\n";
+        let (a, b, outside) = (TestKey::new(), TestKey::new(), TestKey::new());
+        let ring = keyring(&[a.public(), b.public()].concat());
+        let sign = |parts: &[(&TestKey, &TestKey, bool)]| TestKey::clearsign_many(text, parts);
+
+        let doc = sign(&[(&a, &a, true), (&outside, &outside, true)]);
+        let (signers, covered) = release(&ring, doc.as_bytes()).unwrap();
+        assert_eq!(signers.len(), 1, "the outside signature is ignored");
+        assert_eq!(signers[0].primary, a.fingerprint());
+        assert!(covered.contains("Codename: trixie"), "{covered}");
+        let doc = sign(&[(&a, &a, true), (&b, &b, true)]);
+        assert_eq!(release(&ring, doc.as_bytes()).unwrap().0.len(), 2);
+
+        let err = release(&ring, sign(&[(&outside, &outside, true)]).as_bytes()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no signature by a key"),
+            "{err:#}"
+        );
+        assert!(release(&ring, text.as_bytes()).is_err(), "unsigned text");
+
+        let doc = sign(&[(&a, &a, true), (&b, &b, true)]);
+        let tampered = doc.replace("trixie", "bookworm");
+        assert!(
+            release(&ring, tampered.as_bytes()).is_err(),
+            "bad ring signature"
+        );
+        let wrapped = format!("Codename: evil\n{doc}Suite: evil\n");
+        let (_, covered) = release(&ring, wrapped.as_bytes()).unwrap();
+        assert!(!covered.contains("evil"), "{covered}");
+
+        for (claimed, with_fp) in [(&a, true), (&a, false)] {
+            let doc = sign(&[(&b, &b, true), (&outside, claimed, with_fp)]);
+            let err = release(&ring, doc.as_bytes()).unwrap_err();
+            assert!(format!("{err:#}").contains("bad signature"), "{err:#}");
+        }
+
+        let mut gone = TestKey::new();
+        gone.revoke();
+        let doc = sign(&[(&gone, &gone, true), (&outside, &outside, true)]);
+        let err = release(&keyring(&gone.public()), doc.as_bytes()).unwrap_err();
+        assert!(format!("{err:#}").contains("revoked"), "{err:#}");
+    }
+
+    #[test]
+    fn release_refuses_a_subkey_without_the_signing_flag() {
+        let key = TestKey::make(3600, true);
+        let primary = &key.secret.primary_key;
+        let subkey = &key.secret.secret_subkeys[0].key;
+        let pw = ::pgp::types::Password::empty();
+        let back = subkey
+            .sign_primary_key_binding(rsa::rand_core::OsRng, &primary.public_key(), &pw)
+            .unwrap();
+        let bind = |flags| {
+            subkey
+                .sign(
+                    rsa::rand_core::OsRng,
+                    primary,
+                    primary.public_key(),
+                    &pw,
+                    flags,
+                    Some(back.clone()),
+                )
+                .unwrap()
+        };
+        let mut public = key.secret.to_public_key();
+        public.public_subkeys[0].signatures = vec![bind(::pgp::packet::KeyFlags::default())];
+        let ring = keyring(&public.to_bytes().unwrap());
+        let doc = key.clearsign_subkey("Codename: trixie\n");
+        let err = release(&ring, doc.as_bytes()).unwrap_err();
+        assert!(format!("{err:#}").contains("cross-certified"), "{err:#}");
+
+        let mut flags = ::pgp::packet::KeyFlags::default();
+        flags.set_sign(true);
+        public.public_subkeys[0].signatures = vec![bind(flags)];
+        let ring = keyring(&public.to_bytes().unwrap());
+        release(&ring, doc.as_bytes()).unwrap();
+
+        let ok = keyring(&key.public());
+        let (signers, _) = release(&ok, doc.as_bytes()).unwrap();
+        assert_eq!(signers[0].key, key.subkey_fingerprint());
+        assert_eq!(signers[0].primary, key.fingerprint());
     }
 
     #[test]
