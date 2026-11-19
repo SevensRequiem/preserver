@@ -1,6 +1,12 @@
 use crate::config::{Config, Transport};
 use crate::crypt;
-use crate::git::Auth;
+use crate::git::credential;
+use crate::git::http::Remote;
+use crate::git::mirror::{self, Trust, Via};
+#[cfg(unix)]
+use crate::git::shell_safe;
+use crate::net::client;
+use crate::net::throttle::Throttle;
 use crate::paths::Paths;
 use crate::personal::{Hooks, Stopped};
 use crate::platform;
@@ -8,15 +14,18 @@ use age::x25519;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use ureq::Agent;
 
 #[derive(Debug)]
 pub(crate) struct Repo {
     /// `owner/name`
     pub name: String,
     pub url: String,
-    pub branch: Option<String>,
 }
 
 /// The name becomes path segments on the drive and in the cache.
@@ -33,20 +42,14 @@ fn valid_repo_name(name: &str) -> bool {
 
 fn list(owner: &str, transport: Transport) -> Result<Vec<Repo>> {
     #[derive(Deserialize)]
-    struct Branch {
-        name: String,
-    }
-    #[derive(Deserialize)]
     struct Listed {
         #[serde(rename = "nameWithOwner")]
         name: String,
-        #[serde(rename = "defaultBranchRef")]
-        branch: Option<Branch>,
     }
 
     let out = Command::new("gh")
         .args(["repo", "list", owner, "--limit", "1000", "--json"])
-        .arg("nameWithOwner,defaultBranchRef")
+        .arg("nameWithOwner")
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .output()
@@ -64,7 +67,6 @@ fn list(owner: &str, transport: Transport) -> Result<Vec<Repo>> {
                 Transport::Https => format!("https://github.com/{}.git", r.name),
             },
             name: r.name,
-            branch: r.branch.map(|b| b.name).filter(|b| !b.is_empty()),
         })
         .collect())
 }
@@ -75,16 +77,59 @@ fn git(mirror: &Path) -> Command {
     cmd
 }
 
-fn run_git(cmd: &mut Command, what: &str) -> Result<Vec<u8>> {
-    let out = cmd.output().context("run git")?;
-    if !out.status.success() {
-        bail!(
-            "{what}: {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+/// The shared ssh connection a run keeps open, for restarting it when it has expired.
+pub(crate) struct Master<'a> {
+    pub ssh: &'a Path,
+    pub runtime: &'a Path,
+    pub session: &'a [(String, String)],
+}
+
+/// How a run reaches the remotes.
+pub(crate) enum Link<'a> {
+    /// `program` is the shim that makes ssh a client of the master.
+    Ssh {
+        program: PathBuf,
+        master: Master<'a>,
+    },
+    Https {
+        agent: Agent,
+        token: Option<String>,
+    },
+    #[cfg(test)]
+    File,
+}
+
+impl Link<'_> {
+    /// Before each repo: the master may have expired since the last one.
+    fn ensure(&self, stop: &(dyn Fn() -> bool + Sync)) -> Result<()> {
+        match self {
+            Link::Ssh { master, .. } => {
+                platform::ssh_ensure_master(master.ssh, master.runtime, master.session, stop)
+            }
+            Link::Https { .. } => Ok(()),
+            #[cfg(test)]
+            Link::File => Ok(()),
+        }
     }
-    Ok(out.stdout)
+
+    fn update(&self, mirror: &Path, url: &str, halt: &Arc<AtomicBool>) -> Result<()> {
+        let via = match self {
+            Link::Ssh { program, .. } => Via::Ssh { program },
+            Link::Https { agent, token } => Via::Https {
+                http: Remote::new(
+                    agent.clone(),
+                    Arc::new(Throttle::new(0)),
+                    Arc::default(),
+                    u64::MAX,
+                    halt.clone(),
+                ),
+                token: token.as_deref(),
+            },
+            #[cfg(test)]
+            Link::File => Via::File,
+        };
+        mirror::update(mirror, url, via, Trust::Host, halt, &|_| ())
+    }
 }
 
 /// A snapshot is due when the refs differ from the recorded state, or when the drive has none yet.
@@ -147,41 +192,38 @@ fn write_bundle(mirror: &Path, recipients: &[x25519::Recipient], tmp: &Path) -> 
 /// Returns whether a bundle was written.
 fn backup_repo(
     paths: &Paths,
-    auth: &Auth,
+    link: &Link,
     recipients: &[x25519::Recipient],
     repo: &Repo,
     today: jiff::civil::Date,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<bool> {
     if !valid_repo_name(&repo.name) {
         bail!("unsafe repo name {:?}", repo.name);
     }
     let mirror = paths.mirrors.join(format!("{}.git", repo.name));
-    if !mirror.exists() {
-        run_git(
-            Command::new("git")
-                .args(["init", "-q", "--bare", "--"])
-                .arg(&mirror)
-                .stdin(Stdio::null()),
-            "init",
-        )?;
+    if let Some(owner) = mirror.parent() {
+        platform::private_dir_all(owner)?;
     }
-    // Heads and tags only: a plain --mirror would also pull every refs/pull/* from GitHub.
-    let mut fetch = git(&mirror);
-    fetch
-        .args(["fetch", "-q", "--prune", "--", &repo.url])
-        .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
-    auth.apply(&mut fetch);
-    run_git(&mut fetch, "fetch")?;
-    if let Some(branch) = &repo.branch {
-        run_git(
-            git(&mirror).args(["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")]),
-            "symbolic-ref",
-        )?;
-    }
-    let out = run_git(
-        git(&mirror).args(["for-each-ref", "--format=%(objectname) %(refname)"]),
-        "for-each-ref",
-    )?;
+    // The transfer's threads need a flag they can share, so the lane's stop is forwarded to one.
+    let halt = Arc::new(AtomicBool::new(false));
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                if stop() {
+                    halt.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let fetched = link.update(&mirror, &repo.url, &halt);
+        done.store(true, Ordering::Relaxed);
+        fetched
+    })
+    .context("fetch")?;
+    let out = mirror::refs_state(&mirror).context("refs")?;
     let refs = trim_newlines(&out);
     if refs.is_empty() {
         return Ok(false);
@@ -211,10 +253,10 @@ fn backup_repo(
 }
 
 /// Backs up every repo and returns how many bundles were written. One failing repo does not
-/// stop the rest; a stop does, between repos (one long fetch runs to its end).
+/// stop the rest; a stop does, and it also ends the fetch in progress.
 pub(crate) fn backup_all(
     paths: &Paths,
-    auth: &Auth,
+    link: &Link,
     recipients: &[x25519::Recipient],
     repos: &[Repo],
     today: jiff::civil::Date,
@@ -231,9 +273,14 @@ pub(crate) fn backup_all(
             stopped = true;
             break;
         }
+        link.ensure(hooks.stop)?;
         (hooks.on_item)(n, repos.len(), &repo.name);
-        match backup_repo(paths, auth, recipients, repo, today) {
+        match backup_repo(paths, link, recipients, repo, today, hooks.stop) {
             Ok(w) => wrote += usize::from(w),
+            Err(_) if (hooks.stop)() => {
+                stopped = true;
+                break;
+            }
             Err(e) => {
                 tracing::error!(repo = repo.name, "repo backup: {e:#}");
                 failed.push(repo.name.as_str());
@@ -262,11 +309,12 @@ struct SshMaster<'a>(&'a Path);
 
 impl<'a> SshMaster<'a> {
     fn start(
+        program: &Path,
         runtime: &'a Path,
         session: &[(String, String)],
         stop: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        platform::ssh_master(runtime, session, stop)?;
+        platform::ssh_master(program, runtime, session, stop)?;
         Ok(Self(runtime))
     }
 }
@@ -277,13 +325,37 @@ impl Drop for SshMaster<'_> {
     }
 }
 
+/// The program gix starts as ssh: this binary under the shim's name, so every ssh it runs is a
+/// client of the run's master.
+#[cfg(not(windows))]
+fn ssh_program(runtime: &Path) -> Result<PathBuf> {
+    let dir = runtime.join("preserver");
+    platform::private_dir_all(&dir).with_context(|| dir.display().to_string())?;
+    let shim = dir.join(crate::git::ssh::SHIM);
+    shell_safe(&shim)?;
+    platform::link_self(&shim).with_context(|| shim.display().to_string())?;
+    Ok(shim)
+}
+
+/// The first `ssh.exe` on PATH (a newer OpenSSH may shadow the system one), else the system one.
+#[cfg(windows)]
+#[expect(clippy::unnecessary_wraps, reason = "same signature as the unix one")]
+fn ssh_program(_runtime: &Path) -> Result<PathBuf> {
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("ssh.exe"))
+            .find(|p| p.is_file())
+    });
+    Ok(found.unwrap_or_else(|| PathBuf::from(platform::SSH)))
+}
+
 /// `paths.mnt` is the primary the caller located. `gh repo list` runs before the ssh master,
 /// so a network outage is a failure and not a missing touch.
 pub(crate) fn run(
     paths: &Paths,
     cfg: &Config,
     transport: Transport,
-    session: Vec<(String, String)>,
+    session: &[(String, String)],
     hooks: &Hooks,
 ) -> Result<()> {
     // The recipient comes from home, not the drive, so tampering with the drive can't redirect new backups.
@@ -292,19 +364,32 @@ pub(crate) fn run(
     for owner in &cfg.owners {
         repos.extend(list(owner, transport).with_context(|| format!("list repos of {owner}"))?);
     }
-    let _master = if transport == Transport::Ssh {
-        platform::notify(
-            false,
-            "GitHub backup",
-            "Enter your security key PIN if asked, then touch the key.",
-        );
-        Some(SshMaster::start(&paths.runtime, &session, hooks.stop)?)
-    } else {
-        None
+    let ssh = Path::new(platform::SSH);
+    let _master;
+    let link = match transport {
+        Transport::Ssh => {
+            platform::notify(
+                false,
+                "GitHub backup",
+                "Enter your security key PIN if asked, then touch the key.",
+            );
+            _master = SshMaster::start(ssh, &paths.runtime, session, hooks.stop)?;
+            Link::Ssh {
+                program: ssh_program(&paths.runtime)?,
+                master: Master {
+                    ssh,
+                    runtime: &paths.runtime,
+                    session,
+                },
+            }
+        }
+        Transport::Https => Link::Https {
+            agent: client::agent(client::os_roots()),
+            token: Some(credential::token()?),
+        },
     };
-    let auth = Auth::new(transport, &paths.runtime)?.with_session(session);
     let today = jiff::Zoned::now().date();
-    let wrote = backup_all(paths, &auth, &recipients, &repos, today, hooks)?;
+    let wrote = backup_all(paths, &link, &recipients, &repos, today, hooks)?;
     platform::notify(
         false,
         "GitHub backup done",
@@ -431,17 +516,15 @@ mod tests {
             &["clone", "-q", "--bare", ".", remote.to_str().unwrap()],
         );
 
-        // A file:// remote: the ssh transport is set up for real, but git never needs it here.
-        let auth = Auth::new(Transport::Ssh, &p.runtime).unwrap();
+        let link = Link::File;
         let repos = [Repo {
             name: "o/r".into(),
             url: format!("file://{}", remote.display()),
-            branch: Some("main".into()),
         }];
         let run = |day| {
             backup_all(
                 &p,
-                &auth,
+                &link,
                 &recipients,
                 &repos,
                 date(2026, 11, day),
@@ -503,7 +586,7 @@ mod tests {
         let tmp = TempDir::new();
         let p = paths(tmp.path());
         let recipients = [x25519::Identity::generate().to_public()];
-        let auth = Auth::new(Transport::Ssh, &p.runtime).unwrap();
+        let link = Link::File;
 
         let work = tmp.path().join("work");
         std::fs::create_dir(&work).unwrap();
@@ -516,22 +599,19 @@ mod tests {
             Repo {
                 name: "../escape".into(),
                 url: format!("file://{}", work.display()),
-                branch: None,
             },
             Repo {
                 name: "o/gone".into(),
                 url: format!("file://{}", tmp.path().join("absent").display()),
-                branch: None,
             },
             Repo {
                 name: "o/ok".into(),
                 url: format!("file://{}", work.display()),
-                branch: Some("main".into()),
             },
         ];
         let err = backup_all(
             &p,
-            &auth,
+            &link,
             &recipients,
             &repos,
             date(2026, 11, 13),
@@ -547,12 +627,111 @@ mod tests {
         assert!(!p.gh_dest().join("o/gone").exists());
     }
 
+    /// What phase 1 left behind (a bare mirror of loose refs, its `.refs` and a bundle) is
+    /// current: no new bundle and the state file is not touched.
+    #[test]
+    fn a_phase_1_mirror_gives_no_new_bundle() {
+        let tmp = TempDir::new();
+        let p = paths(tmp.path());
+        let recipients = [x25519::Identity::generate().to_public()];
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        tgit(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("f.txt"), "one").unwrap();
+        tgit(&work, &["add", "."]);
+        tgit(&work, &["commit", "-q", "-m", "one"]);
+        tgit(&work, &["tag", "v1"]);
+
+        let mirror = p.mirrors.join("o/r.git");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        tgit(
+            tmp.path(),
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+        );
+        tgit(
+            &mirror,
+            &[
+                "fetch",
+                "-q",
+                work.to_str().unwrap(),
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        );
+        let refs = tgit(
+            &mirror,
+            &["for-each-ref", "--format=%(objectname) %(refname)"],
+        );
+        let state_file = p.github.join("o/r.refs");
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        let state = format!("{refs}\n");
+        std::fs::write(&state_file, &state).unwrap();
+        let dir = p.gh_dest().join("o/r");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-11-01.bundle.age"), "old").unwrap();
+
+        let repos = [Repo {
+            name: "o/r".into(),
+            url: format!("file://{}", work.display()),
+        }];
+        let wrote = backup_all(
+            &p,
+            &Link::File,
+            &recipients,
+            &repos,
+            date(2026, 11, 13),
+            &Hooks::NONE,
+        )
+        .unwrap();
+        assert_eq!(wrote, 0);
+        assert_eq!(bundles(&dir), ["2026-11-01.bundle.age"]);
+        assert_eq!(std::fs::read_to_string(&state_file).unwrap(), state);
+    }
+
+    /// The master is gone and cannot be restarted (the fake ssh fails like an unanswered prompt):
+    /// the run ends at once as a missing touch and starts no fetch.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_master_that_cannot_restart_is_a_missing_touch() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let p = paths(tmp.path());
+        let ssh = tmp.path().join("fake-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = Link::Ssh {
+            program: ssh.clone(),
+            master: Master {
+                ssh: &ssh,
+                runtime: &p.runtime,
+                session: &[],
+            },
+        };
+        let repos = [Repo {
+            name: "o/r".into(),
+            url: "git@github.com:o/r.git".into(),
+        }];
+        let started = std::time::Instant::now();
+        let err = backup_all(
+            &p,
+            &link,
+            &[x25519::Identity::generate().to_public()],
+            &repos,
+            date(2026, 11, 13),
+            &Hooks::NONE,
+        )
+        .unwrap_err();
+        assert!(err.is::<platform::TouchMissing>(), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!p.mirrors.join("o/r.git").exists());
+    }
+
     #[test]
     fn an_empty_repo_writes_nothing() {
         let tmp = TempDir::new();
         let p = paths(tmp.path());
         let recipients = [x25519::Identity::generate().to_public()];
-        let auth = Auth::new(Transport::Ssh, &p.runtime).unwrap();
+        let link = Link::File;
         let empty = tmp.path().join("empty.git");
         tgit(
             tmp.path(),
@@ -561,12 +740,11 @@ mod tests {
         let repos = [Repo {
             name: "o/empty".into(),
             url: format!("file://{}", empty.display()),
-            branch: None,
         }];
         assert_eq!(
             backup_all(
                 &p,
-                &auth,
+                &link,
                 &recipients,
                 &repos,
                 date(2026, 11, 13),

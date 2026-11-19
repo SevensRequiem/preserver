@@ -37,17 +37,43 @@ pub(crate) fn open_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// ssh with one multiplexed connection, so the security key is touched once for the whole run.
-/// The options come first: everything the caller appends is git's.
-pub(crate) fn ssh_command(runtime: &Path) -> Command {
+pub(crate) const SSH: &str = "/usr/bin/ssh";
+
+/// ssh on the run's one multiplexed connection, so the security key is touched once. The master
+/// (`master`) may open it and prompt. Any other caller, git's shim included, is a mux client; if
+/// the master is gone ssh connects on its own, so that connection is given no way to
+/// authenticate and fails at once instead of waiting for a touch. The options come first:
+/// everything the caller appends is git's.
+pub(crate) fn ssh_command(program: &Path, runtime: &Path, master: bool) -> Command {
     let mut control = OsString::from("ControlPath=");
     control.push(runtime.join("preserver-ssh-%C"));
-    let mut cmd = Command::new("/usr/bin/ssh");
-    cmd.args(["-o", "ControlMaster=auto", "-o"])
-        .arg(control)
-        .args(["-o", "ControlPersist=60"]);
+    let mut cmd = Command::new(program);
+    cmd.args([
+        "-o",
+        if master {
+            "ControlMaster=auto"
+        } else {
+            "ControlMaster=no"
+        },
+        "-o",
+    ])
+    .arg(control)
+    .args(["-o", "ControlPersist=60"]);
+    if !master {
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+        ]);
     // Backups run from the tray with no terminal, so the PIN and touch prompts go to a dialog.
-    if Path::new(ASKPASS).exists() {
+    } else if Path::new(ASKPASS).exists() {
         cmd.env("SSH_ASKPASS", ASKPASS)
             .env("SSH_ASKPASS_REQUIRE", "force");
     }
@@ -111,11 +137,12 @@ fn wait_auth(
 /// `ControlPersist` only bounds the master if `ssh_master_stop` never gets to run. `session`
 /// lets a daemon reach the graphical session's askpass and agent.
 pub(crate) fn ssh_master(
+    program: &Path,
     runtime: &Path,
     session: &[(String, String)],
     stop: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let mut cmd = ssh_command(runtime);
+    let mut cmd = ssh_command(program, runtime, true);
     cmd.args(["-fN", GITHUB])
         .envs(session.iter().map(|(k, v)| (k, v)));
     // On a terminal ssh may read the PIN from it, which a background process group cannot.
@@ -219,8 +246,28 @@ pub(crate) fn watch_queue(dir: &Path, on_change: impl Fn() + Send + 'static) {
     });
 }
 
+/// Opens the master again when `ControlPersist` or a crash ended it since the last repo.
+pub(crate) fn ssh_ensure_master(
+    program: &Path,
+    runtime: &Path,
+    session: &[(String, String)],
+    stop: &dyn Fn() -> bool,
+) -> Result<()> {
+    let alive = ssh_command(program, runtime, false)
+        .args(["-O", "check", GITHUB])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if alive {
+        return Ok(());
+    }
+    ssh_master(program, runtime, session, stop)
+}
+
 pub(crate) fn ssh_master_stop(runtime: &Path) {
-    let stopped = ssh_command(runtime)
+    let stopped = ssh_command(Path::new(SSH), runtime, true)
         .args(["-O", "exit", GITHUB])
         .stderr(Stdio::null())
         .status();
@@ -305,8 +352,25 @@ mod tests {
     }
 
     #[test]
+    fn the_shims_ssh_cannot_authenticate_on_its_own() {
+        let cmd = ssh_command(Path::new(SSH), Path::new("/run/user/1000"), false);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(args.contains(&"ControlMaster=no"), "{args:?}");
+        for opt in [
+            "BatchMode=yes",
+            "IdentityAgent=none",
+            "IdentityFile=none",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+        ] {
+            assert!(args.contains(&opt), "{opt}: {args:?}");
+        }
+        assert!(!args.contains(&"ControlMaster=auto"), "{args:?}");
+    }
+
+    #[test]
     fn ssh_options_precede_the_callers_arguments() {
-        let mut cmd = ssh_command(Path::new("/run/user/1000"));
+        let mut cmd = ssh_command(Path::new(SSH), Path::new("/run/user/1000"), true);
         cmd.args(["-p", "22", "git@github.com", "git-upload-pack 'o/r.git'"]);
         assert_eq!(cmd.get_program(), "/usr/bin/ssh");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();

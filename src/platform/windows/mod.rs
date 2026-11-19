@@ -106,12 +106,26 @@ pub(crate) fn run_tray(_paths: &crate::paths::Paths) -> Result<()> {
     Err(unsupported().into())
 }
 
+pub(crate) const SSH: &str = r"C:\Windows\System32\OpenSSH\ssh.exe";
+
+/// ssh.exe makes its own connection per repo and asks for the key itself.
+#[expect(clippy::unnecessary_wraps, reason = "same signature as the Linux one")]
 pub(crate) fn ssh_master(
+    _program: &Path,
     _runtime: &Path,
     _session: &[(String, String)],
     _stop: &dyn Fn() -> bool,
 ) -> Result<()> {
-    Err(unsupported().into())
+    Ok(())
+}
+
+pub(crate) fn ssh_ensure_master(
+    program: &Path,
+    runtime: &Path,
+    session: &[(String, String)],
+    stop: &dyn Fn() -> bool,
+) -> Result<()> {
+    ssh_master(program, runtime, session, stop)
 }
 
 pub(crate) fn ssh_master_stop(_runtime: &Path) {}
@@ -120,18 +134,14 @@ pub(crate) fn private_dir_all(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
-pub(crate) fn link_self(_link: &Path) -> io::Result<()> {
-    Err(unsupported())
-}
-
 pub(crate) fn notify(_urgent: bool, _title: &str, _body: &str) {}
 
 pub(crate) fn open_path(_path: &Path) -> Result<()> {
     Err(unsupported().into())
 }
 
-pub(crate) fn ssh_command(_runtime: &Path) -> Command {
-    Command::new(r"C:\Windows\System32\OpenSSH\ssh.exe")
+pub(crate) fn ssh_command(program: &Path, _runtime: &Path, _master: bool) -> Command {
+    Command::new(program)
 }
 
 pub(crate) fn exec(mut cmd: Command) -> io::Error {

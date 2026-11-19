@@ -28,5 +28,4 @@ mod testutil;
 mod tray_model;
 mod verify;
 
-pub use git::credential::{HELPER, helper_main};
 pub use git::ssh::{SHIM, shim_main};

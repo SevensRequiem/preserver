@@ -208,7 +208,7 @@ fn run_job(paths: &Paths, store: &Store, env: &Env, mut job: Job) -> Result<()> 
         let (tx, rx) = mpsc::channel::<()>();
         let worker = s.spawn(|| {
             let r = status::job(&mut paths, name, |p| match transport {
-                Some(t) => github::run(p, &cfg, t, session, &hooks),
+                Some(t) => github::run(p, &cfg, t, &session, &hooks),
                 None => local::run(p, &cfg, &hooks),
             });
             drop(tx);
