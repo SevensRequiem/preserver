@@ -953,7 +953,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod walk_tests {
+pub(crate) mod walk_tests {
     use super::super::generation::{self, Next, begin, read_tsv};
     use super::super::{Check, Entry};
     use super::*;
@@ -971,10 +971,10 @@ mod walk_tests {
 
     const META: &str = "meta?repo=x";
 
-    struct Site {
-        srv: Server,
-        routes: HashMap<String, Vec<u8>>,
-        src: Source,
+    pub(crate) struct Site {
+        pub(crate) srv: Server,
+        pub(crate) routes: HashMap<String, Vec<u8>>,
+        pub(crate) src: Source,
         tmp: TempDir,
     }
 
@@ -983,7 +983,7 @@ mod walk_tests {
     }
 
     impl Site {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
             let src = Source {
                 name: "f".into(),
@@ -1005,7 +1005,7 @@ mod walk_tests {
         }
 
         /// Publishes a repomd of `rev` listing `pkgs`, and returns it.
-        fn repo(&mut self, rev: u64, pkgs: &[(&str, &[u8])]) -> Vec<u8> {
+        pub(crate) fn repo(&mut self, rev: u64, pkgs: &[(&str, &[u8])]) -> Vec<u8> {
             let mut xml = String::from("<metadata>");
             for (n, b) in pkgs {
                 let _ = write!(
@@ -1045,7 +1045,7 @@ mod walk_tests {
 
         /// Serves `served` as the mirror's repomd and a metalink at `ts` listing `cur` and,
         /// when given, `alt` as an alternate.
-        fn publish(&mut self, ts: u64, cur: &[u8], alt: Option<&[u8]>, served: &[u8]) {
+        pub(crate) fn publish(&mut self, ts: u64, cur: &[u8], alt: Option<&[u8]>, served: &[u8]) {
             let hashes = |b: &[u8]| {
                 format!(
                     "<size>{}</size><verification><hash type=\"sha256\">{}</hash>\

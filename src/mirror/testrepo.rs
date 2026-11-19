@@ -41,16 +41,16 @@ fn date(n: i64) -> String {
         .to_string()
 }
 
-struct Site {
-    srv: Server,
-    routes: HashMap<String, Vec<u8>>,
-    src: Source,
-    key: TestKey,
+pub(crate) struct Site {
+    pub(crate) srv: Server,
+    pub(crate) routes: HashMap<String, Vec<u8>>,
+    pub(crate) src: Source,
+    pub(crate) key: TestKey,
     tmp: TempDir,
 }
 
 impl Site {
-    fn new(suites: &[&str]) -> Self {
+    pub(crate) fn new(suites: &[&str]) -> Self {
         let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
         let key = TestKey::new();
         let src = Source {
@@ -80,7 +80,7 @@ impl Site {
 
     /// Publishes `suite` at `when` (minutes after a fixed start) with these pool files. The
     /// indexes are served by hash only. A name under `pool/` is the path as given.
-    fn publish(&mut self, suite: &str, when: i64, pkgs: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn publish(&mut self, suite: &str, when: i64, pkgs: &[(&str, &[u8])]) -> Vec<u8> {
         let mut packages = String::new();
         for (name, body) in pkgs {
             let path = if name.starts_with("pool/") {

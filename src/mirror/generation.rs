@@ -350,12 +350,44 @@ impl Journal {
     }
 }
 
+/// Lets a test make the next `commit_swap` of a tree fail after `n` steps, as a crash would.
+#[cfg(test)]
+pub(crate) mod crash {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    static ARMED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(tree: &Path, n: usize) {
+        let mut a = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        a.push((tree.to_path_buf(), n));
+    }
+
+    pub(super) fn take(tree: &Path) -> Option<usize> {
+        let mut a = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        let i = a.iter().position(|(t, _)| t == tree)?;
+        Some(a.remove(i).1)
+    }
+}
+
 type Tick<'a> = &'a mut dyn FnMut() -> io::Result<()>;
 
 /// Swaps the staged generation in: `<stage>/meta/<path>` for every step and the staged
 /// `live.tsv`, then prunes what the new generation does not name. The journal is written
 /// first, so a crash at any point is finished by `recover`.
 pub(crate) fn commit_swap(tree: &Path, j: Journal) -> Result<()> {
+    #[cfg(test)]
+    if let Some(n) = crash::take(tree) {
+        let mut calls = 0;
+        return commit_with(tree, j, true, &mut || {
+            calls += 1;
+            if calls > n {
+                Err(io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        });
+    }
     commit_with(tree, j, true, &mut || Ok(()))
 }
 
@@ -829,8 +861,9 @@ pub(crate) fn fs_limits<'e>(
     )
 }
 
-/// Files and bytes handed out per batch; a larger file still goes, alone.
-const BATCH_FILES: usize = 2048;
+/// Files and bytes handed out per batch; a larger file still goes, alone. Tests use two so a
+/// handful of files spans several batches.
+const BATCH_FILES: usize = if cfg!(test) { 2 } else { 2048 };
 const BATCH_BYTES: u64 = 4 << 30;
 
 pub(crate) fn done_path(tree: &Path) -> PathBuf {

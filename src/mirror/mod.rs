@@ -7,7 +7,7 @@ pub(crate) mod debian;
 pub(crate) mod fedora;
 pub(crate) mod generation;
 #[cfg(test)]
-mod testrepo;
+pub(crate) mod testrepo;
 
 use crate::catalog::{RepoFormat, Source};
 use crate::keys::{Keyring, RsaKey};

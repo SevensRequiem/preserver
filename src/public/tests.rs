@@ -1,6 +1,7 @@
 use super::versioned::{read_set_file, version_dirs};
 use super::*;
 use crate::catalog::{Kind, Resolve};
+use crate::keys::RsaKey;
 use crate::mirror::Anchor;
 use crate::net::testserver::Server;
 use crate::platform::DriveAt;
@@ -12,21 +13,26 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-struct Env {
+pub(super) struct Env {
     _tmp: TempDir,
-    paths: Paths,
+    pub(super) paths: Paths,
     srv: Server,
-    dl: Downloader,
-    store: Store,
+    pub(super) dl: Downloader,
+    pub(super) store: Store,
     key: TestKey,
     notes: Mutex<Vec<String>>,
     walkers: Walkers,
+    /// Replaces the test key's public half as the ring named `test`.
+    pub(super) ring: Option<Vec<u8>>,
+    /// An Alpine key's name and PEM.
+    pub(super) rsa: Option<(String, String)>,
+    pub(super) metalink: String,
 }
 
-const GB: u64 = 1_000_000_000;
+pub(super) const GB: u64 = 1_000_000_000;
 
 impl Env {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let tmp = TempDir::new();
         let paths = paths(tmp.path());
         Self {
@@ -38,6 +44,9 @@ impl Env {
             key: TestKey::new(),
             notes: Mutex::new(Vec::new()),
             walkers: WALKERS,
+            ring: None,
+            rsa: None,
+            metalink: String::new(),
         }
     }
 
@@ -49,8 +58,22 @@ impl Env {
         self.srv.set(|b| b.routes = Some(map));
     }
 
-    fn with<R>(&self, cat: &Catalog, free: (u64, u64), f: impl FnOnce(&Public) -> R) -> R {
-        let ring = self.key.public();
+    pub(super) fn with<R>(
+        &self,
+        cat: &Catalog,
+        free: (u64, u64),
+        f: impl FnOnce(&Public) -> R,
+    ) -> R {
+        let ring = self.ring.clone().unwrap_or_else(|| self.key.public());
+        let rsa: Vec<RsaKey<'_>> = self
+            .rsa
+            .iter()
+            .map(|(name, pem)| RsaKey {
+                name,
+                arches: &["x86_64"],
+                pem,
+            })
+            .collect();
         let note = |_: bool, title: &str, body: &str| {
             self.notes.lock().unwrap().push(format!("{title}: {body}"));
         };
@@ -66,7 +89,7 @@ impl Env {
             },
             verifier: Verifier {
                 keys: &[("test", &ring)],
-                rsa: &[],
+                rsa: &rsa,
                 tofu: &self.paths.tofu,
                 note: &note,
             },
@@ -76,7 +99,7 @@ impl Env {
             resolved: Mutex::new(HashMap::new()),
             gens: Mutex::new(HashMap::new()),
             walkers: self.walkers,
-            metalink: "",
+            metalink: &self.metalink,
         })
     }
 
@@ -112,11 +135,11 @@ impl Env {
         self.store.job(&ids[0].1).unwrap()
     }
 
-    fn sync(&self, cat: &Catalog) -> Job {
+    pub(super) fn sync(&self, cat: &Catalog) -> Job {
         self.sync_with(cat, (900 * GB, 1000 * GB))
     }
 
-    fn set_dir(&self) -> PathBuf {
+    pub(super) fn set_dir(&self) -> PathBuf {
         self.paths.mnt.join("preserver/public/demo")
     }
 
@@ -149,7 +172,7 @@ impl Env {
     }
 }
 
-fn catalog(keep: usize, sources: Vec<Source>) -> Catalog {
+pub(super) fn catalog(keep: usize, sources: Vec<Source>) -> Catalog {
     Catalog {
         sets: vec![Set {
             name: "demo".into(),
@@ -812,7 +835,7 @@ fn list_measures_the_newest_version_per_variant() {
     assert!(isos[1].contains("measured 0"), "{text}");
 }
 
-fn mirror(name: &str, kind: Kind, est: f64) -> Source {
+pub(super) fn mirror(name: &str, kind: Kind, est: f64) -> Source {
     Source {
         name: name.into(),
         kind: Some(kind),

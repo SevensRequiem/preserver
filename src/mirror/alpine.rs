@@ -44,7 +44,7 @@ const SHA256_PREFIX: [u8; 19] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hash {
+pub(crate) enum Hash {
     Sha1,
     Sha256,
 }
@@ -499,7 +499,7 @@ pub(crate) fn check_apk<R: Read + Seek>(file: R, q1: &[u8; 20]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -509,9 +509,9 @@ mod tests {
     use std::io::{Cursor, Write};
     use std::sync::LazyLock;
 
-    struct Key {
+    pub(crate) struct Key {
         private: RsaPrivateKey,
-        pem: String,
+        pub(crate) pem: String,
     }
 
     fn make(bits: usize) -> Key {
@@ -523,10 +523,10 @@ mod tests {
         Key { private, pem }
     }
 
-    static K2048: LazyLock<Key> = LazyLock::new(|| make(2048));
+    pub(crate) static K2048: LazyLock<Key> = LazyLock::new(|| make(2048));
     static K1024: LazyLock<Key> = LazyLock::new(|| make(1024));
 
-    const NAME: &str = "test@example.invalid-5f3a.rsa.pub";
+    pub(crate) const NAME: &str = "test@example.invalid-5f3a.rsa.pub";
 
     fn ring(k: &Key) -> RsaKey<'_> {
         RsaKey {
@@ -565,7 +565,7 @@ mod tests {
         t
     }
 
-    fn member(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn member(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let all: Vec<_> = entries
             .iter()
             .map(|(n, d)| (*n, tar::EntryType::Regular, *d))
@@ -591,12 +591,12 @@ mod tests {
         member(&[("APKINDEX", TEXT.as_bytes()), ("DESCRIPTION", b"main")])
     }
 
-    fn signed(k: &Key, hash: Hash, entry: &str, second: &[u8]) -> Vec<u8> {
+    pub(crate) fn signed(k: &Key, hash: Hash, entry: &str, second: &[u8]) -> Vec<u8> {
         let sig = sign(k, hash, second, false);
         [member(&[(entry, &sig)]), second.to_vec()].concat()
     }
 
-    fn entry(hash: Hash) -> String {
+    pub(crate) fn entry(hash: Hash) -> String {
         match hash {
             Hash::Sha1 => format!(".SIGN.RSA.{NAME}"),
             Hash::Sha256 => format!(".SIGN.RSA256.{NAME}"),
@@ -849,12 +849,12 @@ mod tests {
         }
     }
 
-    struct Apk {
-        bytes: Vec<u8>,
-        q1: [u8; 20],
+    pub(crate) struct Apk {
+        pub(crate) bytes: Vec<u8>,
+        pub(crate) q1: [u8; 20],
     }
 
-    fn apk(pkginfo: &[(&str, &[u8])], data: &[u8], datahash: Option<&str>) -> Apk {
+    pub(crate) fn apk(pkginfo: &[(&str, &[u8])], data: &[u8], datahash: Option<&str>) -> Apk {
         let sig = member(&[(&entry(Hash::Sha1), b"sig")]);
         let data_member = gz(&tar_of(&[("usr/bin/x", tar::EntryType::Regular, data)]));
         let hash = hex(&Sha256::digest(&data_member));

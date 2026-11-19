@@ -1042,4 +1042,7 @@ pub(crate) fn run(
 }
 
 #[cfg(test)]
+#[path = "../mirror/gate_tests.rs"]
+mod gate_tests;
+#[cfg(test)]
 mod tests;
