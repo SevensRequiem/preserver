@@ -67,7 +67,7 @@ license = "n/a"
 name = "debian-cd-key"
 kind = "http"
 resolve = "static"
-urls = ["https://keyring.debian.org/pks/lookup?op=get&search=0xDF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
+urls = ["https://www.debian.org/CD/key-DF9B9C49EAA9298432589D76DA87E80D6294BE9B.asc"]
 assets = ["debian-cd-key.asc"]
 stored = "debian-cd"
 signers = ["DF9B9C49EAA9298432589D76DA87E80D6294BE9B"]
@@ -209,8 +209,13 @@ est = 0.01
 [[set.source]]
 name = "unicode"
 kind = "http"
-enabled = false
-todo = "needs two steps: highest N.N.N/ directory under unicode.org/Public, then the files inside it"
+resolve = "listing"
+url = "https://www.unicode.org/Public/zipped/"
+dirs = '^(\d+\.\d+\.\d+)/$'
+dir_top = 1
+pattern = '^(?:UCD|Unihan)\.zip$'
+license = "Unicode-3.0"
+est = 0.01
 
 [[set.source]]
 name = "man-pages"
@@ -236,9 +241,10 @@ est = 0.05
 [[set.source]]
 name = "rfcs"
 kind = "http"
-enabled = false
-url = "rsync.rfc-editor.org::rfcs"
-todo = "phase 3: was an rsync module; becomes an https listing of rfc-editor.org"
+resolve = "listing"
+url = "https://www.ietf.org/rfc/"
+pattern = '^rfc(\d+)\.(txt|xml)$'
+top = 2
 est = 3
 license = "IETF Trust"
 
@@ -374,18 +380,22 @@ use = "Source and bootstrap tarballs for GCC alternatives, Go, Rust, Zig, Node, 
 [[set.source]]
 name = "gcc"
 kind = "http"
-enabled = false
-url = "rsync://mirrors.kernel.org/gnu/gcc/"
-todo = "phase 3 (two-level https listing): wants the newest two major gcc-N.N.N/ directories: needs a list-only resolver for rsync, then --files-from"
+resolve = "listing"
+url = "https://mirrors.kernel.org/gnu/gcc/"
+dirs = '^gcc-((\d+)\.\d+\.\d+)/$'
+dir_top = 2
+pattern = '^{dir}\.tar\.xz$'
+sig = ".sig"
+keyring = "gnu-keyring"
+license = "GPL-3.0"
+est = 0.15
 
 [[set.source]]
 name = "musl"
 kind = "http"
-enabled = false
-todo = "the listing url 404s: confirm the index page of musl.libc.org (probably releases.html, whose hrefs are releases/musl-X.Y.Z.tar.gz, so the pattern needs that prefix), then enable"
 resolve = "listing"
-url = "https://musl.libc.org/releases/"
-pattern = '^musl-(\d+\.\d+\.\d+)\.tar\.gz$'
+url = "https://musl.libc.org/releases.html"
+pattern = '^releases/musl-(\d+\.\d+\.\d+)\.tar\.gz$'
 top = 2
 sig = ".asc"
 keyring = "musl"
@@ -595,9 +605,15 @@ keep = 1
 [[set.source]]
 name = "gnu-latest"
 kind = "http"
-enabled = false
-url = "rsync://mirrors.kernel.org/gnu/"
-todo = "phase 3 (two-level https listing): needs rsync --list-only, then the newest tarball of each package plus its .sig fed to --files-from, verified with gnu-keyring"
+resolve = "listing"
+url = "https://mirrors.kernel.org/gnu/"
+dirs = '^[a-z][a-z0-9+_-]*/$'
+exclude = '^(?:gcc|gnu|old-gnu|non-gnu|third-party|video)/$'
+pattern = '^([A-Za-z][A-Za-z0-9+_-]*)-(\d[\d.]*\d)\.tar\.xz$'
+sig = ".sig"
+keyring = "gnu-keyring"
+license = "GPL-3.0"
+est = 12
 
 [[set]]
 name = "lfs"
@@ -635,8 +651,20 @@ kind = "git"
 url = "https://github.com/fosslinux/live-bootstrap"
 est = 0.1
 license = "GPL-3.0"
-enabled = false
-todo = "the stage0-posix and builder-hex0 submodules are not mirrored by a bare mirror: add them as their own git sources"
+
+[[set.source]]
+name = "stage0-posix"
+kind = "git"
+url = "https://github.com/oriansj/stage0-posix"
+est = 0.05
+license = "GPL-3.0"
+
+[[set.source]]
+name = "builder-hex0"
+kind = "git"
+url = "https://github.com/ironmeadow/builder-hex0"
+est = 0.01
+license = "MIT"
 
 [[set.source]]
 name = "mes"
@@ -1174,9 +1202,12 @@ use = "Point apk at this tree as a repository. Packages are signed by the Alpine
 name = "alpine"
 kind = "repo"
 enabled = false
-url = "rsync://rsync.alpinelinux.org/alpine/v3.24/"
-todo = "phase 3"
-# main and community, x86_64 and aarch64
+todo = "pin keys by hand (H3/H4)"
+url = "https://dl-cdn.alpinelinux.org/alpine/"
+format = "alpine"
+suites = ["v3.24"]
+components = ["main", "community"]
+arches = ["x86_64", "aarch64"]
 est = 133  # measured 2026-11-13: 132.4 GB
 license = "various-free"
 
@@ -1199,22 +1230,33 @@ title = "Debian 13 mirror (amd64, all, source)"
 priority = 180
 estimate = 250
 keep = 1
+use = "Use as an apt source. The dists files are a snapshot that stops being fresh, so set check-valid-until=no (Acquire::Check-Valid-Until \"false\") for it. Release files are signed by the Debian archive keys; apt checks them on use."
 
 [[set.source]]
 name = "debian"
 kind = "repo"
 enabled = false
-url = "rsync://mirrors.kernel.org/debian/"
-todo = "phase 3"
-# trixie amd64 and source: the pool file list comes from Packages and Sources. Est 240 GB
+todo = "pin keys by hand (H3/H4)"
+url = "https://deb.debian.org/debian/"
+format = "debian"
+suites = ["trixie", "trixie-updates"]
+components = ["main", "contrib", "non-free", "non-free-firmware"]
+arches = ["amd64"]
+est = 240
+license = "various-free"
 
 [[set.source]]
 name = "debian-security"
 kind = "repo"
 enabled = false
-url = "rsync://mirrors.kernel.org/debian-security/"
-todo = "phase 3"
-# trixie-security, same walk as debian. Est 10 GB
+todo = "pin keys by hand (H3/H4)"
+url = "https://deb.debian.org/debian-security/"
+format = "debian"
+suites = ["trixie-security"]
+components = ["main", "contrib", "non-free", "non-free-firmware"]
+arches = ["amd64"]
+est = 10
+license = "various-free"
 
 [[set]]
 name = "repo-fedora"
@@ -1222,26 +1264,21 @@ title = "Fedora 45 mirror (x86_64 and source)"
 priority = 170
 estimate = 311
 keep = 1
-use = "Use as a dnf baseurl. Fedora's own signatures on the packages and repodata are checked by dnf on use."
+use = "Use as a dnf baseurl. The repodata is unsigned: it is pinned to Fedora's metalink over TLS, and dnf checks the packages' own signatures on use."
 
 [[set.source]]
-name = "fedora-release"
+name = "fedora"
 kind = "repo"
-enabled = false
-url = "rsync://mirrors.kernel.org/fedora/releases/45/Everything/"
-todo = "phase 3"
-# x86_64 and source, without debug and drpms
-est = 259  # measured 2026-11-13: 258.6 GB
-license = "various-free"
-
-[[set.source]]
-name = "fedora-updates"
-kind = "repo"
-enabled = false
-url = "rsync://mirrors.kernel.org/fedora/updates/45/Everything/"
-todo = "phase 3"
-# x86_64 and source, without debug and drpms
-est = 52  # measured 2026-11-13; grows toward ~150 GB by end of life
+url = "https://mirrors.kernel.org/fedora/"
+format = "fedora"
+trees = [
+  { path = "releases/45/Everything/x86_64/os", metalink = "repo=fedora-45&arch=x86_64" },
+  { path = "releases/45/Everything/source/tree", metalink = "repo=fedora-source-45&arch=x86_64" },
+  { path = "updates/45/Everything/x86_64", metalink = "repo=updates-released-f45&arch=x86_64" },
+  { path = "updates/45/Everything/source/tree", metalink = "repo=updates-released-source-f45&arch=x86_64" },
+]
+# x86_64 and source, release and updates, without debug and drpms. Measured 2026-11-13: 258.6 GB and 52 GB, updates grow toward ~150 GB by end of life
+est = 311
 license = "various-free"
 
 [[set]]
@@ -1310,11 +1347,9 @@ todo = "needs the daily build index at maps.protomaps.com/builds (format unverif
 [[set.source]]
 name = "geofabrik-na"
 kind = "http"
-enabled = false
-todo = "the pattern matches nothing on the index page: confirm where download.geofabrik.de lists the dated north-america-YYMMDD.osm.pbf files (or switch to north-america-latest.osm.pbf with its .md5 replaced by a sha256 source), then enable"
 resolve = "listing"
-url = "https://download.geofabrik.de/"
-pattern = '^north-america-(\d{6})\.osm\.pbf$'
+url = "https://download.geofabrik.de/north-america.html"
+pattern = '^north-america-(\d{4}01)\.osm\.pbf$'
 license = "ODbL"
 est = 18.2
 

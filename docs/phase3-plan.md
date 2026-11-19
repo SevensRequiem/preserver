@@ -573,11 +573,11 @@ Dependency graph:
 ## (d) Things the user does by hand
 
 - **H1. Real FIDO key.** After S6, run `personal --foreground` over ssh, then over https. Also run it once after the ControlMaster has expired: it should re-prompt for a touch. Expect 0 bundles when nothing changed and 1 after a push.
-- **H2. Real dry runs.** After S17, run `public --dry-run` for the repo sets, gnu-latest, gcc, rfcs, unicode and musl.
+- **H2. Real dry runs.** After S17, run `public --dry-run` for the repo sets, gnu-latest, gcc, rfcs, unicode and musl; also check that geofabrik's north-america page lists first-of-month files (`-YYYYMM01`).
   - Also all enabled git sources, for the redirect and smart-http probe.
   - Note Alpine's signature type, and any GNU package that needs an `exclude`.
 - **H3. Alpine keys.** Fetch them from aports at a pinned commit, cross-check against `alpine:3.24` `/usr/share/apk/keys`, and write `keys/alpine/SHA256SUMS`. Then `chore` adds the entries and enables repo-alpine.
-- **H4. Debian keyring.** Run `keys/fetch.sh debian-archive`, cross-check against `debian:trixie` and ftp-master, and fill in `signers`. Then `chore` enables repo-debian.
+- **H4. Debian keyring.** Run `keys/fetch.sh debian-archive`, cross-check against `debian:trixie` and ftp-master, and fill in `signers`. Then `chore` enables repo-debian, and `embedded_catalog_loads` gains the Debian signer coverage check (`validate_format(Kind::Repo)` plus `keys::listed` per signer), which cannot run while the sources are disabled.
 - **H5. Install from the mirror (C18).** Without a full fill this can't be done from the compiled-in catalog, so there are two options:
   - Default: a scratch build whose `catalog.toml` is cut down to Debian `trixie-updates` main amd64, Alpine `main/x86_64` and Fedora `updates` source only. Then run the dnf, apt and apk commands from the earlier draft in podman. No runtime override knob is added.
   - Otherwise the gate closes only after H6.

@@ -480,12 +480,11 @@ mod tests {
         let c = Catalog::embedded().unwrap();
         assert!(c.sets.len() > 20, "{} sets", c.sets.len());
         assert_eq!(c.sets[0].name, "keys");
-        for set in &c.sets {
-            for src in &set.sources {
+        for src in c.sets.iter().flat_map(|s| &s.sources) {
+            for u in std::iter::once(&src.url).chain(&src.urls) {
                 assert!(
-                    src.kind() != Kind::Repo || !src.on(),
-                    "{}/{}: repo mirrors arrive in phase 3",
-                    set.name,
+                    !u.contains("rsync") && !u.contains("::"),
+                    "{}: {u}",
                     src.name
                 );
             }
@@ -494,9 +493,97 @@ mod tests {
             let s = c.sets.iter().find(|s| s.name == set).unwrap();
             s.sources.iter().find(|x| x.name == src).unwrap().est
         };
-        assert!((est("repo-fedora", "fedora-release") - 259.0).abs() < f64::EPSILON);
-        assert!((est("repo-fedora", "fedora-updates") - 52.0).abs() < f64::EPSILON);
+        assert!((est("repo-fedora", "fedora") - 311.0).abs() < f64::EPSILON);
         assert!((est("repo-alpine", "alpine") - 133.0).abs() < f64::EPSILON);
+        assert!((est("repo-debian", "debian") - 240.0).abs() < f64::EPSILON);
+        let find = |src: &str| {
+            c.sets
+                .iter()
+                .flat_map(|s| &s.sources)
+                .find(|s| s.name == src)
+                .unwrap()
+        };
+        for src in [
+            "fedora",
+            "unicode",
+            "rfcs",
+            "gcc",
+            "musl",
+            "gnu-latest",
+            "geofabrik-na",
+            "stage0-posix",
+            "builder-hex0",
+            "live-bootstrap",
+        ] {
+            assert!(find(src).on(), "{src}");
+        }
+        for src in ["alpine", "debian", "debian-security", "python"] {
+            assert!(!find(src).on(), "{src}");
+        }
+        for src in c
+            .sets
+            .iter()
+            .flat_map(|s| &s.sources)
+            .filter(|s| s.kind() == Kind::Repo)
+        {
+            assert!(src.url.starts_with("https://"), "{}", src.name);
+        }
+    }
+
+    #[test]
+    fn catalog_patterns_match_real_names() {
+        let c = Catalog::embedded().unwrap();
+        let find = |src: &str| {
+            c.sets
+                .iter()
+                .flat_map(|s| &s.sources)
+                .find(|s| s.name == src)
+                .unwrap()
+        };
+        let pat =
+            |src: &str, dir: &str| Regex::new(&find(src).pattern.replace("{dir}", dir)).unwrap();
+        let dirs = |src: &str| Regex::new(&find(src).dirs).unwrap();
+
+        assert!(pat("musl", "").is_match("releases/musl-1.2.5.tar.gz"));
+        assert!(!pat("musl", "").is_match("musl-1.2.5.tar.gz.asc"));
+
+        assert!(pat("geofabrik-na", "").is_match("north-america-261101.osm.pbf"));
+        assert!(!pat("geofabrik-na", "").is_match("north-america-latest.osm.pbf"));
+
+        let rfc = pat("rfcs", "");
+        for (name, want) in [
+            ("rfc9000.txt", true),
+            ("rfc9000.xml", true),
+            ("rfc9000.pdf", false),
+            ("rfc-index.txt", false),
+        ] {
+            assert_eq!(rfc.is_match(name), want, "{name}");
+        }
+
+        let uni = pat("unicode", "");
+        assert!(uni.is_match("UCD.zip") && uni.is_match("Unihan.zip"));
+        assert!(!uni.is_match("UCD.zip.sig"));
+        assert!(dirs("unicode").is_match("16.0.0/") && !dirs("unicode").is_match("UNIDATA/"));
+
+        let gcc = pat("gcc", &regex::escape("gcc-15.2.0"));
+        assert!(gcc.is_match("gcc-15.2.0.tar.xz") && !gcc.is_match("gcc-15.2.0.tar.gz"));
+        assert!(dirs("gcc").is_match("gcc-15.2.0/"));
+        assert!(!dirs("gcc").is_match("gcc-15.2.0-RC-20250728/"));
+
+        let gnu = pat("gnu-latest", "");
+        for (name, family, ver) in [
+            ("coreutils-9.5.tar.xz", "coreutils", "9.5"),
+            ("gnutls-3.8.4.tar.xz", "gnutls", "3.8.4"),
+        ] {
+            let g = gnu.captures(name).unwrap();
+            assert_eq!((&g[1], &g[2]), (family, ver), "{name}");
+        }
+        assert!(!gnu.is_match("emacs-30.1.tar.xz.sig"));
+        let gnu_dirs = dirs("gnu-latest");
+        let gnu_exclude = Regex::new(&find("gnu-latest").exclude).unwrap();
+        assert!(gnu_dirs.is_match("coreutils/") && !gnu_exclude.is_match("coreutils/"));
+        assert!(gnu_dirs.is_match("gcc/") && gnu_exclude.is_match("gcc/"));
+        assert!(!gnu_dirs.is_match("gnu-keyring.gpg"));
     }
 
     #[test]

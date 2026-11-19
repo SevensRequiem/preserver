@@ -32,7 +32,7 @@ get https://fedoraproject.org/fedora.gpg fedora fedora
 get https://alpinelinux.org/keys/ncopa.asc ncopa alpine-ncopa
 get https://releases.llvm.org/release-keys.asc llvm llvm
 get https://musl.libc.org/musl.pub musl musl
-get "https://keyring.debian.org/pks/lookup?op=get&search=0xDF9B9C49EAA9298432589D76DA87E80D6294BE9B" debcd debian-cd
+get https://www.debian.org/CD/key-DF9B9C49EAA9298432589D76DA87E80D6294BE9B.asc debcd debian-cd
 
 gpg --batch --auto-key-locate clear,wkd,nodefault --locate-keys torvalds@kernel.org gregkh@kernel.org alx@kernel.org jwboyer@kernel.org >/dev/null 2>&1
 gpg --batch --export >"$work/kernel.raw"

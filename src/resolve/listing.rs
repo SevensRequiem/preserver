@@ -180,7 +180,8 @@ impl Resolver<'_> {
     }
 
     /// Descends into the newest `dir_top` directories (all when 0) whose names match `dirs`,
-    /// and picks files from each. A link that leaves `s.url`, or a name that decodes to a
+    /// and picks files from each. A second capture group in `dirs` is the series: only the
+    /// newest directory of each series counts, so `dir_top` then counts series. A link that leaves `s.url`, or a name that decodes to a
     /// path, is not followed: parent links are normal on an index page.
     fn two_level(&self, s: &Source) -> Result<Vec<Item>> {
         let prefix = if s.url.ends_with('/') {
@@ -195,7 +196,7 @@ impl Resolver<'_> {
         let body = self.get(&s.url, DOC_LIMIT)?;
         let body = String::from_utf8_lossy(&body);
         let mut seen = HashSet::new();
-        let mut dirs: Vec<(String, String, String)> = Vec::new();
+        let mut dirs: Vec<(String, String, String, String)> = Vec::new();
         for href in hrefs(&body) {
             let Some(g) = dirs_re.captures(href) else {
                 continue;
@@ -215,14 +216,17 @@ impl Resolver<'_> {
                 continue;
             }
             let ver = g.get(1).map_or(name.as_str(), |m| m.as_str()).to_string();
-            dirs.push((url, name, ver));
+            let series = g.get(2).map_or("", |m| m.as_str()).to_string();
+            dirs.push((url, name, ver, series));
         }
         dirs.sort_by(|a, b| newest_first(&a.2, &b.2));
+        let mut series = HashSet::new();
+        dirs.retain(|d| d.3.is_empty() || series.insert(d.3.clone()));
         if s.dir_top > 0 {
             dirs.truncate(s.dir_top);
         }
         let mut out = Vec::new();
-        for (url, name, ver) in &dirs {
+        for (url, name, ver, _) in &dirs {
             let re = Regex::new(&s.pattern.replace("{dir}", &regex::escape(name)))?;
             out.extend(self.one_dir(s, url, &re, ver, Some(url))?);
         }
@@ -431,14 +435,14 @@ mod tests {
                 "p/gcc-14.2.0/",
                 br#"<a href="gcc-14.2.0.tar.xz">x</a> <a href="gcc-14.2.0.tar.xz.sig">s</a>"#,
             ),
-            ("p/gcc-14.1.0/", br#"<a href="gcc-14.1.0.tar.xz">x</a>"#),
+            ("p/gcc-13.3.0/", br#"<a href="gcc-13.3.0.tar.xz">x</a>"#),
         ]);
         let dl = downloader();
         let r = resolver(&dl, "");
-        let mut s = two(&srv, r"^gcc-(\d+\.\d+\.\d+)/$", r"^{dir}\.tar\.xz$");
+        let mut s = two(&srv, r"^gcc-((\d+)\.\d+\.\d+)/$", r"^{dir}\.tar\.xz$");
         s.dir_top = 2;
         let items = r.resolve(&s).unwrap();
-        assert_eq!(names(&items), ["gcc-14.2.0.tar.xz", "gcc-14.1.0.tar.xz"]);
+        assert_eq!(names(&items), ["gcc-14.2.0.tar.xz", "gcc-13.3.0.tar.xz"]);
         assert_eq!(items[0].url, srv.url("p/gcc-14.2.0/gcc-14.2.0.tar.xz"));
     }
 
