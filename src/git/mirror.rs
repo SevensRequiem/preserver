@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use gix::ObjectId;
 use gix::bstr::BString;
 use gix::lock::acquire::Fail;
+use gix::objs::ObjectRef;
+use gix::odb::pack::{self, index::traverse};
 use gix::protocol::fetch::RefMap;
 use gix::protocol::handshake::Ref;
 use gix::protocol::transport::Protocol;
@@ -22,7 +24,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 pub(crate) enum Via<'a> {
     /// `program` is run directly, never through a shell.
@@ -46,6 +50,12 @@ pub(crate) enum Trust {
 const CONFIG: &str =
     "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tlogallrefupdates = false\n";
 const STAGED: &[u8] = b"refs/staged/";
+/// The packs that passed the check, one file name per line. It sits on the same drive as the
+/// packs and is trusted as much as they are.
+const CHECKED: &str = "preserver-checked";
+/// The most one object may make gix allocate, on fetch and in the check: an entry's declared
+/// size is otherwise reserved and zero-filled as is. GitHub refuses files over 100 MiB.
+const ALLOC_LIMIT: usize = 1 << 30;
 
 /// Whether a token may be sent to `url`: https to exactly github.com, by the parser gix connects with.
 pub(crate) fn token_for(url: &str) -> bool {
@@ -66,7 +76,7 @@ pub(crate) fn update(
     via: Via<'_>,
     checked: Trust,
     stop: &AtomicBool,
-    phase: &dyn Fn(&str),
+    phase: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let parsed = gix::url::parse(url).with_context(|| format!("git URL {url:?}"))?;
     let scheme = match via {
@@ -83,7 +93,30 @@ pub(crate) fn update(
     }
     neutralise(dir)?;
     sweep(dir)?;
+    if matches!(checked, Trust::Host) {
+        mark_host_packs(dir)?;
+    }
     let repo = open(dir)?;
+    // A staged ref whose objects are gone (a pack that failed the check, deleted by hand) would
+    // make the fetch see no change and never bring them back.
+    let mut gone = Vec::new();
+    for r in repo.references()?.all()? {
+        let r = r?;
+        if r.name().as_bstr().starts_with(STAGED)
+            && r.target().try_id().is_some_and(|id| !repo.has_object(id))
+        {
+            gone.push(edit(
+                r.name().as_bstr(),
+                Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                },
+            )?);
+        }
+    }
+    if !gone.is_empty() {
+        transact(&repo, gone)?;
+    }
     let remote = repo
         .remote_at_without_url_rewrite(parsed.clone())?
         .with_refspecs(
@@ -154,21 +187,37 @@ pub(crate) fn update(
             },
         )?;
     if edits(&repo, prepare.ref_map())?.is_empty() {
-        return Ok(());
+        // Nothing to publish, but a pack planted since the last run is still checked.
+        return check_packs(dir, checked, repo.object_hash(), &[], stop, phase);
     }
     phase("fetching");
     let outcome = prepare
         .with_write_packed_refs_only(true)
         .receive(gix::progress::Discard, stop)?;
-    phase("checking packs");
-    check_packs(dir, checked)?;
+    let edits = edits(&repo, &outcome.ref_map)?;
+    let tips: Vec<ObjectId> = edits
+        .iter()
+        .filter_map(|e| match &e.change {
+            Change::Update {
+                new: Target::Object(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    check_packs(dir, checked, repo.object_hash(), &tips, stop, phase)?;
     // Relaxed: the flag carries no data, and a stop seen one step late only publishes once more.
     if stop.load(Ordering::Relaxed) {
         bail!("stopped");
     }
     phase("publishing");
-    let edits = edits(&repo, &outcome.ref_map)?;
     platform::sync_fs(dir).context("sync")?;
+    transact(&repo, edits)?;
+    platform::sync_fs(dir).context("sync")?;
+    Ok(())
+}
+
+fn transact(repo: &gix::Repository, edits: Vec<RefEdit>) -> Result<()> {
     repo.refs
         .transaction()
         .packed_refs(
@@ -178,7 +227,6 @@ pub(crate) fn update(
         )
         .prepare(edits, Fail::Immediately, Fail::Immediately)?
         .commit(None)?;
-    platform::sync_fs(dir).context("sync")?;
     Ok(())
 }
 
@@ -207,8 +255,9 @@ pub(crate) fn refs_state(dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn open(dir: &Path) -> Result<gix::Repository> {
-    gix::open_opts(dir, gix::open::Options::isolated())
-        .with_context(|| format!("open {}", dir.display()))
+    let options = gix::open::Options::isolated()
+        .config_overrides([format!("gitoxide.objects.allocLimit={ALLOC_LIMIT}")]);
+    gix::open_opts(dir, options).with_context(|| format!("open {}", dir.display()))
 }
 
 /// Makes `dir` a bare repo whose behaviour comes from `CONFIG` alone: no alternates (objects
@@ -289,25 +338,208 @@ fn sweep_dir(dir: &Path, deep: bool, stale: &dyn Fn(&str) -> bool) -> Result<()>
     Ok(())
 }
 
-/// Stands in for the pack check: outside tests, a pack not listed as checked is refused.
-fn check_packs(dir: &Path, _checked: Trust) -> Result<()> {
-    let listed = match std::fs::read_to_string(dir.join("preserver-checked")) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).context("preserver-checked"),
-    };
-    let mut unchecked = 0;
-    for e in std::fs::read_dir(dir.join("objects/pack"))? {
-        let name = e?.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".pack") && !listed.lines().any(|l| l == name) {
-            unchecked += 1;
-        }
+/// The pack check (D15): every pack not yet in `preserver-checked` has its pack and index
+/// checksums verified and every object decoded and hashed, in delta-tree order, and every object
+/// any of them names must be in a pack (or, on the host's disk, loose). Packs are recorded only
+/// when all pass, so the checked packs stay closed under references and a new object's closure
+/// is complete once its direct references are present. `tips` must be present as well.
+fn check_packs(
+    dir: &Path,
+    trust: Trust,
+    hash: gix::hash::Kind,
+    tips: &[ObjectId],
+    stop: &AtomicBool,
+    phase: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
+    let listed = read_checked(dir)?;
+    let names = packs(dir)?;
+    let pack_dir = dir.join("objects/pack");
+    let mut indexes = Vec::with_capacity(names.len());
+    for name in &names {
+        let path = pack_dir.join(name).with_extension("idx");
+        indexes
+            .push(pack::index::File::at(&path, hash).with_context(|| path.display().to_string())?);
     }
-    if unchecked > 0 && !cfg!(test) {
-        bail!("{unchecked} packs are unchecked, and the pack check is not built yet");
+    let present = |id: &gix::oid| {
+        indexes.iter().any(|i| i.lookup(id).is_some())
+            || matches!(trust, Trust::Host) && {
+                let hex = id.to_hex().to_string();
+                dir.join("objects")
+                    .join(&hex[..2])
+                    .join(&hex[2..])
+                    .is_file()
+            }
+    };
+    let unchecked: Vec<usize> = (0..names.len())
+        .filter(|&i| !listed.lines().any(|l| l == names[i]))
+        .collect();
+    let total: u64 = unchecked
+        .iter()
+        .map(|&i| u64::from(indexes[i].num_objects()))
+        .sum();
+    let done = AtomicU64::new(0);
+    for (n, &i) in unchecked.iter().enumerate() {
+        let label = |k: u64| {
+            format!(
+                "checking pack {}/{}, objects {k}/{total}",
+                n + 1,
+                unchecked.len()
+            )
+        };
+        phase(&label(done.load(Ordering::Relaxed)));
+        let path = pack_dir.join(&names[i]);
+        let data = pack::data::File::at(&path, hash).with_context(|| path.display().to_string())?;
+        let result = watched(stop, |interrupt| {
+            indexes[i].traverse(
+                &data,
+                &mut gix::progress::Discard,
+                interrupt,
+                |kind, bytes, entry, _| {
+                    // Relaxed: a counter and a flag that carry no data with them.
+                    if stop.load(Ordering::Relaxed) {
+                        return Err(gix::Error::from_error(io::Error::other("stopped")));
+                    }
+                    let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k * 100 / total != (k - 1) * 100 / total {
+                        phase(&label(k));
+                    }
+                    references(kind, bytes, hash, &mut |id| {
+                        if present(&id) {
+                            Ok(())
+                        } else {
+                            Err(gix::Error::from_error(io::Error::other(format!(
+                                "{kind} {} names {id}, which no pack holds",
+                                entry.oid
+                            ))))
+                        }
+                    })
+                },
+                traverse::Options {
+                    traversal: traverse::Algorithm::DeltaTreeLookup,
+                    thread_limit: Some(1),
+                    check: traverse::SafetyCheck::All,
+                    alloc_limit_bytes: Some(ALLOC_LIMIT),
+                    make_pack_lookup_cache: || pack::cache::Never,
+                },
+            )
+        });
+        if stop.load(Ordering::Relaxed) {
+            bail!("stopped");
+        }
+        // Kept, as the plan decided; it fails every run until it is deleted.
+        result.with_context(|| {
+            format!(
+                "pack {} failed the check (delete it and its .idx to fetch its objects again)",
+                path.display()
+            )
+        })?;
+    }
+    if let Some(tip) = tips.iter().find(|t| !present(t)) {
+        bail!("{tip} is to be published, but no pack holds it");
+    }
+    if !unchecked.is_empty() {
+        let mut text = listed;
+        for &i in &unchecked {
+            text.push_str(&names[i]);
+            text.push('\n');
+        }
+        replace(dir, CHECKED, text.as_bytes())?;
     }
     Ok(())
+}
+
+/// Calls `need` with every object the object in `bytes` names. A submodule's commit lives in
+/// another repository and is not named here.
+fn references(
+    kind: gix::objs::Kind,
+    bytes: &[u8],
+    hash: gix::hash::Kind,
+    need: &mut dyn FnMut(ObjectId) -> gix::Result<()>,
+) -> gix::Result<()> {
+    match ObjectRef::from_bytes(bytes, kind, hash)? {
+        ObjectRef::Commit(c) => {
+            need(c.tree())?;
+            c.parents().try_for_each(need)
+        }
+        ObjectRef::Tree(t) => t
+            .entries
+            .iter()
+            .filter(|e| !e.mode.is_commit())
+            .try_for_each(|e| need(e.oid.to_owned())),
+        ObjectRef::Tag(t) => need(t.target()),
+        ObjectRef::Blob(_) => Ok(()),
+    }
+}
+
+/// Runs `f` with an interrupt flag of its own that a watcher sets within 100 ms of `stop`. gix
+/// sets the flag itself when a checksum fails, so `stop` must not be handed to it; and hashing
+/// the pack and index looks at that flag only, never at the per-object callback.
+fn watched<T>(stop: &AtomicBool, f: impl FnOnce(&AtomicBool) -> T) -> T {
+    let interrupt = AtomicBool::new(false);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        let flag = &interrupt;
+        s.spawn(move || {
+            // Relaxed: the flags carry no data with them.
+            while !stop.load(Ordering::Relaxed) {
+                if done_rx.recv_timeout(Duration::from_millis(100))
+                    != Err(RecvTimeoutError::Timeout)
+                {
+                    return;
+                }
+            }
+            flag.store(true, Ordering::Relaxed);
+        });
+        let result = f(&interrupt);
+        drop(done_tx);
+        result
+    })
+}
+
+/// On the first open of a mirror on this host's disk, its packs are taken as checked as they are.
+fn mark_host_packs(dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dir.join(CHECKED)).is_ok() {
+        return Ok(());
+    }
+    let mut text = String::new();
+    for name in packs(dir)? {
+        text.push_str(&name);
+        text.push('\n');
+    }
+    replace(dir, CHECKED, text.as_bytes())
+}
+
+fn read_checked(dir: &Path) -> Result<String> {
+    match std::fs::read_to_string(dir.join(CHECKED)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).context(CHECKED),
+    }
+}
+
+/// The packs git would read: `*.pack` files with an index next to them, sorted.
+fn packs(dir: &Path) -> Result<Vec<String>> {
+    let pack_dir = dir.join("objects/pack");
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&pack_dir).with_context(|| pack_dir.display().to_string())? {
+        let e = e?;
+        let name = e.file_name();
+        if !name.as_encoded_bytes().ends_with(b".pack") {
+            continue;
+        }
+        let Some(name) = name.to_str().filter(|n| !n.contains('\n')) else {
+            bail!(
+                "a pack named {} cannot be listed as checked",
+                name.display()
+            );
+        };
+        // Followed links count: git reads a pack through one.
+        if pack_dir.join(name).is_file() && pack_dir.join(name).with_extension("idx").is_file() {
+            out.push(name.to_owned());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn edit(name: &[u8], change: Change) -> Result<RefEdit> {
@@ -537,7 +769,7 @@ mod tests {
         let f = fixture();
         let stop = AtomicBool::new(false);
         let err = update(&f.mirror, &f.url(), Via::File, Trust::Drive, &stop, &|p| {
-            if p == "checking packs" {
+            if p.starts_with("checking pack") {
                 stop.store(true, Ordering::Relaxed);
             }
         })
@@ -619,6 +851,294 @@ mod tests {
         git(&f.src, &["symbolic-ref", "HEAD", "refs/pull/1"]);
         f.run().unwrap();
         f.assert_mirrors("refs/heads/dev");
+    }
+
+    /// A run with every phase label kept.
+    fn run_logged(f: &Fixture, trust: Trust) -> (Result<()>, Vec<String>) {
+        let log = std::sync::Mutex::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let r = update(&f.mirror, &f.url(), Via::File, trust, &stop, &|p| {
+            log.lock().unwrap().push(p.to_owned());
+        });
+        (r, log.into_inner().unwrap())
+    }
+
+    fn checked(f: &Fixture) -> Vec<String> {
+        read_checked(&f.mirror)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn published(f: &Fixture) -> String {
+        git(
+            &f.mirror,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/tags",
+            ],
+        )
+    }
+
+    /// Flips the last byte before the pack's trailer.
+    fn flip(f: &Fixture, name: &str) {
+        let path = f.mirror.join("objects/pack").join(name);
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "a pack in the test's own temp dir"
+        )]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&path, perm).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() - 21;
+        bytes[at] ^= 0x40;
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// Packs the objects of `revs` (rev-list arguments) less `skip` into the mirror by hand.
+    fn plant(f: &Fixture, revs: &str, skip: &str) -> String {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut list = String::new();
+        for line in git(&f.src, &["rev-list", "--objects", revs]).lines() {
+            if !line.starts_with(skip) || skip.is_empty() {
+                list.push_str(&line[..40]);
+                list.push('\n');
+            }
+        }
+        std::fs::create_dir_all(f.mirror.join("objects/pack")).unwrap();
+        let prefix = f.mirror.join("objects/pack/pack");
+        let mut child = Command::new("git")
+            .current_dir(&f.src)
+            .args(["pack-objects", "-q"])
+            .arg(&prefix)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(list.as_bytes())
+            .unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        format!("pack-{}.pack", out.trim())
+    }
+
+    /// The first run stops at the check: one pack fetched and staged, none checked.
+    fn fetch_only(f: &Fixture) -> String {
+        let stop = AtomicBool::new(false);
+        let err = update(&f.mirror, &f.url(), Via::File, Trust::Drive, &stop, &|p| {
+            if p.starts_with("checking pack") {
+                stop.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "stopped");
+        assert_eq!(checked(f), Vec::<String>::new());
+        let mut names = packs(&f.mirror).unwrap();
+        assert_eq!(names.len(), 1);
+        names.remove(0)
+    }
+
+    #[test]
+    fn a_flipped_byte_is_refused() {
+        let f = fixture();
+        let name = fetch_only(&f);
+        flip(&f, &name);
+        let err = f.run().unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("{name} failed the check")),
+            "{err:#}"
+        );
+        assert_eq!(published(&f), "");
+        assert_eq!(checked(&f), Vec::<String>::new());
+        // What the error says to do: the staged refs still name the deleted objects.
+        let pack = f.mirror.join("objects/pack").join(&name);
+        std::fs::remove_file(pack.with_extension("idx")).unwrap();
+        std::fs::remove_file(pack).unwrap();
+        f.run().unwrap();
+        f.assert_mirrors("refs/heads/main");
+    }
+
+    /// A stop reaches the flag gix hashes under, while `f` is still running, and does not leak
+    /// into `stop`'s owner the other way: gix setting its flag leaves `stop` alone.
+    #[test]
+    fn a_stop_reaches_the_flag_gix_watches() {
+        let stop = AtomicBool::new(false);
+        let seen = watched(&stop, |interrupt| {
+            interrupt.store(true, Ordering::Relaxed);
+            interrupt.store(false, Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while !interrupt.load(Ordering::Relaxed) && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            interrupt.load(Ordering::Relaxed)
+        });
+        assert!(seen);
+        let quiet = AtomicBool::new(false);
+        watched(&quiet, |interrupt| interrupt.store(true, Ordering::Relaxed));
+        assert!(!quiet.load(Ordering::Relaxed));
+    }
+
+    /// One blob whose header claims 8 GiB over a one-byte zlib stream, with an index to match.
+    #[test]
+    fn a_size_bomb_is_refused_before_it_is_allocated() {
+        let f = fixture();
+        f.run().unwrap();
+        let repo = open(&f.mirror).unwrap();
+        let config = repo.config_snapshot();
+        let limit = config.integer("gitoxide.objects.allocLimit");
+        assert_eq!(limit, i64::try_from(ALLOC_LIMIT).ok());
+        let sha1 = |parts: &[&[u8]]| {
+            let mut h = gix::hash::hasher(gix::hash::Kind::Sha1);
+            for p in parts {
+                h.update(p);
+            }
+            h.try_finalize().unwrap()
+        };
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        // Blob (3), size 1 << 33: four empty 7-bit groups, then 2 << 28.
+        pack.extend_from_slice(&[0xb0, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        pack.extend_from_slice(b"x\x9c\xab\x00\x00\x00y\x00y");
+        let trailer = sha1(&[&pack]);
+        pack.extend_from_slice(trailer.as_bytes());
+        let mut idx = b"\xfftOc\0\0\0\x02".to_vec();
+        for i in 0..=255u8 {
+            idx.extend_from_slice(&u32::from(i >= 0x11).to_be_bytes());
+        }
+        idx.extend_from_slice(&[0x11; 20]);
+        idx.extend_from_slice(&[0; 4]);
+        idx.extend_from_slice(&12u32.to_be_bytes());
+        idx.extend_from_slice(trailer.as_bytes());
+        let sum = sha1(&[&idx]);
+        idx.extend_from_slice(sum.as_bytes());
+        let name = format!("pack-{trailer}.pack");
+        let path = f.mirror.join("objects/pack").join(&name);
+        std::fs::write(&path, pack).unwrap();
+        std::fs::write(path.with_extension("idx"), idx).unwrap();
+        let msg = format!("{:#}", f.run().unwrap_err());
+        assert!(msg.contains(&format!("{name} failed the check")), "{msg}");
+        assert!(msg.contains("Entry too large to fit in memory"), "{msg}");
+        assert!(!checked(&f).contains(&name));
+    }
+
+    #[test]
+    fn a_pack_missing_a_blob_is_refused() {
+        let f = fixture();
+        f.run().unwrap();
+        let before = published(&f);
+        let old = git(&f.src, &["rev-parse", "main"]);
+        commit(&f.src, "n", "new blob");
+        let blob = git(&f.src, &["rev-parse", "main:n"]);
+        let name = plant(&f, &format!("{old}..main"), &blob);
+        let new = git(&f.src, &["rev-parse", "main"]);
+        git(&f.mirror, &["update-ref", "refs/staged/heads/main", &new]);
+        let err = f.run().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("{name} failed")), "{msg}");
+        assert!(
+            msg.contains(&format!("names {blob}, which no pack holds")),
+            "{msg}"
+        );
+        assert_eq!(published(&f), before);
+        assert!(!checked(&f).contains(&name));
+    }
+
+    /// Pack B is intact, but what it builds on is in pack A, which is not: neither is recorded.
+    #[test]
+    fn a_corrupt_pack_fails_the_packs_that_need_it() {
+        let f = fixture();
+        git(&f.src, &["branch", "-D", "dev"]);
+        git(&f.src, &["tag", "-d", "v1", "v2"]);
+        git(f.src.parent().unwrap(), &["init", "-q", "--bare", "m.git"]);
+        let base = git(&f.src, &["rev-parse", "main"]);
+        let a = plant(&f, "main", "");
+        commit(&f.src, "n", "on top");
+        let b = plant(&f, &format!("{base}..main"), "");
+        let new = git(&f.src, &["rev-parse", "main"]);
+        git(&f.mirror, &["update-ref", "refs/staged/heads/main", &new]);
+        flip(&f, &a);
+        let (r, log) = run_logged(&f, Trust::Drive);
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains(&format!("{a} failed the check")), "{msg}");
+        assert!(
+            log.iter().any(|p| p.starts_with("checking pack 1/2")),
+            "{log:?}"
+        );
+        assert_eq!(checked(&f), Vec::<String>::new(), "{b} was recorded");
+        assert_eq!(published(&f), "");
+    }
+
+    #[test]
+    fn a_planted_pack_is_checked_on_the_next_run() {
+        let f = fixture();
+        f.run().unwrap();
+        let good = plant(&f, "main", "");
+        let (r, log) = run_logged(&f, Trust::Drive);
+        r.unwrap();
+        assert!(
+            log.iter().any(|p| p.starts_with("checking pack 1/1,")),
+            "{log:?}"
+        );
+        assert!(checked(&f).contains(&good));
+        let bad = plant(&f, "dev", "");
+        flip(&f, &bad);
+        let err = f.run().unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("{bad} failed the check")),
+            "{err:#}"
+        );
+        assert!(!checked(&f).contains(&bad));
+        // The bad pack stays (D15: kept, not deleted); the published refs are untouched.
+        assert_eq!(published(&f), f.src_refs());
+    }
+
+    /// A mirror phase 1 left on this host: `git clone --mirror`, then a fetch that wrote loose
+    /// refs and loose objects. Its pack is taken as checked; only the new one is decoded.
+    #[test]
+    fn a_phase_1_host_mirror_is_taken_as_checked() {
+        let f = fixture();
+        git(
+            f.src.parent().unwrap(),
+            &["clone", "-q", "--mirror", "--no-local", &f.url(), "m.git"],
+        );
+        commit(&f.src, "f", "seven");
+        git(&f.mirror, &["fetch", "-q"]);
+        assert!(f.mirror.join("refs/heads/main").is_file());
+        let loose = git(&f.mirror, &["count-objects"]);
+        assert!(!loose.starts_with("0 objects"), "{loose}");
+        let first = packs(&f.mirror).unwrap();
+        commit(&f.src, "g", "eight");
+        let (r, log) = run_logged(&f, Trust::Host);
+        r.unwrap();
+        f.assert_mirrors("refs/heads/main");
+        let decoded: Vec<_> = log
+            .iter()
+            .filter(|p| p.starts_with("checking pack"))
+            .collect();
+        assert_ne!(decoded.len(), 0);
+        assert!(
+            decoded.iter().all(|p| p.starts_with("checking pack 1/1,")),
+            "{decoded:?}"
+        );
+        let all = packs(&f.mirror).unwrap();
+        assert_eq!(all.len(), first.len() + 1);
+        let new: Vec<String> = all.into_iter().filter(|n| !first.contains(n)).collect();
+        assert_eq!(checked(&f), [first, new].concat());
     }
 
     #[test]

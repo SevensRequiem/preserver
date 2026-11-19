@@ -117,7 +117,7 @@ impl From<Vec<Fetch>> for Work<'_>
 **D15. git integrity (R6, F3, C12).**
 - Every pack not listed in `preserver-checked` gets full verification before anything is published:
   - the pack and index trailer checksums;
-  - every object decoded through gix's index-traverse path in delta-tree order, with a bounded pack cache (64 MiB);
+  - every object decoded through gix's index-traverse path in delta-tree order, with no object larger than 1 GiB (`gitoxide.objects.allocLimit`, on fetch too). `DeltaTreeLookup` takes no pack cache: its memory is the resolved bases on the current delta path;
   - every object id recomputed.
 - Then connectivity is checked over the union of the unchecked packs plus the already-checked ones. All packs in the set pass, or none are recorded and nothing is published.
 - `preserver-checked` lives on the drive and has the same trust as the packs themselves; the docs say so.
@@ -593,7 +593,7 @@ Dependency graph:
 5. **Upstream moves during a fill** cause 404s and failed runs. The next run re-anchors and keeps what landed.
 6. **No exchange on exFAT, vfat and Windows**: a short 404 window. Windows `sync_fs` is a stub. Windows prune is path-based, so the symlink race (R16) is mitigated only on Linux.
 7. **By-hash entries vanish at the swap.** Security's `Valid-Until` lapses about a week after the last sync.
-8. **Git has no repack, and packs accumulate.** A pack that fails the check blocks every run until upstream changes. `Run` jobs are never yielded, so a long git fetch delays higher-priority sets until it finishes.
+8. **Git has no repack, and packs accumulate.** A pack that fails the check is kept and fails every run until someone deletes it and its `.idx`, as the error says; the next run drops the staged refs that named its objects and fetches them again. `Run` jobs are never yielded, so a long git fetch delays higher-priority sets until it finishes.
 9. **No redirects:** a renamed upstream fails until the catalog changes. The dry-run probe catches it first.
 10. **Copy lane and kit** don't carry mirror trees until phase 4.
 11. **GNU publishes all or nothing.** RFCs are TOFU. A full gnu-latest resolve costs about 2 minutes per new job (cached per job).
