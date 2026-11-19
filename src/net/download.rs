@@ -677,11 +677,36 @@ impl Downloader {
     /// A small document (an index, an API answer, a key) of at most `limit` bytes. It goes
     /// through the bandwidth bucket like every other body.
     pub(crate) fn get(&self, url: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
-        let mut body = self
-            .doc_retried(url, false)?
-            .into_body()
-            .into_reader()
-            .take(limit + 1);
+        let body = self.doc_retried(url, false)?.into_body();
+        self.read_limited(body, url, limit)
+    }
+
+    /// Like `get` but one request that refuses any redirect: for a document whose host must not
+    /// be able to send us elsewhere (the Fedora metalink).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Fedora walker uses it, a later step")
+    )]
+    pub(crate) fn get_direct(&self, url: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
+        let resp = self
+            .agent
+            .get(url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(120)))
+            .build()
+            .call()
+            .map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+        match resp.status().as_u16() {
+            200 => self.read_limited(resp.into_body(), url, limit),
+            s @ (301 | 302 | 303 | 307 | 308) => {
+                anyhow::bail!("{url}: redirect (HTTP {s}) refused")
+            }
+            s => anyhow::bail!("{url}: HTTP {s}"),
+        }
+    }
+
+    fn read_limited(&self, body: ureq::Body, url: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
+        let mut body = body.into_reader().take(limit + 1);
         let mut out = Vec::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -698,6 +723,16 @@ impl Downloader {
             anyhow::bail!("{url}: larger than {limit} bytes");
         }
         Ok(out)
+    }
+
+    #[expect(dead_code, reason = "the git transport takes it, a later step")]
+    pub(crate) fn agent(&self) -> Agent {
+        self.agent.clone()
+    }
+
+    #[expect(dead_code, reason = "the git transport takes it, a later step")]
+    pub(crate) fn throttle(&self) -> Arc<Throttle> {
+        self.throttle.clone()
     }
 
     pub(crate) fn head(&self, url: &str) -> anyhow::Result<HeaderMap> {
@@ -994,6 +1029,22 @@ mod tests {
             matches!(&err, Fail::Permanent(m) if m.ends_with("more than 10 redirects")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn get_direct_refuses_a_redirect() {
+        let srv = Server::start("127.0.0.1", Behaviour::new(b"doc".to_vec()));
+        srv.set(|b| {
+            b.redirects
+                .insert("moved".into(), "http://127.0.0.1:9/other".into());
+        });
+        let d = dl(0);
+        assert_eq!(d.get_direct(&srv.url("doc"), 16).unwrap(), b"doc");
+        let err = d.get_direct(&srv.url("moved"), 16).unwrap_err().to_string();
+        assert!(err.contains("redirect (HTTP 302) refused"), "{err}");
+        assert_eq!(srv.hits().len(), 2);
+        let err = d.get_direct(&srv.url("doc"), 2).unwrap_err().to_string();
+        assert!(err.contains("larger than 2 bytes"), "{err}");
     }
 
     #[test]

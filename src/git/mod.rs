@@ -1,4 +1,9 @@
 pub mod credential;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the mirror step builds its remote from it")
+)]
+pub(crate) mod http;
 pub mod ssh;
 
 use crate::config::Transport;

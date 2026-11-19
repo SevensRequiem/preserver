@@ -2,7 +2,7 @@
 //! for every path, with switches for range support, If-Range, a dropped connection and pacing.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,9 @@ pub(crate) struct Behaviour {
     pub routes: Option<HashMap<String, Vec<u8>>>,
     /// Paths answered with a 302 to the given Location, before anything else.
     pub redirects: HashMap<String, String>,
+    /// Paths answered with this status and these raw header lines (each ending in CRLF) and no
+    /// body, after the redirects.
+    pub replies: HashMap<String, (u16, String)>,
 }
 
 impl Behaviour {
@@ -51,12 +54,15 @@ impl Behaviour {
             pace: Duration::ZERO,
             routes: None,
             redirects: HashMap::new(),
+            replies: HashMap::new(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Hit {
+    pub method: String,
+    pub body: Vec<u8>,
     pub range: Option<String>,
     pub if_range: Option<String>,
     pub status: u16,
@@ -135,9 +141,14 @@ fn serve(mut sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
         return;
     }
     let mut words = line.split_whitespace();
-    let is_head = words.next() == Some("HEAD");
-    let path = words.next().unwrap_or_default().trim_start_matches('/');
-    let (mut range, mut if_range) = (None, None);
+    let method = words.next().unwrap_or_default().to_string();
+    let is_head = method == "HEAD";
+    let path = words
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let (mut range, mut if_range, mut length) = (None, None, 0usize);
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
@@ -147,16 +158,32 @@ fn serve(mut sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
         match k.to_ascii_lowercase().as_str() {
             "range" => range = Some(v.trim().to_string()),
             "if-range" => if_range = Some(v.trim().to_string()),
+            "content-length" => length = v.trim().parse().unwrap_or(0),
             _ => {}
         }
     }
-    let to = behaviour.lock().unwrap().redirects.get(path).cloned();
+    let mut data = vec![0; length];
+    if reader.read_exact(&mut data).is_err() {
+        return;
+    }
+    let req = Req { method, path, data };
+    let (to, reply) = {
+        let b = behaviour.lock().unwrap();
+        (
+            b.redirects.get(req.path.as_str()).cloned(),
+            b.replies.get(req.path.as_str()).cloned(),
+        )
+    };
+    if let Some((status, lines)) = reply.filter(|_| to.is_none()) {
+        req.record(counts, range, if_range, status);
+        let head = format!(
+            "HTTP/1.1 {status} Reply\r\n{lines}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(head.as_bytes());
+        return;
+    }
     if let Some(to) = to {
-        counts.hits.lock().unwrap().push(Hit {
-            range,
-            if_range,
-            status: 302,
-        });
+        req.record(counts, range, if_range, 302);
         let head = format!(
             "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
@@ -172,8 +199,27 @@ fn serve(mut sock: TcpStream, behaviour: &Mutex<Behaviour>, counts: &Stats) {
         range,
         if_range,
         Active(&counts.active),
-        (is_head, path),
+        (is_head, req),
     );
+}
+
+struct Req {
+    method: String,
+    path: String,
+    data: Vec<u8>,
+}
+
+impl Req {
+    fn record(&self, counts: &Stats, range: Option<String>, if_range: Option<String>, status: u16) {
+        let hit = Hit {
+            method: self.method.clone(),
+            body: self.data.clone(),
+            range,
+            if_range,
+            status,
+        };
+        counts.hits.lock().unwrap().push(hit);
+    }
 }
 
 /// An `ETag` that changes with the content (FNV-1a).
@@ -191,8 +237,9 @@ fn respond(
     range: Option<String>,
     if_range: Option<String>,
     active: Active<'_>,
-    (is_head, path): (bool, &str),
+    (is_head, req): (bool, Req),
 ) {
+    let path = req.path.as_str();
     let (data, etag, pace, die_at, status, head) = {
         let mut cfg = behaviour.lock().unwrap();
         let routed = cfg.routes.as_ref().map(|r| r.get(path).cloned());
@@ -245,11 +292,7 @@ fn respond(
         }
         (data, etag, cfg.pace, die.map(|d| d - start), status, head)
     };
-    counts.hits.lock().unwrap().push(Hit {
-        range,
-        if_range,
-        status,
-    });
+    req.record(counts, range, if_range, status);
     let reason = if status == 206 {
         "Partial Content"
     } else {
