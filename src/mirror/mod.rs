@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// How a file is known to be the right one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum Check {
     Sha256([u8; 32]),
@@ -64,7 +64,7 @@ impl From<Check> for String {
 }
 
 /// A file of the tree, by its path relative to the tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Entry {
     pub path: String,
     pub size: u64,
@@ -86,6 +86,8 @@ pub(crate) struct Anchor {
     pub docs: Vec<(String, Vec<u8>)>,
     pub meta: Vec<Meta>,
     pub swaps: Vec<String>,
+    /// The metalink's `mm0:timestamp` (Fedora), kept in the `live.tsv` header at the commit.
+    pub ts: Option<u64>,
 }
 
 /// What a walker may use to fetch and verify its anchor.
