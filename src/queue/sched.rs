@@ -318,6 +318,24 @@ pub(crate) fn halt_requested(store: &Store, id: &str) -> Option<Halt> {
 pub(crate) enum Halt {
     Pause,
     Cancel,
+    /// A job that sorts first was queued: this one goes back in the queue, partials kept.
+    Yield,
+}
+
+/// Whether a queued download job sorts before `job`. Without this a long set (a 100 GB zim)
+/// holds the lane for days and every set queued after it waits, whatever its priority.
+fn outranked(store: &Store, job: &Job) -> bool {
+    let key = (job.priority, job.created, &job.id);
+    store.jobs().is_ok_and(|jobs| {
+        jobs.iter().any(|j| {
+            let c = store.control(Some(&j.id));
+            j.kind.lane() == Lane::Download
+                && j.state == JobState::Queued
+                && !c.pause
+                && !c.cancel
+                && (c.priority.unwrap_or(j.priority), j.created, &j.id) < key
+        })
+    })
 }
 
 pub(crate) struct Worker<'a> {
@@ -406,7 +424,9 @@ impl Worker<'_> {
             }
             let mut last = (Instant::now(), 0);
             while !pool.wait(Duration::from_secs(1)) {
-                if let Some(h) = halt_requested(self.store, &job.id) {
+                if let Some(h) = halt_requested(self.store, &job.id)
+                    .or_else(|| outranked(self.store, &job).then_some(Halt::Yield))
+                {
                     halt = Some(h);
                     pool.halt();
                 }
@@ -438,32 +458,40 @@ impl Worker<'_> {
         job.progress.files_done = st.files_done;
         job.progress.rate_bps = 0;
         job.progress.current.clear();
-        job.state = if st.drive_gone {
-            // Unplugging is not the job's fault.
-            job.attempts -= 1;
-            JobState::Blocked(BlockReason::DriveAbsent)
-        } else if st.files_done == fetches.len() as u64 {
-            JobState::Done
-        } else if halt == Some(Halt::Cancel) {
-            for f in &fetches {
-                for p in [f.part(), f.sidecar()] {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-            JobState::Canceled
-        } else if halt == Some(Halt::Pause) {
-            JobState::Paused
-        } else {
-            let n = st.failed.len();
-            let mut msg = st.failed.into_iter().take(3).collect::<Vec<_>>().join("; ");
-            if n > 3 {
-                msg = format!("{msg} (and {} more)", n - 3);
-            }
-            job.error = Some(msg);
-            JobState::Failed
-        };
+        job.state = stopped(&mut job, st, halt, &fetches);
         (self.settle)(&mut job, &root);
         self.store.save(&mut job)
+    }
+}
+
+/// The state a job's run ends in, from what its downloads did and what stopped them.
+fn stopped(job: &mut Job, st: State, halt: Option<Halt>, fetches: &[Fetch]) -> JobState {
+    if st.drive_gone {
+        // Unplugging is not the job's fault.
+        job.attempts -= 1;
+        JobState::Blocked(BlockReason::DriveAbsent)
+    } else if st.files_done == fetches.len() as u64 {
+        JobState::Done
+    } else if halt == Some(Halt::Cancel) {
+        for f in fetches {
+            for p in [f.part(), f.sidecar()] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        JobState::Canceled
+    } else if halt == Some(Halt::Pause) {
+        JobState::Paused
+    } else if halt == Some(Halt::Yield) {
+        job.attempts -= 1;
+        JobState::Queued
+    } else {
+        let n = st.failed.len();
+        let mut msg = st.failed.into_iter().take(3).collect::<Vec<_>>().join("; ");
+        if n > 3 {
+            msg = format!("{msg} (and {} more)", n - 3);
+        }
+        job.error = Some(msg);
+        JobState::Failed
     }
 }
 
@@ -735,6 +763,64 @@ mod tests {
         let hits = r.srv.hits();
         let want = format!("bytes={saved}-");
         assert_eq!(hits.last().unwrap().range.as_deref(), Some(want.as_str()));
+    }
+
+    #[test]
+    fn a_job_queued_with_higher_priority_runs_first() {
+        let r = Rig::new(6 * CP, 2 << 20);
+        let drive: DriveId = "ABCD-0123".parse().unwrap();
+        let big = r
+            .store
+            .create(&JobKind::Set { set: "big".into() }, &drive, 20)
+            .unwrap();
+        let order = Mutex::new(Vec::new());
+        let mnt = r.mnt();
+        let plan = |j: &Job, root: &Path| {
+            let JobKind::Set { set } = &j.kind else {
+                unreachable!()
+            };
+            order.lock().unwrap().push(set.clone());
+            Ok(vec![Fetch {
+                dest: root.join(format!("staging/{set}.iso")),
+                ..r.fetch(root)
+            }])
+        };
+        let worker = Worker {
+            store: &r.store,
+            dl: &r.dl,
+            plan: &plan,
+            settle: &|_, _| {},
+            drive: &|_| DriveAt::Mounted(mnt.clone()),
+        };
+        let mut small = None;
+        std::thread::scope(|s| {
+            let w = s.spawn(|| worker.run(Pass::TICK).unwrap());
+            while r.srv.served() < 3 * CP / 2 {
+                assert!(!w.is_finished());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            small = Some(
+                r.store
+                    .create(
+                        &JobKind::Set {
+                            set: "small".into(),
+                        },
+                        &drive,
+                        3,
+                    )
+                    .unwrap(),
+            );
+            w.join().unwrap();
+        });
+        assert_eq!(*order.lock().unwrap(), ["big", "small", "big"]);
+        for id in [&big.id, &small.unwrap().id] {
+            let j = r.store.job(id).unwrap();
+            assert_eq!(j.state, JobState::Done, "{:?}", j.error);
+            assert_eq!(j.attempts, 1, "a yield is not an attempt");
+        }
+        // The yielded job resumed from its checkpoint instead of starting over.
+        let resumed = r.srv.hits().iter().filter(|h| h.range.is_some()).count();
+        assert!(resumed >= 1, "{:?}", r.srv.hits());
     }
 
     #[test]
