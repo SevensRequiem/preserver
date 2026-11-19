@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 pub(crate) const SIDE_LIMIT: u64 = 16 << 20;
 /// Decoder memory for a signed `.xz`, in KiB: four times what `xz -9` needs (64 MiB).
 /// Most an honest tarball inflates by under xz.
-const XZ_RATIO: u64 = 64;
-const XZ_MEM_KIB: u32 = 256 << 10;
+pub(crate) const XZ_RATIO: u64 = 64;
+pub(crate) const XZ_MEM_KIB: u32 = 256 << 10;
 
 pub(crate) struct Verifier<'a> {
     pub keys: &'a [Keyring<'a>],

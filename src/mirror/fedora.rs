@@ -6,6 +6,7 @@ use super::{Anchor, Check, Ctx, Entry, Meta, rel_path};
 use crate::catalog::Source;
 use crate::platform;
 use crate::public::versioned::read_meta;
+use crate::resolve::unhex;
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -101,24 +102,6 @@ fn num(text: &str, what: &str) -> Result<u64> {
     text.trim()
         .parse()
         .with_context(|| format!("{what} is not a number"))
-}
-
-fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
-    let b = text.trim().as_bytes();
-    if b.len() != N * 2 {
-        bail!("hash of {} characters, wanted {}", b.len(), N * 2);
-    }
-    let nib = |c: u8| match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => bail!("not hex"),
-    };
-    let mut out = [0u8; N];
-    for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
-        *o = (nib(pair[0])? << 4) | nib(pair[1])?;
-    }
-    Ok(out)
 }
 
 /// One version of the repomd as the metalink states it.

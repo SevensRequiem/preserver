@@ -3,6 +3,7 @@
 
 pub(crate) mod alpine;
 pub(crate) mod deb822;
+pub(crate) mod debian;
 pub(crate) mod fedora;
 pub(crate) mod generation;
 

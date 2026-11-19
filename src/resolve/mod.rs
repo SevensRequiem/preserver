@@ -385,6 +385,25 @@ pub(crate) fn hex(b: &[u8]) -> String {
     })
 }
 
+/// A hash as published, in either case, of exactly `N` bytes.
+pub(crate) fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
+    let b = text.trim().as_bytes();
+    if b.len() != N * 2 {
+        bail!("hash of {} characters, wanted {}", b.len(), N * 2);
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => bail!("not hex"),
+    };
+    let mut out = [0u8; N];
+    for (o, pair) in out.iter_mut().zip(b.as_chunks::<2>().0) {
+        *o = (nib(pair[0])? << 4) | nib(pair[1])?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
