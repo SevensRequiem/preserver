@@ -4,7 +4,17 @@ pub mod credential;
     expect(dead_code, reason = "the mirror step builds its remote from it")
 )]
 pub(crate) mod http;
+#[cfg_attr(
+    any(not(test), not(unix)),
+    expect(
+        dead_code,
+        reason = "the public and personal mirror steps call it; ssh and https are tested on unix"
+    )
+)]
+pub(crate) mod mirror;
 pub mod ssh;
+#[cfg(test)]
+mod testcgi;
 
 use crate::config::Transport;
 use crate::platform;

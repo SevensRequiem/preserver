@@ -250,7 +250,7 @@ Dependency graph:
   - `pub(crate) enum Trust { Drive, Host }`
   - `refs_state`
   - `token_for(url) -> bool`: parses the host and compares it exactly with `github.com`.
-  - `TRIES`
+  - No `TRIES` here: a Mirror `Work::Run` error maps straight to Failed (the S1 outcome table), and retries come from the queue's own `attempts` and ctl retry, so nothing in S4a counts attempts.
 - Steps:
   1. Write the fixed config text (tmp, fsync, rename) and delete `commondir` and alternates. This happens for both `Trust` values (R9).
   2. Sweep stale `*.lock` files under the root and `refs/`, plus pack temp files (R7).

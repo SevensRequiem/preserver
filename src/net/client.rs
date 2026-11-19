@@ -6,7 +6,7 @@ use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 const USER_AGENT: &str = concat!("preserver/", env!("CARGO_PKG_VERSION"));
 
-fn provider() -> Arc<CryptoProvider> {
+pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
