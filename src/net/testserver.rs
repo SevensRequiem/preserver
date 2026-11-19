@@ -62,6 +62,7 @@ impl Behaviour {
 #[derive(Debug, Clone)]
 pub(crate) struct Hit {
     pub method: String,
+    pub path: String,
     pub body: Vec<u8>,
     pub range: Option<String>,
     pub if_range: Option<String>,
@@ -213,6 +214,7 @@ impl Req {
     fn record(&self, counts: &Stats, range: Option<String>, if_range: Option<String>, status: u16) {
         let hit = Hit {
             method: self.method.clone(),
+            path: self.path.clone(),
             body: self.data.clone(),
             range,
             if_range,

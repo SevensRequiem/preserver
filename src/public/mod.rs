@@ -10,6 +10,8 @@ use crate::config::{Config, DriveId};
 use crate::git::http::Remote;
 use crate::git::mirror::{Trust, Via, refs_state, update};
 use crate::keys;
+use crate::mirror::generation::{Gen, Next, live_path, read_header};
+use crate::mirror::{self, Ctx, WALKERS, Walkers};
 use crate::net::client;
 use crate::net::download::{CHECKPOINT, Downloader};
 use crate::net::throttle::Throttle;
@@ -41,6 +43,11 @@ pub(crate) struct Public<'a> {
     free: Free<'a>,
     /// The stage each planned job is filling, until the worker settles the job.
     staged: Mutex<HashMap<String, Staged>>,
+    /// The generation each planned repo mirror job is filling, until the worker settles it.
+    gens: Mutex<HashMap<String, Gen>>,
+    walkers: Walkers,
+    /// The Fedora metalink service: the constant in production, a loopback server in tests.
+    metalink: &'a str,
 }
 
 #[expect(clippy::cast_precision_loss, reason = "a size shown to two decimals")]
@@ -208,16 +215,22 @@ impl Public<'_> {
         Ok(by)
     }
 
+    fn gens(&self) -> std::sync::MutexGuard<'_, HashMap<String, Gen>> {
+        self.gens.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn staged(&self) -> std::sync::MutexGuard<'_, HashMap<String, Staged>> {
         self.staged.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The worker's planner: what a set job has to download. A set that needs nothing (no
     /// usable source, over budget, unchanged) is recorded here and plans no files.
-    pub(crate) fn plan(&self, job: &Job, root: &Path) -> Result<Work<'_>> {
+    pub(crate) fn plan(&self, job: &Job, root: &Path, ok: &[usize]) -> Result<Work<'_>> {
         let name = match &job.kind {
             JobKind::Set { set } => set,
-            JobKind::Mirror { set, source } => return self.plan_mirror(set, source, root),
+            JobKind::Mirror { set, source } => {
+                return self.plan_mirror(job, set, source, root, ok);
+            }
             _ => bail!("not a public job"),
         };
         let set = self
@@ -281,9 +294,17 @@ impl Public<'_> {
     }
 
     /// A git mirror is one closure job: gix fetches into the bare repo under
-    /// `<set>/git/<source>.git`. A repo source only records that it was skipped until its
-    /// walkers arrive. A source gone from the catalog ends the job in `settle`.
-    fn plan_mirror(&self, set: &str, source: &str, root: &Path) -> Result<Work<'_>> {
+    /// `<set>/git/<source>.git`. A repo mirror is a generation of the tree
+    /// `<set>/<source>`, planned batch by batch. A source gone from the catalog ends the job
+    /// in `settle`.
+    fn plan_mirror(
+        &self,
+        job: &Job,
+        set: &str,
+        source: &str,
+        root: &Path,
+        ok: &[usize],
+    ) -> Result<Work<'_>> {
         let id = format!("{set}/{source}");
         let skip = |detail: &str| {
             self.record(&id, "skipped", "", detail);
@@ -293,7 +314,7 @@ impl Public<'_> {
             return skip("source no longer in the catalog");
         };
         if src.kind() != Kind::Git {
-            return skip("arrives later in phase 3");
+            return self.plan_repo(job, set, src, root, ok);
         }
         let set_dir = Self::public_dir(root).join(set);
         let repo = set_dir.join("git").join(format!("{source}.git"));
@@ -389,22 +410,96 @@ impl Public<'_> {
         })))
     }
 
+    /// The next batch of a repo mirror. The first call of a job starts its generation: a
+    /// swap a crash left is finished, the anchor is fetched and the stages of other
+    /// generations are dropped. Later calls hand `ok` to the generation.
+    fn plan_repo(
+        &self,
+        jb: &Job,
+        set: &str,
+        src: &Source,
+        root: &Path,
+        ok: &[usize],
+    ) -> Result<Work<'_>> {
+        let set_dir = Self::public_dir(root).join(set);
+        let tree = set_dir.join(&src.name);
+        let id = format!("{set}/{}", src.name);
+        let job = jb.id.as_str();
+        // An unknown filesystem gets the Windows name rules, the strictest that still hold
+        // files over 4 GiB.
+        let fstype = platform::list_filesystems()
+            .ok()
+            .and_then(|fs| fs.into_iter().find(|f| jb.drive.matches(&f.id)))
+            .map(|f| f.fstype)
+            .filter(|t| !t.is_empty())
+            .or_else(|| platform::fs_type(root).ok())
+            .unwrap_or_else(|| "exfat".into());
+        let mut gens = self.gens();
+        if !gens.contains_key(job) {
+            versioned::plain_dirs(&[
+                &root.join("preserver"),
+                &Self::public_dir(root),
+                &set_dir,
+                &tree,
+            ])?;
+            std::fs::create_dir_all(&tree).with_context(|| tree.display().to_string())?;
+            mirror::generation::recover(&tree)?;
+            let ctx = Ctx {
+                dl: self.resolver.dl,
+                keys: self.verifier.keys,
+                metalink: self.metalink,
+                plain_http: self.resolver.plain_http,
+                tree: tree.is_dir().then_some(tree.as_path()),
+            };
+            let anchor = (self.walkers.anchor)(&ctx, src)?;
+            let g = mirror::generation::begin(&tree, &src.url, anchor)?;
+            let g16 = g.generation()[..16].to_string();
+            versioned::clear_other_stages(&mirror::generation::staging_root(&tree), &g16);
+            gens.insert(job.to_string(), g);
+        }
+        let g = gens.get_mut(job).context("the generation is gone")?;
+        let walkers = self.walkers;
+        let mut walk =
+            |a: &mirror::Anchor, meta: &Path, emit: &mut dyn FnMut(mirror::generation::Walked)| {
+                (walkers.walk)(src, a, meta, emit)
+            };
+        let next = self
+            .room(root)
+            .and_then(|room| g.next(ok, &mut walk, room, &fstype));
+        let next = match next {
+            Ok(n) => n,
+            Err(e) => {
+                gens.remove(job);
+                return Err(e);
+            }
+        };
+        match next {
+            Next::Batch(p) => Ok(Work::Fetch(p)),
+            Next::Ready => Ok(Vec::new().into()),
+            Next::OverBudget { need, room } => {
+                gens.remove(job);
+                self.record(
+                    &id,
+                    "skipped",
+                    "",
+                    &format!(
+                        "budget: needs about {}, {} free above the {}% reserve",
+                        gb(need),
+                        gb(room),
+                        self.reserve_percent
+                    ),
+                );
+                Ok(Vec::new().into())
+            }
+        }
+    }
+
     /// Called by the worker when a job stops. A job whose downloads all arrived is verified
     /// and published here; a verification failure turns it into a failed job.
-    pub(crate) fn settle(&self, job: &mut Job, root: &Path) {
-        if let JobKind::Mirror { set, source } = &job.kind {
-            match job.state {
-                JobState::Done if self.mirror_source(set, source).is_none() => {
-                    job.state = JobState::Canceled;
-                }
-                JobState::Failed => self.record(
-                    &format!("{set}/{source}"),
-                    "failed",
-                    "",
-                    job.error.as_deref().unwrap_or_default(),
-                ),
-                _ => {}
-            }
+    pub(crate) fn settle(&self, job: &mut Job, root: &Path, ok: &[usize]) {
+        if let JobKind::Mirror { set, source } = job.kind.clone() {
+            let g = self.gens().remove(&job.id);
+            self.settle_mirror(job, &set, &source, root, g, ok);
             return;
         }
         let JobKind::Set { set } = &job.kind else {
@@ -432,6 +527,93 @@ impl Public<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Settles a Mirror job. A repo mirror whose files all landed is committed; in every
+    /// other state the generation only keeps what verified. The generation is dropped either way.
+    fn settle_mirror(
+        &self,
+        job: &mut Job,
+        set: &str,
+        source: &str,
+        root: &Path,
+        g: Option<Gen>,
+        ok: &[usize],
+    ) {
+        let id = format!("{set}/{source}");
+        if job.state == JobState::Done && self.mirror_source(set, source).is_none() {
+            job.state = JobState::Canceled;
+            return;
+        }
+        if let Some(mut g) = g {
+            if job.state == JobState::Done && g.ready() {
+                if let Err(e) = self.commit_repo(set, source, root, &mut g) {
+                    let msg = trunc(&format!("{e:#}"), 600);
+                    job.state = JobState::Failed;
+                    job.error = Some(msg);
+                }
+            } else if let Err(e) = g.land(ok) {
+                tracing::warn!("{id}: done ledger: {e:#}");
+            }
+        }
+        if job.state == JobState::Failed {
+            self.record(&id, "failed", "", job.error.as_deref().unwrap_or_default());
+        }
+    }
+
+    /// Swaps a finished generation in and records it: `MIRRORS.toml`, the status line and the
+    /// archive index.
+    fn commit_repo(&self, set: &str, source: &str, root: &Path, g: &mut Gen) -> Result<()> {
+        let set_dir = Self::public_dir(root).join(set);
+        let tree = set_dir.join(source);
+        g.commit()?;
+        // The swap has landed: a failure below must not turn the job into a failed one.
+        if let Err(e) = self.record_repo(set, source, root, &set_dir, &tree) {
+            tracing::warn!("{set}/{source}: committed, bookkeeping failed: {e:#}");
+        }
+        Ok(())
+    }
+
+    fn record_repo(
+        &self,
+        set: &str,
+        source: &str,
+        root: &Path,
+        set_dir: &Path,
+        tree: &Path,
+    ) -> Result<()> {
+        let head = read_header(&live_path(tree))?.context("no live.tsv after the commit")?;
+        let src = self
+            .mirror_source(set, source)
+            .context("the source left the catalog")?;
+        let names: Vec<&str> = self
+            .cat
+            .sets
+            .iter()
+            .filter(|s| s.name == set)
+            .flat_map(|s| &s.sources)
+            .map(|s| s.name.as_str())
+            .collect();
+        let g16 = head.generation[..16].to_string();
+        index::record_mirror(
+            set_dir,
+            &names,
+            index::Mirror {
+                name: source.to_string(),
+                kind: "repo".into(),
+                url: src.url.clone(),
+                updated: head.at.to_string(),
+                bytes: head.bytes,
+                files: Some(head.files),
+                generation: Some(g16.clone()),
+                license: src.license.clone(),
+            },
+        )?;
+        self.record(&format!("{set}/{source}"), "ok", &g16, "");
+        if let Err(e) = index::write(self.cat, &root.join("preserver")) {
+            tracing::warn!("index: {e:#}");
+        }
+        Ok(())
     }
 
     /// One `info/refs` request: whether the URL speaks smart http, and where it says to go.
@@ -485,12 +667,22 @@ impl Public<'_> {
             if src.kind().in_place() {
                 writeln!(
                     w,
-                    "   {:<22} {} mirror {} (estimate {:.2} GB, phase 3)",
-                    src.name,
-                    src.kind().as_str(),
-                    src.url,
-                    src.est
+                    "   {:<22} repo mirror {} (estimate {:.2} GB)",
+                    src.name, src.url, src.est
                 )?;
+                let tree = root.map(|r| Self::public_dir(r).join(&set.name).join(&src.name));
+                let ctx = Ctx {
+                    dl: self.resolver.dl,
+                    keys: self.verifier.keys,
+                    metalink: self.metalink,
+                    plain_http: self.resolver.plain_http,
+                    tree: tree.as_deref().filter(|t| t.is_dir()),
+                };
+                let cache = self.paths.mirrors.with_file_name("repo-meta");
+                let cache = cache.join(&set.name).join(&src.name);
+                if let Err(e) = mirror::dry_run(&ctx, &self.walkers, src, &cache, w) {
+                    writeln!(w, "   {:<22} FAILED: {e:#}", src.name)?;
+                }
                 continue;
             }
             let items = match self.resolver.resolve(src) {
@@ -590,6 +782,9 @@ fn public<'a>(cat: &'a Catalog, paths: &'a Paths, cfg: &Config, dl: &'a Download
         reserve_percent: cfg.reserve_percent,
         free: &platform::disk_free,
         staged: Mutex::new(HashMap::new()),
+        gens: Mutex::new(HashMap::new()),
+        walkers: WALKERS,
+        metalink: mirror::FEDORA_METALINK,
     }
 }
 
@@ -598,8 +793,8 @@ fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
     Worker {
         store,
         dl,
-        plan: &|job, root, _| p.plan(job, root),
-        settle: &|job, root, _| p.settle(job, root),
+        plan: &|job, root, ok| p.plan(job, root, ok),
+        settle: &|job, root, ok| p.settle(job, root, ok),
         drive: &platform::locate,
     }
     .run(pass)
@@ -675,10 +870,11 @@ pub(crate) fn list_report(paths: &mut Paths, cfg: &Config) -> Result<String> {
         Ok(()) => (String::new(), Some(paths.mnt.clone())),
         Err(e) => (format!("note: {e:#}, so sizes are estimates only\n"), None),
     };
-    Ok(note + &list_text(&cat, root.as_deref())?)
+    let st = status::Status::read(&paths.status_file("public"));
+    Ok(note + &list_text(&cat, root.as_deref(), &st)?)
 }
 
-fn list_text(cat: &Catalog, root: Option<&Path>) -> Result<String> {
+fn list_text(cat: &Catalog, root: Option<&Path>, st: &status::Status) -> Result<String> {
     use std::fmt::Write as _;
     let mut out = String::new();
     for set in cat.select(&[], false)? {
@@ -718,6 +914,33 @@ fn list_text(cat: &Catalog, root: Option<&Path>) -> Result<String> {
                 v.name,
                 set.estimate_of(&v),
                 bytes.map_or_else(|| "-".to_string(), gb)
+            );
+        }
+        let mirrors = dir.as_deref().map(index::read_mirrors);
+        for src in set.sources.iter().filter(|s| s.on() && s.kind().in_place()) {
+            let line = st
+                .sets
+                .iter()
+                .find(|x| x["name"] == format!("{}/{}", set.name, src.name));
+            let field = |k: &str| line.and_then(|x| x[k].as_str()).unwrap_or("-");
+            let size = match (src.kind(), &dir) {
+                (Kind::Git, _) => mirrors
+                    .as_ref()
+                    .and_then(|m| m.mirror.iter().find(|m| m.name == src.name))
+                    .map(|m| m.bytes),
+                (_, Some(d)) => read_header(&live_path(&d.join(&src.name)))
+                    .ok()
+                    .flatten()
+                    .map(|h| h.bytes),
+                _ => None,
+            };
+            let _ = writeln!(
+                out,
+                "    {:<14} mirror {}  gen {}  {}",
+                src.name,
+                field("state"),
+                field("version"),
+                size.map_or_else(|| "-".to_string(), gb)
             );
         }
     }

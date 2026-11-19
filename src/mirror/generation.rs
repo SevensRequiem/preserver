@@ -85,8 +85,12 @@ pub(crate) fn live_path(tree: &Path) -> PathBuf {
     book(tree).join("live.tsv")
 }
 
+pub(crate) fn staging_root(tree: &Path) -> PathBuf {
+    book(tree).join("staging")
+}
+
 pub(crate) fn stage_dir(tree: &Path, generation: &str) -> PathBuf {
-    book(tree).join("staging").join(&generation[..16])
+    staging_root(tree).join(&generation[..16])
 }
 
 /// The first line of `live.tsv` and of a staged one.
@@ -822,7 +826,7 @@ pub(crate) fn fs_limits<'e>(
 const BATCH_FILES: usize = 2048;
 const BATCH_BYTES: u64 = 4 << 30;
 
-fn done_path(tree: &Path) -> PathBuf {
+pub(crate) fn done_path(tree: &Path) -> PathBuf {
     book(tree).join("done.tsv")
 }
 
@@ -908,7 +912,7 @@ pub(crate) struct Gen {
 
 /// The anchor is consistent before anything is written: swap paths valid and disjoint, every
 /// document and metadata file under one of them, each swap path keyed by a document.
-fn check_anchor(a: &Anchor) -> Result<()> {
+pub(crate) fn check_anchor(a: &Anchor) -> Result<()> {
     if a.swaps.is_empty() {
         bail!("anchor: no swap paths");
     }
@@ -957,7 +961,7 @@ fn check_anchor(a: &Anchor) -> Result<()> {
 }
 
 /// The generation is named by its anchor documents, path and bytes.
-fn gen_of(a: &Anchor) -> String {
+pub(crate) fn gen_of(a: &Anchor) -> String {
     let mut h = Sha256::new();
     for (p, b) in &a.docs {
         h.update((p.len() as u64).to_le_bytes());

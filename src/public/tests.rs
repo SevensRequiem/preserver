@@ -1,6 +1,7 @@
 use super::versioned::{read_set_file, version_dirs};
 use super::*;
 use crate::catalog::{Kind, Resolve};
+use crate::mirror::Anchor;
 use crate::net::testserver::Server;
 use crate::platform::DriveAt;
 use crate::resolve::hex;
@@ -8,6 +9,7 @@ use crate::resolve::tests::{downloader, serve};
 use crate::testutil::{TempDir, paths};
 use crate::verify::testkey::TestKey;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 struct Env {
@@ -18,6 +20,7 @@ struct Env {
     store: Store,
     key: TestKey,
     notes: Mutex<Vec<String>>,
+    walkers: Walkers,
 }
 
 const GB: u64 = 1_000_000_000;
@@ -34,6 +37,7 @@ impl Env {
             dl: downloader(),
             key: TestKey::new(),
             notes: Mutex::new(Vec::new()),
+            walkers: WALKERS,
         }
     }
 
@@ -68,6 +72,9 @@ impl Env {
             reserve_percent: 10,
             free: &free,
             staged: Mutex::new(HashMap::new()),
+            gens: Mutex::new(HashMap::new()),
+            walkers: self.walkers,
+            metalink: "",
         })
     }
 
@@ -76,8 +83,8 @@ impl Env {
             Worker {
                 store: &self.store,
                 dl: &self.dl,
-                plan: &|job, root, _| p.plan(job, root),
-                settle: &|job, root, _| p.settle(job, root),
+                plan: &|job, root, ok| p.plan(job, root, ok),
+                settle: &|job, root, ok| p.settle(job, root, ok),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
             }
             .run(Pass::FRESH)
@@ -93,8 +100,8 @@ impl Env {
             Worker {
                 store: &self.store,
                 dl: &self.dl,
-                plan: &|job, root, _| p.plan(job, root),
-                settle: &|job, root, _| p.settle(job, root),
+                plan: &|job, root, ok| p.plan(job, root, ok),
+                settle: &|job, root, ok| p.settle(job, root, ok),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
             }
             .run(Pass::FRESH)
@@ -486,8 +493,11 @@ fn sets_without_work_are_skipped() {
     env.sync(&catalog(2, vec![off, git]));
     let st = status::Status::read(&env.paths.status_file("public"));
     let row = st.sets.iter().find(|s| s["name"] == "demo/repo").unwrap();
-    assert_eq!(row["state"].as_str(), Some("skipped"));
-    assert_eq!(row["detail"].as_str(), Some("arrives later in phase 3"));
+    assert_eq!(row["state"].as_str(), Some("failed"));
+    assert!(
+        row["detail"].as_str().unwrap().contains("needs a format"),
+        "{row}"
+    );
     assert!(env.srv.hits().is_empty());
 }
 
@@ -778,7 +788,7 @@ fn a_symlink_on_the_drive_is_refused_and_nothing_behind_it_is_touched() {
 fn list_measures_the_newest_version_per_variant() {
     let tmp = TempDir::new();
     let cat = Catalog::embedded().unwrap();
-    let text = list_text(&cat, None).unwrap();
+    let text = list_text(&cat, None, &status::Status::default()).unwrap();
     assert!(
         text.find("keys").unwrap() < text.find("extras").unwrap(),
         "{text}"
@@ -791,7 +801,7 @@ fn list_measures_the_newest_version_per_variant() {
     let v = Public::public_dir(tmp.path()).join("isos/2026-11-01");
     std::fs::create_dir_all(&v).unwrap();
     std::fs::write(v.join("SET.toml"), "").unwrap();
-    let text = list_text(&cat, Some(tmp.path())).unwrap();
+    let text = list_text(&cat, Some(tmp.path()), &status::Status::default()).unwrap();
     let isos = text
         .lines()
         .skip_while(|l| !l.starts_with("isos"))
@@ -875,18 +885,10 @@ fn the_set_budget_leaves_out_in_place_estimates() {
 }
 
 #[test]
-fn an_enabled_repo_mirror_is_skipped_for_now_and_an_orphan_is_canceled() {
+fn an_orphan_mirror_job_is_canceled() {
     let env = Env::new();
     let drive: DriveId = "0123-ABCD".parse().unwrap();
     let cat = catalog(2, vec![mirror("g", Kind::Repo, 1.0)]);
-    let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
-    env.work_queue(&cat);
-    assert_eq!(env.store.job(&ids[0].1).unwrap().state, JobState::Done);
-    let st = status::Status::read(&env.paths.status_file("public"));
-    assert_eq!(st.sets[0]["name"].as_str(), Some("demo/g"));
-    assert_eq!(st.sets[0]["state"].as_str(), Some("skipped"));
-
-    env.store.remove(&ids[0].1).unwrap();
     let ids = enqueue_all(&env.store, &[&cat.sets[0]], &drive, true, &|_| false).unwrap();
     env.work_queue(&catalog(2, Vec::new()));
     assert_eq!(env.store.job(&ids[0].1).unwrap().state, JobState::Canceled);
@@ -1045,4 +1047,261 @@ fn a_mirror_job_publishes_a_git_repo() {
     let st = status::Status::read(&env.paths.status_file("public"));
     let row = st.sets.iter().find(|s| s["name"] == "demo/g").unwrap();
     assert_eq!(row["state"].as_str(), Some("failed"));
+}
+
+const REL: &str = "dists/s/Release";
+const LIST: &str = "dists/s/list";
+const EXTRA: &str = "dists/s/extra";
+
+/// A synthetic upstream. The Release is the anchor and names `list` and `extra` by hash and
+/// size; `list` names the payload; the walk reads `list` only.
+fn synth_anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    use crate::mirror::{Check, Entry, Meta};
+    let doc = ctx
+        .dl
+        .get(&mirror::generation::url_of(&src.url, REL), 4096)?;
+    let mut meta = Vec::new();
+    for l in std::str::from_utf8(&doc)?.lines() {
+        let f: Vec<&str> = l.split(' ').collect();
+        let [name, h, size] = f[..] else {
+            bail!("bad release line")
+        };
+        let check: Check = format!("sha256:{h}").parse().map_err(anyhow::Error::msg)?;
+        meta.push(Meta {
+            entry: Entry {
+                path: format!("dists/s/{name}"),
+                size: size.parse()?,
+                check,
+            },
+            from: None,
+        });
+    }
+    Ok(Anchor {
+        docs: vec![(REL.into(), doc)],
+        meta,
+        swaps: vec!["dists/s".into()],
+        ts: None,
+    })
+}
+
+fn synth_walk(
+    _: &Source,
+    _: &Anchor,
+    meta: &Path,
+    emit: &mut dyn FnMut(mirror::generation::Walked),
+) -> Result<()> {
+    use crate::mirror::{Entry, rel_path};
+    for l in std::fs::read_to_string(rel_path(meta, LIST))?.lines() {
+        let f: Vec<&str> = l.split(' ').collect();
+        let [h, size, path] = f[..] else {
+            bail!("bad list line")
+        };
+        emit(mirror::generation::Walked::File(Entry {
+            path: path.into(),
+            size: size.parse()?,
+            check: format!("sha256:{h}").parse().map_err(anyhow::Error::msg)?,
+        }));
+    }
+    Ok(())
+}
+
+fn synth_walk_meta<'a>(_: &Source, a: &'a Anchor) -> Vec<&'a mirror::Entry> {
+    a.meta
+        .iter()
+        .map(|m| &m.entry)
+        .filter(|e| e.path == LIST)
+        .collect()
+}
+
+const SYNTH: Walkers = Walkers {
+    anchor: synth_anchor,
+    walk: synth_walk,
+    walk_meta: synth_walk_meta,
+};
+
+fn sha_hex(b: &[u8]) -> String {
+    hex(&Sha256::digest(b))
+}
+
+/// Serves a repo under `repo/` with the given payload, and returns its source.
+fn publish_repo(env: &Env, payload: &[(&str, &[u8])]) -> Source {
+    let mut list = String::new();
+    for (p, b) in payload {
+        let _ = writeln!(list, "{} {} {p}", sha_hex(b), b.len());
+    }
+    let extra = b"not read by the walk".to_vec();
+    let release = format!(
+        "list {} {}\nextra {} {}\n",
+        sha_hex(list.as_bytes()),
+        list.len(),
+        sha_hex(&extra),
+        extra.len()
+    );
+    let mut routes = vec![
+        (format!("repo/{REL}"), release.into_bytes()),
+        (format!("repo/{LIST}"), list.into_bytes()),
+        (format!("repo/{EXTRA}"), extra),
+    ];
+    routes.extend(
+        payload
+            .iter()
+            .map(|(p, b)| (format!("repo/{p}"), b.to_vec())),
+    );
+    env.srv
+        .set(|b| b.routes = Some(routes.into_iter().collect()));
+    Source {
+        name: "r".into(),
+        kind: Some(Kind::Repo),
+        format: Some(crate::catalog::RepoFormat::Alpine),
+        url: env.srv.url("repo"),
+        license: "MIT".into(),
+        est: 0.001,
+        ..Source::default()
+    }
+}
+
+fn paths_hit(env: &Env) -> Vec<String> {
+    env.srv.hits().into_iter().map(|h| h.path).collect()
+}
+
+fn mirror_row(env: &Env, name: &str) -> Option<serde_json::Value> {
+    let st = status::Status::read(&env.paths.status_file("public"));
+    st.sets.into_iter().find(|s| s["name"] == name)
+}
+
+#[test]
+fn a_synthetic_repo_mirror_runs_end_to_end() {
+    let mut env = Env::new();
+    env.walkers = SYNTH;
+    let src = publish_repo(&env, &[("pool/a", b"aaa"), ("pool/b/c", b"bc")]);
+    let cat = catalog(2, vec![src]);
+
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    let tree = env.set_dir().join("r");
+    assert_eq!(std::fs::read(tree.join("pool/b/c")).unwrap(), b"bc");
+    assert!(tree.join(REL).is_file() && tree.join(LIST).is_file() && tree.join(EXTRA).is_file());
+    let head = read_header(&live_path(&tree)).unwrap().unwrap();
+    assert_eq!((head.files, head.bytes), (2, 5));
+    let row = mirror_row(&env, "demo/r").unwrap();
+    assert_eq!(row["state"].as_str(), Some("ok"));
+    assert_eq!(row["version"].as_str(), Some(&head.generation[..16]));
+    let rows = std::fs::read_to_string(env.set_dir().join("MIRRORS.toml")).unwrap();
+    assert!(
+        rows.contains("kind = \"repo\"") && rows.contains("files = 2"),
+        "{rows}"
+    );
+    let html = std::fs::read_to_string(env.paths.mnt.join("preserver/INDEX.html")).unwrap();
+    assert!(html.contains("href=\"public/demo/r/\""), "{html}");
+
+    env.srv.clear_log();
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(paths_hit(&env), ["repo/dists/s/Release"]);
+}
+
+#[test]
+fn a_failed_repo_mirror_is_recorded_and_drops_its_generation() {
+    let mut env = Env::new();
+    env.walkers = SYNTH;
+    let src = publish_repo(&env, &[("pool/a", b"aaa")]);
+    env.srv.set(|b| {
+        b.routes
+            .as_mut()
+            .unwrap()
+            .insert("repo/pool/a".into(), b"evil".to_vec());
+    });
+    let cat = catalog(2, vec![src]);
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(
+        mirror_row(&env, "demo/r").unwrap()["state"].as_str(),
+        Some("failed")
+    );
+    assert!(!env.set_dir().join("r").join(REL).exists());
+    env.with(&cat, (GB, GB), |p| assert!(p.gens().is_empty()));
+}
+
+#[test]
+fn the_dry_run_fetches_only_what_the_walk_reads() {
+    let mut env = Env::new();
+    env.walkers = SYNTH;
+    let src = publish_repo(&env, &[("pool/a", b"aaa"), ("pool/b/c", b"bc")]);
+    let cat = catalog(2, vec![src]);
+    std::fs::create_dir_all(&env.paths.mnt).unwrap();
+    let mut out = Vec::new();
+    env.with(&cat, (900 * GB, 1000 * GB), |p| {
+        p.dry_run(&cat.sets[0], Some(&env.paths.mnt), &mut out)
+            .unwrap();
+    });
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("2 files, 5 bytes"), "{text}");
+    assert_eq!(
+        paths_hit(&env),
+        ["repo/dists/s/Release", "repo/dists/s/list"]
+    );
+    assert_eq!(files(&env.paths.mnt), Vec::<String>::new());
+    assert_eq!(
+        files(&env.paths.mirrors.with_file_name("repo-meta")),
+        Vec::<String>::new()
+    );
+}
+
+fn row_of(text: &str, n: &str) -> String {
+    text.lines()
+        .find(|l| l.trim_start().starts_with(n))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn list_shows_repo_and_git_rows() {
+    use crate::mirror::generation::{Header, write_tsv};
+    let tmp = TempDir::new();
+    let cat = catalog(
+        2,
+        vec![mirror("r", Kind::Repo, 1.0), mirror("g", Kind::Git, 1.0)],
+    );
+    let dir = Public::public_dir(tmp.path()).join("demo");
+    let tree = dir.join("r");
+    std::fs::create_dir_all(live_path(&tree).parent().unwrap()).unwrap();
+    write_tsv(
+        &live_path(&tree),
+        Some(&Header {
+            generation: "ab".repeat(32),
+            files: 3,
+            bytes: 3_000_000_000,
+            at: Timestamp::now(),
+            anchor_ts: None,
+        }),
+        &[],
+    )
+    .unwrap();
+    index::record_mirror(
+        &dir,
+        &["r", "g"],
+        index::Mirror {
+            name: "g".into(),
+            kind: "git".into(),
+            bytes: 2_000_000_000,
+            ..index::Mirror::default()
+        },
+    )
+    .unwrap();
+    let mut st = status::Status::default();
+    st.sets
+        .push(serde_json::json!({"name": "demo/r", "state": "ok", "version": "abababababababab"}));
+    st.sets
+        .push(serde_json::json!({"name": "demo/g", "state": "ok", "version": "1234567"}));
+    let text = list_text(&cat, Some(tmp.path()), &st).unwrap();
+    assert!(
+        row_of(&text, "r ").contains("mirror ok  gen abababababababab  3.00 GB"),
+        "{text}"
+    );
+    assert!(
+        row_of(&text, "g ").contains("mirror ok  gen 1234567  2.00 GB"),
+        "{text}"
+    );
+    let text = list_text(&cat, None, &status::Status::default()).unwrap();
+    assert!(row_of(&text, "r ").contains("mirror -  gen -  -"), "{text}");
 }

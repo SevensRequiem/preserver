@@ -3,10 +3,16 @@
 
 pub(crate) mod generation;
 
+use crate::catalog::{RepoFormat, Source};
 use crate::keys::Keyring;
 use crate::net::download::Downloader;
 use crate::resolve::hex;
+use anyhow::{Context, Result, bail};
+use generation::{Walked, live_path, read_tsv, url_of};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -106,6 +112,126 @@ pub(crate) fn rel_path(base: &Path, rel: &str) -> PathBuf {
     let mut p = base.to_path_buf();
     p.extend(rel.split('/'));
     p
+}
+
+/// The Fedora metalink service, which production passes in `Ctx`.
+pub(crate) const FEDORA_METALINK: &str = "https://mirrors.fedoraproject.org/metalink";
+
+type WalkFn = fn(&Source, &Anchor, &Path, &mut dyn FnMut(Walked)) -> Result<()>;
+
+/// The three steps a format provides, so a test can stand in for a real upstream.
+#[derive(Clone, Copy)]
+pub(crate) struct Walkers {
+    pub anchor: fn(&Ctx<'_>, &Source) -> Result<Anchor>,
+    pub walk: WalkFn,
+    /// The metadata files `walk` reads, which is all a dry run fetches.
+    pub walk_meta: for<'a> fn(&Source, &'a Anchor) -> Vec<&'a Entry>,
+}
+
+pub(crate) const WALKERS: Walkers = Walkers {
+    anchor,
+    walk,
+    walk_meta,
+};
+
+fn no_walker(src: &Source) -> Result<()> {
+    match src.format {
+        Some(f @ (RepoFormat::Fedora | RepoFormat::Debian | RepoFormat::Alpine)) => {
+            bail!("{f:?} mirrors have no walker yet")
+        }
+        None => bail!("a repo source needs a format"),
+    }
+}
+
+fn anchor(_: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    no_walker(src).map(|()| Anchor::default())
+}
+
+fn walk(src: &Source, _: &Anchor, _: &Path, _: &mut dyn FnMut(Walked)) -> Result<()> {
+    no_walker(src)
+}
+
+fn walk_meta<'a>(_: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
+    a.meta.iter().map(|m| &m.entry).collect()
+}
+
+/// Prints what a run of `src` would fetch. Only the metadata `walk_meta` names is downloaded,
+/// into `cache`, and the cache is deleted afterwards. `tree` is the live tree when the drive
+/// is mounted: what it already holds is left out of the payload to fetch.
+pub(crate) fn dry_run(
+    ctx: &Ctx<'_>,
+    w: &Walkers,
+    src: &Source,
+    cache: &Path,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let anchor = (w.anchor)(ctx, src)?;
+    generation::check_anchor(&anchor)?;
+    let dir = cache.join(&generation::gen_of(&anchor)[..16]);
+    let res = dry_walk(ctx, w, src, &anchor, &dir, out);
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
+fn dry_walk(
+    ctx: &Ctx<'_>,
+    w: &Walkers,
+    src: &Source,
+    anchor: &Anchor,
+    dir: &Path,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let put = |rel: &str, bytes: &[u8]| -> Result<()> {
+        let dest = rel_path(dir, rel);
+        std::fs::create_dir_all(dest.parent().context("a file at the root")?)?;
+        std::fs::write(&dest, bytes).with_context(|| dest.display().to_string())
+    };
+    for (p, bytes) in &anchor.docs {
+        put(p, bytes)?;
+    }
+    for e in (w.walk_meta)(src, anchor) {
+        let from = anchor
+            .meta
+            .iter()
+            .find(|m| m.entry == *e)
+            .and_then(|m| m.from.as_deref())
+            .unwrap_or(&e.path);
+        let body = ctx.dl.get(&url_of(&src.url, from), e.size)?;
+        let Check::Sha256(want) = e.check;
+        if body.len() as u64 != e.size || <[u8; 32]>::from(Sha256::digest(&body)) != want {
+            bail!("{}: does not match the anchor", e.path);
+        }
+        put(&e.path, &body)?;
+    }
+    let mut files = Vec::new();
+    (w.walk)(src, anchor, dir, &mut |f| {
+        if let Walked::File(e) = f {
+            files.push(e);
+        }
+    })?;
+    let total: u64 = files.iter().map(|e| e.size).sum();
+    write!(
+        out,
+        "   {:<22} {} files, {} bytes",
+        src.name,
+        files.len(),
+        total
+    )?;
+    if let Some(tree) = ctx.tree {
+        let mut held = HashSet::new();
+        for path in [live_path(tree), generation::done_path(tree)] {
+            if let Ok(t) = read_tsv(&path) {
+                held.extend(t.entries);
+            }
+        }
+        let (n, bytes) = files
+            .iter()
+            .filter(|e| !held.contains(*e))
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.size));
+        write!(out, "; {n} files, {bytes} bytes to fetch")?;
+    }
+    writeln!(out)?;
+    Ok(())
 }
 
 #[cfg(test)]

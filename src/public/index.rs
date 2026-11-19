@@ -51,7 +51,7 @@ pub(crate) struct Mirrors {
     pub mirror: Vec<Mirror>,
 }
 
-fn read_mirrors(dir: &Path) -> Mirrors {
+pub(super) fn read_mirrors(dir: &Path) -> Mirrors {
     read_meta(&dir.join("MIRRORS.toml"))
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
