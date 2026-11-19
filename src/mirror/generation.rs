@@ -100,27 +100,28 @@ pub(crate) struct Header {
     pub files: u64,
     pub bytes: u64,
     pub at: jiff::Timestamp,
-    /// The metalink's `mm0:timestamp` at the commit (Fedora rollback rule).
-    pub anchor_ts: Option<u64>,
+    /// Each anchor document's path with its metalink's `mm0:timestamp` at the commit (Fedora
+    /// rollback rule), in the order `gen_of` hashed them.
+    pub anchor_ts: Vec<(String, u64)>,
 }
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{MAGIC}\t1\t{}\t{}\t{}\t{}\t",
+            "{MAGIC}\t1\t{}\t{}\t{}\t{}",
             self.generation, self.files, self.bytes, self.at
         )?;
-        match self.anchor_ts {
-            Some(t) => write!(f, "{t}"),
-            None => f.write_str("-"),
+        for (p, t) in &self.anchor_ts {
+            write!(f, "\t{t}:{p}")?;
         }
+        Ok(())
     }
 }
 
 fn parse_header(line: &str) -> Result<Header> {
     let f: Vec<&str> = line.split('\t').collect();
-    let [MAGIC, "1", generation, files, bytes, at, ts] = f[..] else {
+    let [MAGIC, "1", generation, files, bytes, at, ts @ ..] = &f[..] else {
         bail!("not a preserver-mirror version 1 header");
     };
     if !is_gen(generation) {
@@ -131,10 +132,16 @@ fn parse_header(line: &str) -> Result<Header> {
         files: files.parse().context("file count")?,
         bytes: bytes.parse().context("byte count")?,
         at: at.parse().context("time")?,
-        anchor_ts: match ts {
-            "-" => None,
-            t => Some(t.parse().context("anchor timestamp")?),
-        },
+        anchor_ts: ts
+            .iter()
+            .map(|f| {
+                let (t, p) = f.split_once(':').context("anchor timestamp")?;
+                if !valid_path(p) {
+                    bail!("invalid anchor path {p:?}");
+                }
+                Ok((p.to_string(), t.parse().context("anchor timestamp")?))
+            })
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -1288,7 +1295,7 @@ impl Gen {
             files: files.len() as u64,
             bytes: files.iter().map(|e| e.size).sum(),
             at: jiff::Timestamp::now(),
-            anchor_ts: self.anchor.ts,
+            anchor_ts: self.anchor.ts.clone(),
         };
         write_tsv(&want_path(&self.tree), Some(&header), &files)?;
         self.classify(files)?;
@@ -1581,7 +1588,7 @@ impl Gen {
             files: entries.len() as u64,
             bytes: entries.iter().map(|e| e.size).sum(),
             at: jiff::Timestamp::now(),
-            anchor_ts: self.anchor.ts,
+            anchor_ts: self.anchor.ts.clone(),
         };
         write_tsv(&stage.join("live.tsv"), Some(&header), &entries)?;
         platform::sync_fs(&self.tree).with_context(|| self.tree.display().to_string())?;
@@ -1639,7 +1646,7 @@ mod tests {
             files: n,
             bytes: 0,
             at: jiff::Timestamp::UNIX_EPOCH,
-            anchor_ts: None,
+            anchor_ts: Vec::new(),
         }
     }
 
@@ -2003,7 +2010,7 @@ mod tests {
         let p = tmp.path().join("live.tsv");
         let es = [entry("a/b", b"1"), entry("a.b", b"22")];
         let mut h = header(NEW, 2);
-        h.anchor_ts = Some(1_700_000_000);
+        h.anchor_ts = vec![("a/b".into(), 1_700_000_000)];
         write_tsv(&p, Some(&h), &es).unwrap();
         let t = read_tsv(&p).unwrap();
         assert_eq!((t.header.as_ref(), &t.entries[..]), (Some(&h), &es[..]));
@@ -2119,7 +2126,7 @@ mod tests {
                     from: None,
                 }],
                 swaps: vec!["dists/s".into()],
-                ts: Some(7),
+                ts: vec![("dists/s/Release".into(), 7)],
             }
         }
 
@@ -2237,7 +2244,7 @@ mod tests {
         let h = live.header.unwrap();
         assert_eq!(
             (h.generation, h.files, h.bytes, h.anchor_ts),
-            (generation, 2, 5, Some(7))
+            (generation, 2, 5, vec![("dists/s/Release".to_string(), 7)])
         );
         assert_eq!(
             live.entries,

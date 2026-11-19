@@ -1,13 +1,6 @@
 //! In-place repository mirrors: a tree on the drive that a package manager reads, kept whole
 //! by swapping its metadata in only after every file it names has landed and verified.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Fedora walker that uses these arrives with the next step"
-    )
-)]
 pub(crate) mod fedora;
 pub(crate) mod generation;
 
@@ -100,8 +93,9 @@ pub(crate) struct Anchor {
     pub docs: Vec<(String, Vec<u8>)>,
     pub meta: Vec<Meta>,
     pub swaps: Vec<String>,
-    /// The metalink's `mm0:timestamp` (Fedora), kept in the `live.tsv` header at the commit.
-    pub ts: Option<u64>,
+    /// Per document path, its metalink's `mm0:timestamp` (Fedora), kept in the `live.tsv`
+    /// header at the commit.
+    pub ts: Vec<(String, u64)>,
 }
 
 /// What a walker may use to fetch and verify its anchor.
@@ -142,25 +136,32 @@ pub(crate) const WALKERS: Walkers = Walkers {
     walk_meta,
 };
 
-fn no_walker(src: &Source) -> Result<()> {
+fn no_walker(src: &Source) -> anyhow::Error {
     match src.format {
-        Some(f @ (RepoFormat::Fedora | RepoFormat::Debian | RepoFormat::Alpine)) => {
-            bail!("{f:?} mirrors have no walker yet")
-        }
-        None => bail!("a repo source needs a format"),
+        Some(f) => anyhow::anyhow!("{f:?} mirrors have no walker yet"),
+        None => anyhow::anyhow!("a repo source needs a format"),
     }
 }
 
-fn anchor(_: &Ctx<'_>, src: &Source) -> Result<Anchor> {
-    no_walker(src).map(|()| Anchor::default())
+fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    match src.format {
+        Some(RepoFormat::Fedora) => fedora::anchor(ctx, src),
+        _ => Err(no_walker(src)),
+    }
 }
 
-fn walk(src: &Source, _: &Anchor, _: &Path, _: &mut dyn FnMut(Walked)) -> Result<()> {
-    no_walker(src)
+fn walk(src: &Source, a: &Anchor, meta: &Path, emit: &mut dyn FnMut(Walked)) -> Result<()> {
+    match src.format {
+        Some(RepoFormat::Fedora) => fedora::walk(src, a, meta, emit),
+        _ => Err(no_walker(src)),
+    }
 }
 
-fn walk_meta<'a>(_: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
-    a.meta.iter().map(|m| &m.entry).collect()
+fn walk_meta<'a>(src: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
+    match src.format {
+        Some(RepoFormat::Fedora) => fedora::walk_meta(src, a),
+        _ => a.meta.iter().map(|m| &m.entry).collect(),
+    }
 }
 
 /// Prints what a run of `src` would fetch. Only the metadata `walk_meta` names is downloaded,

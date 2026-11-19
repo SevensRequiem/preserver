@@ -683,10 +683,6 @@ impl Downloader {
 
     /// Like `get` but one request that refuses any redirect: for a document whose host must not
     /// be able to send us elsewhere (the Fedora metalink).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Fedora walker uses it, a later step")
-    )]
     pub(crate) fn get_direct(&self, url: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
         let resp = self
             .agent

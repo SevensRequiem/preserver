@@ -1,15 +1,22 @@
 //! Fedora repodata: the metalink that anchors a tree over TLS, the repomd it vouches for and
 //! the primary listing of packages. The parsers read nothing from disk or the network.
 
-use super::generation::valid_path;
-use super::{Check, Entry};
+use super::generation::{Walked, gen_of, live_path, read_header, url_of, valid_path};
+use super::{Anchor, Check, Ctx, Entry, Meta, rel_path};
+use crate::catalog::Source;
+use crate::platform;
+use crate::public::versioned::read_meta;
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
+use ruzstd::decoding::StreamingDecoder;
 use sha2::{Digest, Sha256, Sha512};
-use std::io::BufRead;
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::Path;
 
 const MAX_DEPTH: usize = 32;
+const METALINK_CAP: u64 = 8 << 20;
+const REPOMD_CAP: u64 = 16 << 20;
 /// Longer text is cut: a field this parser reads is a number, a hash or a name, and a cut one
 /// no longer parses.
 const MAX_TEXT: usize = 64 * 1024;
@@ -401,6 +408,149 @@ pub(crate) fn accept(
         );
     }
     Ok(new)
+}
+
+fn repomd_path(tree: &str) -> String {
+    format!("{tree}/repodata/repomd.xml")
+}
+
+/// The live generation's anchor documents (path, bytes, metalink timestamp) as committed, so a
+/// catalog that gained or lost a tree since still reads them. Their hash is checked against
+/// the one the generation was named by (`gen_of`): a file that changed since is an error.
+fn live_docs(tree: Option<&Path>) -> Result<Vec<(String, Vec<u8>, u64)>> {
+    let Some(tree) = tree else {
+        return Ok(Vec::new());
+    };
+    let Some(head) = read_header(&live_path(tree))? else {
+        return Ok(Vec::new());
+    };
+    let mut pinned = Anchor::default();
+    let mut out = Vec::new();
+    for (p, ts) in head.anchor_ts {
+        let bytes = read_meta(&rel_path(tree, &p)).with_context(|| format!("live {p}"))?;
+        pinned.docs.push((p.clone(), bytes.clone()));
+        out.push((p, bytes, ts));
+    }
+    if gen_of(&pinned) != head.generation {
+        bail!("the live repomd no longer matches the hash recorded at its commit");
+    }
+    Ok(out)
+}
+
+/// Pins a generation to the metalink of each tree (over TLS, no redirects) and the repomd a
+/// mirror serves for it, which must be one of the documents the metalink lists and newer
+/// than the live one (`accept`). The repodata directories are the swap paths.
+pub(crate) fn anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
+    let live = live_docs(ctx.tree)?;
+    let mut a = Anchor::default();
+    for t in &src.trees {
+        let url = format!("{}?{}", ctx.metalink, t.metalink);
+        let ml = parse_metalink(&ctx.dl.get_direct(&url, METALINK_CAP)?)
+            .with_context(|| format!("metalink for {}", t.path))?;
+        let path = repomd_path(&t.path);
+        let cap = ml
+            .docs
+            .iter()
+            .map(|d| d.size)
+            .max()
+            .unwrap_or(0)
+            .min(REPOMD_CAP);
+        let bytes = ctx.dl.get(&url_of(&src.url, &path), cap)?;
+        let (live_bytes, last_ts) = live
+            .iter()
+            .find(|(p, ..)| *p == path)
+            .map_or((None, None), |(_, b, ts)| (Some(b.as_slice()), Some(*ts)));
+        let live_repomd = live_bytes.map(parse_repomd).transpose()?;
+        // The same repomd again is no rollback: the run only completes or repairs it.
+        let against = if live_bytes == Some(&bytes[..]) {
+            None
+        } else {
+            live_repomd.as_ref()
+        };
+        let repomd = accept(&ml, &bytes, against, last_ts)
+            .with_context(|| format!("repomd of {}", t.path))?;
+        repomd.primary()?;
+        for d in repomd.data {
+            a.meta.push(Meta {
+                entry: Entry {
+                    path: format!("{}/{}", t.path, d.path),
+                    size: d.size,
+                    check: d.check,
+                },
+                from: None,
+            });
+        }
+        a.ts.push((path.clone(), ml.ts));
+        a.docs.push((path, bytes));
+        a.swaps.push(format!("{}/repodata", t.path));
+    }
+    Ok(a)
+}
+
+/// The repomd of `tree` from the anchor and its primary's meta path and open size.
+fn primary_of(a: &Anchor, tree: &str) -> Result<(String, u64)> {
+    let want = repomd_path(tree);
+    let (_, doc) = a
+        .docs
+        .iter()
+        .find(|(p, _)| *p == want)
+        .with_context(|| format!("no repomd for {tree}"))?;
+    let repomd = parse_repomd(doc)?;
+    let (d, open) = repomd.primary()?;
+    Ok((format!("{tree}/{}", d.path), open))
+}
+
+/// Hands out at most `left` bytes and fails on more: a primary bigger than its open-size is
+/// a decompression bomb.
+struct Capped<R> {
+    r: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.left = self
+            .left
+            .checked_sub(n as u64)
+            .ok_or_else(|| io::Error::other("primary is larger than its open-size"))?;
+        Ok(n)
+    }
+}
+
+/// Every package of every tree's primary listing, from the staged metadata.
+pub(crate) fn walk(
+    src: &Source,
+    a: &Anchor,
+    meta: &Path,
+    emit: &mut dyn FnMut(Walked),
+) -> Result<()> {
+    for t in &src.trees {
+        let (path, open) = primary_of(a, &t.path)?;
+        let file = platform::open_regular(&rel_path(meta, &path))
+            .with_context(|| format!("staged {path}"))?;
+        let zst = StreamingDecoder::new(BufReader::new(file))
+            .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        let capped = BufReader::new(Capped { r: zst, left: open });
+        parse_primary(capped, &mut |e| {
+            emit(Walked::File(Entry {
+                path: format!("{}/{}", t.path, e.path),
+                ..e
+            }));
+            Ok(())
+        })
+        .with_context(|| path.clone())?;
+    }
+    Ok(())
+}
+
+/// The primary listings, which are all `walk` reads.
+pub(crate) fn walk_meta<'a>(src: &Source, a: &'a Anchor) -> Vec<&'a Entry> {
+    src.trees
+        .iter()
+        .filter_map(|t| primary_of(a, &t.path).ok())
+        .filter_map(|(p, _)| a.meta.iter().map(|m| &m.entry).find(|e| e.path == p))
+        .collect()
 }
 
 #[cfg(test)]
@@ -835,4 +985,394 @@ mod tests {
                }
            }
        }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::super::generation::{self, Next, begin, read_tsv};
+    use super::super::{Check, Entry};
+    use super::*;
+    use crate::catalog::{Kind, RepoFormat, Tree};
+    use crate::net::download::Downloader;
+    use crate::net::testserver::{Behaviour, Server};
+    use crate::resolve::hex;
+    use crate::resolve::tests::downloader;
+    use crate::testutil::TempDir;
+    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    const META: &str = "meta?repo=x";
+
+    struct Site {
+        srv: Server,
+        routes: HashMap<String, Vec<u8>>,
+        src: Source,
+        tmp: TempDir,
+    }
+
+    fn sha(b: &[u8]) -> String {
+        hex(&Sha256::digest(b))
+    }
+
+    impl Site {
+        fn new() -> Self {
+            let srv = Server::start("127.0.0.1", Behaviour::new(Vec::new()));
+            let src = Source {
+                name: "f".into(),
+                kind: Some(Kind::Repo),
+                format: Some(RepoFormat::Fedora),
+                url: srv.url("m"),
+                trees: vec![Tree {
+                    path: "os".into(),
+                    metalink: "repo=x".into(),
+                }],
+                ..Source::default()
+            };
+            Self {
+                srv,
+                routes: HashMap::new(),
+                src,
+                tmp: TempDir::new(),
+            }
+        }
+
+        /// Publishes a repomd of `rev` listing `pkgs`, and returns it.
+        fn repo(&mut self, rev: u64, pkgs: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut xml = String::from("<metadata>");
+            for (n, b) in pkgs {
+                let _ = write!(
+                    xml,
+                    "<package type=\"rpm\"><checksum type=\"sha256\" pkgid=\"YES\">{}</checksum>\
+                     <size package=\"{}\" installed=\"1\" archive=\"1\"/>\
+                     <location href=\"Packages/{n}\"/></package>",
+                    sha(b),
+                    b.len()
+                );
+                self.routes.insert(format!("m/os/Packages/{n}"), b.to_vec());
+            }
+            xml.push_str("</metadata>");
+            let zst = compress_to_vec(xml.as_bytes(), CompressionLevel::Fastest);
+            let fl = format!("filelists {rev}").into_bytes();
+            let (pp, fp) = (
+                format!("repodata/{}-primary.xml.zst", &sha(&zst)[..8]),
+                format!("repodata/{}-filelists.xml.zst", &sha(&fl)[..8]),
+            );
+            let repomd = format!(
+                "<repomd><revision>{rev}</revision>\
+                 <data type=\"primary\"><checksum type=\"sha256\">{}</checksum>\
+                 <location href=\"{pp}\"/><size>{}</size><open-size>{}</open-size></data>\
+                 <data type=\"filelists\"><checksum type=\"sha256\">{}</checksum>\
+                 <location href=\"{fp}\"/><size>{}</size></data></repomd>",
+                sha(&zst),
+                zst.len(),
+                xml.len(),
+                sha(&fl),
+                fl.len()
+            )
+            .into_bytes();
+            self.routes.insert(format!("m/os/{pp}"), zst);
+            self.routes.insert(format!("m/os/{fp}"), fl);
+            repomd
+        }
+
+        /// Serves `served` as the mirror's repomd and a metalink at `ts` listing `cur` and,
+        /// when given, `alt` as an alternate.
+        fn publish(&mut self, ts: u64, cur: &[u8], alt: Option<&[u8]>, served: &[u8]) {
+            let hashes = |b: &[u8]| {
+                format!(
+                    "<size>{}</size><verification><hash type=\"sha256\">{}</hash>\
+                     <hash type=\"sha512\">{}</hash></verification>",
+                    b.len(),
+                    sha(b),
+                    hex(&Sha512::digest(b))
+                )
+            };
+            let alt = alt.map_or(String::new(), |a| {
+                format!(
+                    "<mm0:alternates><mm0:alternate><mm0:timestamp>1</mm0:timestamp>{}\
+                     </mm0:alternate></mm0:alternates>",
+                    hashes(a)
+                )
+            });
+            let ml = format!(
+                "<metalink xmlns=\"http://www.metalinker.org/\" \
+                 xmlns:mm0=\"http://fedorahosted.org/mirrormanager\"><files>\
+                 <file name=\"repomd.xml\"><mm0:timestamp>{ts}</mm0:timestamp>{}{alt}\
+                 </file></files></metalink>",
+                hashes(cur)
+            );
+            self.routes.insert(META.into(), ml.into_bytes());
+            self.routes
+                .insert("m/os/repodata/repomd.xml".into(), served.to_vec());
+            let routes = self.routes.clone();
+            self.srv.set(|b| b.routes = Some(routes));
+        }
+
+        fn tree(&self) -> std::path::PathBuf {
+            self.tmp.path().join("tree")
+        }
+
+        fn ctx<'a>(dl: &'a Downloader, ml: &'a str, tree: &'a Path) -> Ctx<'a> {
+            Ctx {
+                dl,
+                keys: &[],
+                metalink: ml,
+                plain_http: true,
+                tree: tree.is_dir().then_some(tree),
+            }
+        }
+
+        /// One whole run: anchor, stage, fetch, commit.
+        fn run(&self) -> Result<()> {
+            let dl = downloader();
+            let (ml, tree) = (self.srv.url("meta"), self.tree());
+            let a = anchor(&Self::ctx(&dl, &ml, &tree), &self.src)?;
+            let mut g = begin(&tree, &self.src.url, a)?;
+            let (stop, done) = (AtomicBool::new(false), Arc::new(AtomicU64::new(0)));
+            let mut ok = Vec::new();
+            loop {
+                let mut w =
+                    |a: &Anchor, m: &Path, e: &mut dyn FnMut(Walked)| walk(&self.src, a, m, e);
+                match g.next(&ok, &mut w, u64::MAX, "ext4")? {
+                    Next::Batch(p) => {
+                        ok.clear();
+                        for (i, f) in p.fetches.iter().enumerate() {
+                            if dl.fetch(f, &stop, &done).is_ok() {
+                                ok.push(i);
+                            }
+                        }
+                        if ok.len() < p.fetches.len() {
+                            g.land(&ok)?;
+                            bail!("a download failed");
+                        }
+                    }
+                    Next::Ready => return g.commit(),
+                    Next::OverBudget { .. } => bail!("over budget"),
+                }
+            }
+        }
+
+        fn anchor_err(&self) -> String {
+            let dl = downloader();
+            let (ml, tree) = (self.srv.url("meta"), self.tree());
+            let e = anchor(&Self::ctx(&dl, &ml, &tree), &self.src).unwrap_err();
+            format!("{e:#}")
+        }
+
+        fn anchor_docs(&self) -> usize {
+            let dl = downloader();
+            let (ml, tree) = (self.srv.url("meta"), self.tree());
+            anchor(&Self::ctx(&dl, &ml, &tree), &self.src)
+                .unwrap()
+                .docs
+                .len()
+        }
+
+        fn hits(&self) -> Vec<String> {
+            self.srv.hits().into_iter().map(|h| h.path).collect()
+        }
+
+        fn live(&self) -> generation::Tsv {
+            read_tsv(&generation::live_path(&self.tree())).unwrap()
+        }
+    }
+
+    const AB: [(&str, &[u8]); 2] = [("a.rpm", b"aaa"), ("b.rpm", b"bbbb")];
+
+    #[test]
+    fn fresh_mirror() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.publish(100, &r, None, &r);
+        s.run().unwrap();
+        let tree = s.tree();
+        assert_eq!(
+            std::fs::read(tree.join("os/Packages/b.rpm")).unwrap(),
+            b"bbbb"
+        );
+        assert_eq!(
+            std::fs::read(tree.join("os/repodata/repomd.xml")).unwrap(),
+            r
+        );
+        let live = s.live();
+        let h = live.header.unwrap();
+        assert_eq!(
+            (h.files, h.bytes, h.anchor_ts),
+            (2, 7, vec![("os/repodata/repomd.xml".to_string(), 100)])
+        );
+        let want = |p: &str, b: &[u8]| Entry {
+            path: p.into(),
+            size: b.len() as u64,
+            check: Check::Sha256(Sha256::digest(b).into()),
+        };
+        assert_eq!(
+            live.entries,
+            [
+                want("os/Packages/a.rpm", b"aaa"),
+                want("os/Packages/b.rpm", b"bbbb")
+            ]
+        );
+        let repodata = std::fs::read_dir(tree.join("os/repodata")).unwrap().count();
+        assert_eq!(repodata, 3);
+    }
+
+    #[test]
+    fn walk_meta_is_the_primary_only() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.publish(100, &r, None, &r);
+        let (dl, ml, tree) = (downloader(), s.srv.url("meta"), s.tree());
+        let a = anchor(&Site::ctx(&dl, &ml, &tree), &s.src).unwrap();
+        let got = walk_meta(&s.src, &a);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].path.ends_with("-primary.xml.zst"), "{:?}", got[0]);
+        assert_eq!(a.meta.len(), 2);
+        assert_eq!(a.swaps, ["os/repodata"]);
+    }
+
+    #[test]
+    fn a_tampered_rpm_is_never_visible() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.routes
+            .insert("m/os/Packages/a.rpm".into(), b"evil".to_vec());
+        s.publish(100, &r, None, &r);
+        assert!(s.run().is_err());
+        let tree = s.tree();
+        assert!(!tree.join("os/repodata/repomd.xml").exists());
+        assert!(!tree.join("os/Packages/a.rpm").exists());
+        assert!(!generation::live_path(&tree).exists());
+    }
+
+    #[test]
+    fn a_lagging_alternate_is_accepted() {
+        let mut s = Site::new();
+        let old = s.repo(4, &AB);
+        let new = s.repo(5, &AB);
+        s.publish(100, &new, Some(&old), &old);
+        s.run().unwrap();
+        let repomd = std::fs::read(s.tree().join("os/repodata/repomd.xml")).unwrap();
+        assert_eq!(repomd, old);
+    }
+
+    #[test]
+    fn a_live_repomd_the_metalink_forgot_is_replaced_by_a_higher_revision() {
+        let mut s = Site::new();
+        let r2 = s.repo(2, &AB);
+        s.publish(100, &r2, None, &r2);
+        s.run().unwrap();
+        let r3 = s.repo(3, &[("c.rpm", b"c")]);
+        s.publish(101, &r3, None, &r3);
+        s.run().unwrap();
+        assert_eq!(s.live().entries.len(), 1);
+        assert!(!s.tree().join("os/Packages/a.rpm").exists());
+    }
+
+    #[test]
+    fn an_equal_or_lower_revision_is_refused() {
+        let mut s = Site::new();
+        let r2 = s.repo(2, &AB);
+        s.publish(100, &r2, None, &r2);
+        s.run().unwrap();
+        let same = s.repo(2, &[("c.rpm", b"c")]);
+        let lower = s.repo(1, &AB);
+        for (name, r) in [("equal", &same), ("lower", &lower)] {
+            s.publish(101, r, None, r);
+            let e = s.anchor_err();
+            assert!(e.contains("not newer"), "{name}: {e}");
+        }
+        assert_eq!(s.live().header.unwrap().anchor_ts[0].1, 100);
+    }
+
+    #[test]
+    fn adding_or_removing_a_tree_leaves_the_live_anchor_readable() {
+        let mut s = Site::new();
+        let r = s.repo(2, &AB);
+        s.publish(100, &r, None, &r);
+        s.run().unwrap();
+        s.routes
+            .insert("m/os2/repodata/repomd.xml".into(), r.clone());
+        s.publish(100, &r, None, &r);
+        let tree = |p: &str| Tree {
+            path: p.into(),
+            metalink: "repo=x".into(),
+        };
+        s.src.trees = vec![tree("os"), tree("os2")];
+        assert_eq!(s.anchor_docs(), 2, "added");
+        s.src.trees = vec![tree("os2")];
+        assert_eq!(s.anchor_docs(), 1, "removed");
+    }
+
+    #[test]
+    fn an_older_metalink_is_refused() {
+        let mut s = Site::new();
+        let r2 = s.repo(2, &AB);
+        s.publish(100, &r2, None, &r2);
+        s.run().unwrap();
+        let r3 = s.repo(3, &AB);
+        s.publish(99, &r3, None, &r3);
+        let e = s.anchor_err();
+        assert!(e.contains("older"), "{e}");
+    }
+
+    #[test]
+    fn a_redirecting_metalink_is_refused() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.publish(100, &r, None, &r);
+        let elsewhere = s.srv.url("m/os/repodata/repomd.xml");
+        s.srv
+            .set(|b| drop(b.redirects.insert(META.into(), elsewhere)));
+        let e = s.anchor_err();
+        assert!(e.contains("redirect"), "{e}");
+    }
+
+    #[test]
+    fn a_repomd_the_metalink_does_not_list_writes_nothing() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        let mut bad = r.clone();
+        bad.extend_from_slice(b" ");
+        s.publish(100, &r, None, &bad);
+        assert!(s.run().is_err());
+        assert!(!s.tree().exists());
+    }
+
+    #[test]
+    fn unchanged_makes_no_payload_hits() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.publish(100, &r, None, &r);
+        s.run().unwrap();
+        s.srv.clear_log();
+        s.run().unwrap();
+        assert_eq!(s.hits(), [META, "m/os/repodata/repomd.xml"]);
+    }
+
+    #[test]
+    fn a_changed_live_repomd_is_an_error() {
+        let mut s = Site::new();
+        let r = s.repo(5, &AB);
+        s.publish(100, &r, None, &r);
+        s.run().unwrap();
+        let p = s.tree().join("os/repodata/repomd.xml");
+        std::fs::write(&p, b"<repomd/>").unwrap();
+        let e = s.anchor_err();
+        assert!(e.contains("no longer matches"), "{e}");
+    }
+
+    #[test]
+    fn a_primary_bigger_than_its_open_size_is_refused() {
+        let mut site = Site::new();
+        let text = String::from_utf8(site.repo(5, &AB)).unwrap();
+        let (head, rest) = text.split_once("<open-size>").unwrap();
+        let (_, tail) = rest.split_once('<').unwrap();
+        let small = format!("{head}<open-size>10<{tail}").into_bytes();
+        site.publish(100, &small, None, &small);
+        let e = format!("{:#}", site.run().unwrap_err());
+        assert!(e.contains("open-size"), "{e}");
+    }
 }

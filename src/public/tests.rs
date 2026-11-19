@@ -1080,7 +1080,7 @@ fn synth_anchor(ctx: &Ctx<'_>, src: &Source) -> Result<Anchor> {
         docs: vec![(REL.into(), doc)],
         meta,
         swaps: vec!["dists/s".into()],
-        ts: None,
+        ts: Vec::new(),
     })
 }
 
@@ -1272,7 +1272,7 @@ fn list_shows_repo_and_git_rows() {
             files: 3,
             bytes: 3_000_000_000,
             at: Timestamp::now(),
-            anchor_ts: None,
+            anchor_ts: Vec::new(),
         }),
         &[],
     )
