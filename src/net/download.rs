@@ -14,13 +14,17 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ureq::http::HeaderMap;
 use ureq::{Agent, RequestBuilder, typestate::WithoutBody};
 
 /// Download threads per worker.
 pub(crate) const STREAMS: usize = 4;
 pub(crate) const CHECKPOINT: u64 = 64 << 20;
+/// Bounds what a crash loses on a slow link; on a fast one the byte cap fires first.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
+/// The SHA-512 block: a midstate only exists at a multiple of it.
+const BLOCK: u64 = 128;
 const MAX_REDIRECTS: usize = 10;
 const CHUNK: usize = 64 << 10;
 const SIDECAR_VERSION: u8 = 1;
@@ -234,12 +238,14 @@ pub(crate) struct Downloader {
     throttle: Arc<Throttle>,
     /// Bytes between checkpoints; a multiple of 128 (the SHA-512 block).
     checkpoint: u64,
+    /// Time between checkpoints when fewer than `checkpoint` bytes arrived.
+    interval: Duration,
 }
 
 impl Downloader {
     pub(crate) fn new(agent: Agent, throttle: Arc<Throttle>, checkpoint: u64) -> Self {
         assert_eq!(
-            checkpoint % 128,
+            checkpoint % BLOCK,
             0,
             "checkpoints must sit on hash block boundaries"
         );
@@ -247,6 +253,7 @@ impl Downloader {
             agent,
             throttle,
             checkpoint,
+            interval: CHECKPOINT_EVERY,
         }
     }
 
@@ -380,10 +387,18 @@ impl Downloader {
                     // A server may send less than asked; the loop asks again from there.
                     let mut left = last - first + 1;
                     while left > 0 {
-                        let n = left.min(self.checkpoint);
-                        self.copy(&mut body, part, Some(n), f, stop, done)
+                        let until = Instant::now() + self.interval;
+                        left -= self
+                            .copy(
+                                &mut body,
+                                part,
+                                Some(left.min(self.checkpoint)),
+                                f,
+                                stop,
+                                done,
+                                Some(until),
+                            )
                             .map_err(|e| e.at(&at))?;
-                        left -= n;
                         if part.offset < total {
                             Self::checkpoint(f, part, side)?;
                         }
@@ -407,7 +422,7 @@ impl Downloader {
                         ranged = false;
                         continue;
                     }
-                    self.copy(&mut body, part, len, f, stop, done)
+                    self.copy(&mut body, part, len, f, stop, done, None)
                         .map_err(|e| e.at(&at))?;
                     if let Some(s) = f.size.filter(|s| part.offset > *s) {
                         return Err(retry(format!("{at}: more than the expected {s} bytes")));
@@ -460,7 +475,7 @@ impl Downloader {
                     && st.url == f.url
                     && st.offset <= len
                     && st.offset < st.total
-                    && st.offset % 128 == 0
+                    && st.offset % BLOCK == 0
                     && st.sha512.is_some() == wants512
             });
         match st {
@@ -480,8 +495,13 @@ impl Downloader {
         Ok(p)
     }
 
-    /// Copies the body into the part: exactly `exact` bytes when given, else to EOF. Errors
-    /// carry no URL; the caller knows which hop sent the body.
+    /// Copies the body into the part: exactly `exact` bytes when given, else to EOF, or stops
+    /// at the first block boundary after `until` once it read something. Returns the bytes
+    /// read. Errors carry no URL; the caller knows which hop sent the body.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one body loop; a struct for its inputs would only be built here"
+    )]
     fn copy(
         &self,
         body: &mut impl Read,
@@ -490,7 +510,8 @@ impl Downloader {
         f: &Fetch,
         stop: &AtomicBool,
         done: &AtomicU64,
-    ) -> Result<(), Fail> {
+        until: Option<Instant>,
+    ) -> Result<u64, Fail> {
         let cap = f.size.unwrap_or(f.limit);
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0u64;
@@ -499,19 +520,27 @@ impl Downloader {
             if stop.load(Ordering::Relaxed) {
                 return Err(Fail::Stopped);
             }
-            let room = exact.map_or(CHUNK, |e| {
-                usize::try_from((e - got).min(CHUNK as u64)).unwrap_or(CHUNK)
-            });
-            if room == 0 {
-                return Ok(());
+            let mut room = exact.map_or(CHUNK as u64, |e| e - got).min(CHUNK as u64);
+            // Only once something was read: at an aligned start with the deadline gone, a cut
+            // here would return 0 bytes and the caller would checkpoint in a loop.
+            if got > 0 && until.is_some_and(|t| Instant::now() >= t) {
+                let align = (BLOCK - p.offset % BLOCK) % BLOCK;
+                if align == 0 {
+                    return Ok(got);
+                }
+                room = room.min(align);
             }
+            if room == 0 {
+                return Ok(got);
+            }
+            let room = usize::try_from(room).unwrap_or(CHUNK);
             let n = body
                 .read(&mut buf[..room])
                 .map_err(|e| retry(format!("read: {e}")))?;
             if n == 0 {
                 return match exact {
                     Some(e) if got < e => Err(retry(format!("body ended at {got} of {e} bytes"))),
-                    _ => Ok(()),
+                    _ => Ok(got),
                 };
             }
             self.throttle.take(n);
@@ -748,7 +777,6 @@ mod tests {
     use crate::net::testserver::{Behaviour, Server, body};
     use crate::testutil::TempDir;
     use sha2::Digest;
-    use std::time::Instant;
     use ureq::tls::RootCerts;
 
     const CP: u64 = 1 << 20;
@@ -823,6 +851,97 @@ mod tests {
         // Only the missing 3 MiB came over the wire again.
         assert_eq!(srv.served(), data.len() as u64 - 2 * CP);
         assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
+    }
+
+    fn retry_progressed(err: &Fail) -> bool {
+        matches!(
+            err,
+            Fail::Retry {
+                progressed: true,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn a_slow_attempt_still_checkpoints_by_time() {
+        let tmp = TempDir::new();
+        let data = body(3 * CP + 77, 1);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let mut d = dl(0);
+        d.interval = Duration::ZERO;
+        let f = fetch(&srv, tmp.path(), "t.iso", &data);
+        let done = AtomicU64::new(0);
+        let die_at = 5 * CP / 2 + 1000;
+        srv.set(|b| b.die_at = Some(die_at));
+        let err = d.fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+        assert!(retry_progressed(&err), "{err}");
+        let off = sidecar(&f).offset;
+        assert!(off.is_multiple_of(BLOCK));
+        assert!(off > 0 && off <= die_at, "offset {off}");
+        assert!(die_at - off <= CHUNK as u64 + BLOCK, "offset {off}");
+        assert!(std::fs::metadata(f.part()).unwrap().len() >= off);
+        assert_eq!(done.load(Ordering::Relaxed), 0);
+        srv.clear_log();
+
+        d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        let hits = srv.hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].range, Some(format!("bytes={off}-")));
+        assert_eq!(hits[0].if_range.as_deref(), Some("\"v1\""));
+        assert_eq!(srv.served(), data.len() as u64 - off);
+        assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
+    }
+
+    #[test]
+    fn time_checkpoints_land_on_block_boundaries() {
+        for (len, die_at) in [
+            (CP + 5, 100_001),
+            (CP, 128 * 1000),
+            (CP, 128 * 1000 + 1),
+            (CP + 127, CP - 1),
+        ] {
+            let case = format!("len {len} die_at {die_at}");
+            let tmp = TempDir::new();
+            let data = body(len, 2);
+            let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+            let mut d = Downloader::new(
+                loopback_agent(RootCerts::new_with_certs(&[])),
+                Arc::new(Throttle::new(0)),
+                1 << 30,
+            );
+            d.interval = Duration::ZERO;
+            let f = fetch(&srv, tmp.path(), "b.iso", &data);
+            srv.set(|b| b.die_at = Some(die_at));
+            let done = AtomicU64::new(0);
+            let err = d.fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+            assert!(retry_progressed(&err), "{case}: {err}");
+            let off = sidecar(&f).offset;
+            assert!(
+                off.is_multiple_of(BLOCK) && off <= die_at,
+                "{case}: offset {off}"
+            );
+            d.fetch(&f, &AtomicBool::new(false), &done).unwrap();
+            assert_eq!(std::fs::read(&f.dest).unwrap(), data, "{case}");
+        }
+    }
+
+    #[test]
+    fn no_time_checkpoint_spins_at_an_aligned_start() {
+        // Guards the `got > 0` rule in `copy`: without it an aligned start with the deadline
+        // gone returns 0 bytes forever and this test hangs.
+        let tmp = TempDir::new();
+        let data = body(2 * CP, 3);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let mut d = dl(0);
+        d.interval = Duration::ZERO;
+        let f = fetch(&srv, tmp.path(), "s.iso", &data);
+        d.fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+            .unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        assert_eq!(srv.hits().len(), 1);
+        assert!(!f.part().exists() && !f.sidecar().exists());
     }
 
     #[test]
