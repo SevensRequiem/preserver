@@ -160,6 +160,26 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// Opens or creates `path` for reading and writing, without following a final link or
+/// opening anything but a regular file.
+pub(crate) fn open_rw_regular(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                .bits()
+                .cast_signed(),
+        )
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

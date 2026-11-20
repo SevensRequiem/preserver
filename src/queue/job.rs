@@ -212,6 +212,10 @@ pub(crate) struct Job {
     /// unchanged: no new notification.
     #[serde(default)]
     pub known_bad: bool,
+    /// URLs whose failure (a mismatch, a refusal at publish, a skip) the last failed run
+    /// reported. The ledger is on the drive: a skip is quiet only for a file named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported: Vec<String>,
 }
 
 /// `<id>.ctl` (or `all.ctl` for every job): written by the CLI and tray only.

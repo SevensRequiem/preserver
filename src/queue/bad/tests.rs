@@ -147,7 +147,7 @@ fn held_only_while_every_probe_sees_the_same() {
         (
             "reuse",
             |_, _, f, _| f.reuse = Some(PathBuf::from("/nonexistent")),
-            false,
+            true,
         ),
     ];
     let d = dl();
@@ -164,14 +164,17 @@ fn held_only_while_every_probe_sees_the_same() {
         let got = held(&bad(tmp.path(), &[]), std::slice::from_ref(&f), &d, &|| {
             false
         });
-        let msg = got.into_iter().next().flatten();
-        assert_eq!(msg.is_some(), want, "{name}: {msg:?}");
-        if let Some(m) = msg {
-            assert!(m.starts_with("skipped ") && m.contains("since "), "{m}");
-            assert!(m.ends_with("upstream unchanged"), "{m}");
-        }
-        if name == "reuse" {
-            assert!(srv.hits().is_empty(), "reuse probed");
+        let hold = got.into_iter().next().flatten();
+        assert_eq!(hold.is_some(), want, "{name}: {hold:?}");
+        if let Some(hold) = hold {
+            let why = &hold.why;
+            assert!(
+                why.starts_with("skipped ") && why.contains("since "),
+                "{why}"
+            );
+            assert!(why.ends_with("upstream unchanged"), "{why}");
+            // A mismatch with a local candidate tries the candidate first.
+            assert_eq!(hold.adopt, name == "reuse", "{name}");
         }
     }
 }
@@ -214,7 +217,7 @@ fn a_server_without_validators_is_held_and_says_so() {
     let got = held(&bad(tmp.path(), &[]), std::slice::from_ref(&f), &d, &|| {
         false
     });
-    let m = got[0].as_deref().unwrap();
+    let m = &got[0].as_ref().unwrap().why;
     assert!(m.ends_with("upstream sends no validator"), "{m}");
 }
 
@@ -280,4 +283,89 @@ fn a_stop_ends_the_probes() {
     let got = held(&bad(tmp.path(), &[]), &fs, &d, &stop);
     assert!(got[0].is_some() && got[1].is_none(), "{got:?}");
     assert_eq!(srv.hits().len(), 1);
+}
+
+#[test]
+fn a_file_refused_at_publish_is_held_outright_even_with_a_candidate() {
+    let tmp = TempDir::new();
+    let data = body(3000, 11);
+    let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+    let d = dl();
+    let mut f = fetch(&srv, tmp.path(), "a.bin", &data);
+    let mut e = entry(&d, &f, &[]);
+    e.reason = "bad signature".into();
+    write_raw(tmp.path(), vec![e]);
+    f.reuse = Some(PathBuf::from("/nonexistent"));
+    let got = held(&bad(tmp.path(), &[]), std::slice::from_ref(&f), &d, &|| {
+        false
+    });
+    assert!(!got[0].as_ref().unwrap().adopt);
+}
+
+#[test]
+fn forged_entries_are_bounded_and_cleaned_on_load() {
+    let tmp = TempDir::new();
+    let srv = Server::start("127.0.0.1", Behaviour::new(body(10, 1)));
+    let seen = dl().probe(&srv.url("x")).unwrap();
+    let with = |urls: &[&str], seen_n: usize| {
+        let mut e = Entry::new(
+            urls.iter().map(|u| (*u).to_string()).collect(),
+            String::new(),
+            None,
+            "r",
+        );
+        e.seen = vec![seen.clone(); seen_n];
+        e
+    };
+    let mut escaped = with(&["https://h/esc"], 1);
+    escaped.reason = format!("\x1b]52;c;AAAA\x07{}", "y".repeat(10_000));
+    let mut entries = vec![
+        with(&["https://h/u"; 2], 2),
+        with(
+            &[
+                "https://h/1",
+                "https://h/2",
+                "https://h/3",
+                "https://h/4",
+                "https://h/5",
+            ],
+            5,
+        ),
+        with(&["https://h/a", "https://h/b"], 1),
+        with(&[], 0),
+        escaped,
+    ];
+    entries.extend((0..CAP + 10).map(|i| with(&[&format!("https://h/n{i}")], 1)));
+    write_raw(tmp.path(), entries);
+    let back = load(tmp.path());
+    assert_eq!(back.len(), CAP);
+    assert_eq!(back[0].urls, ["https://h/esc"]);
+    assert_eq!(back[0].reason.chars().count(), 200);
+    assert!(!back[0].reason.chars().any(char::is_control));
+    assert_eq!(back[1].urls, ["https://h/n0"]);
+}
+
+#[test]
+fn each_url_is_probed_once_per_call() {
+    let tmp = TempDir::new();
+    let data = body(3000, 12);
+    let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+    let d = dl();
+    let fs = [
+        fetch(&srv, tmp.path(), "a.bin", &data),
+        fetch(&srv, tmp.path(), "b.bin", &data),
+    ];
+    let sums = srv.url("SHA256SUMS");
+    write_raw(
+        tmp.path(),
+        fs.iter()
+            .map(|f| entry(&d, f, std::slice::from_ref(&sums)))
+            .collect(),
+    );
+    srv.clear_log();
+    let got = held(&bad(tmp.path(), &[&sums]), &fs, &d, &|| false);
+    assert!(got.iter().all(Option::is_some), "{got:?}");
+    let mut paths: Vec<String> = srv.hits().into_iter().map(|h| h.path).collect();
+    paths.sort();
+    assert_eq!(paths, ["SHA256SUMS", "a.bin", "b.bin"]);
 }

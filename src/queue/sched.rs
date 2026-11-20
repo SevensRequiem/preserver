@@ -1,7 +1,7 @@
 //! The worker: one job at a time, its files over `STREAMS` threads with at most `PER_HOST` per
 //! host, per-file retries with backoff, and the controls applied while it runs.
 
-use super::bad::{self, Bad};
+use super::bad::{self, Bad, Held};
 use super::job::{BlockReason, Job, JobState, Lane, Progress};
 use super::store::Store;
 use crate::config::DriveId;
@@ -51,8 +51,8 @@ struct State {
     /// Plan positions that finished verified.
     ok: Vec<usize>,
     failed: Vec<String>,
-    /// Files skipped by the bad-file ledger; each also has its line in `failed`.
-    held: usize,
+    /// Plan positions skipped by the bad-file ledger; each also has its line in `failed`.
+    held: Vec<usize>,
     /// Plan positions whose whole download did not match, with what the server said.
     mismatched: Vec<(usize, Seen)>,
     drive_gone: bool,
@@ -70,21 +70,28 @@ struct Pool<'a> {
     st: Mutex<State>,
     cv: Condvar,
     stop: AtomicBool,
+    /// `adopt_only[i]`: fetch `i` is held unless its reuse candidate proves good; why if not.
+    adopt_only: Vec<Option<String>>,
 }
 
 impl<'a> Pool<'a> {
-    /// `held[i]`, when given, is why fetch `i` is not downloaded at all.
-    fn new(fetches: &'a [Fetch], held: &[Option<String>]) -> Self {
+    /// `held[i]`, when given, is why fetch `i` is not downloaded.
+    fn new(fetches: &'a [Fetch], held: &[Option<Held>]) -> Self {
         let hosts: Vec<String> = fetches.iter().map(Fetch::host).collect();
         let mut st = State {
             tries: vec![0; fetches.len()],
             ..State::default()
         };
+        let mut adopt_only = vec![None; fetches.len()];
         for (i, h) in hosts.iter().enumerate() {
-            if let Some(Some(msg)) = held.get(i) {
-                st.failed.push(msg.clone());
-                st.held += 1;
-                continue;
+            match held.get(i) {
+                Some(Some(Held { why, adopt: true })) => adopt_only[i] = Some(why.clone()),
+                Some(Some(Held { why, adopt: false })) => {
+                    st.failed.push(why.clone());
+                    st.held.push(i);
+                    continue;
+                }
+                _ => {}
             }
             st.queues.entry(h.clone()).or_default().insert(i);
         }
@@ -94,6 +101,7 @@ impl<'a> Pool<'a> {
             st: Mutex::new(st),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
+            adopt_only,
         }
     }
 
@@ -182,7 +190,12 @@ impl<'a> Pool<'a> {
                 st.failed.push(msg);
                 st.mismatched.push((i, seen));
             }
-            Err(Fail::Permanent(msg)) => st.failed.push(msg),
+            Err(Fail::Permanent(msg)) => {
+                if self.adopt_only[i].is_some() {
+                    st.held.push(i);
+                }
+                st.failed.push(msg);
+            }
             Err(e @ (Fail::Retry { .. } | Fail::Disk(_))) => {
                 // Only tries that got nowhere count: a large file over a flaky route may need
                 // many attempts, and each one that saved a checkpoint brought it closer.
@@ -211,7 +224,15 @@ impl<'a> Pool<'a> {
 
     fn work(&self, dl: &Downloader, done: &AtomicU64, drive_ok: &dyn Fn() -> bool) {
         while let Some(i) = self.next() {
-            let r = dl.fetch(&self.fetches[i], &self.stop, done);
+            let f = &self.fetches[i];
+            let r = match (&self.adopt_only[i], &f.reuse) {
+                (Some(why), Some(from)) => match Downloader::adopt(f, from, &self.stop, done) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(Fail::Permanent(why.clone())),
+                    Err(e) => Err(e),
+                },
+                _ => dl.fetch(f, &self.stop, done),
+            };
             self.finish(i, r, drive_ok);
         }
     }
@@ -723,8 +744,18 @@ fn stopped(job: &mut Job, st: State, halt: Option<Halt>, fetches: &[Fetch]) -> J
         JobState::Queued
     } else {
         let n = st.failed.len();
-        job.known_bad = st.held > 0 && st.held == n;
-        let held = st.held;
+        let held = st.held.len();
+        let url = |i: &usize| fetches[*i].url.clone();
+        // Quiet only for files this job already reported: the ledger is on the drive, and a
+        // forged entry must not hide a failure nobody was told about.
+        job.known_bad =
+            held > 0 && held == n && st.held.iter().all(|i| job.reported.contains(&url(i)));
+        job.reported = st
+            .held
+            .iter()
+            .chain(st.mismatched.iter().map(|(i, _)| i))
+            .map(url)
+            .collect();
         let mut msg = st.failed.into_iter().take(3).collect::<Vec<_>>().join("; ");
         if n > 3 {
             msg = format!("{msg} (and {} more)", n - 3);
@@ -1332,6 +1363,94 @@ mod tests {
         let j = r.store.job(&job.id).unwrap();
         assert_eq!(j.state, JobState::Done, "{:?}", j.error);
         assert!(!ledger().unwrap().contains("big.iso"));
+    }
+
+    /// Requests since the last call that were not probes.
+    fn full_gets(r: &Rig) -> usize {
+        let n = r
+            .srv
+            .hits()
+            .iter()
+            .filter(|h| h.range.as_deref() != Some("bytes=0-0"))
+            .count();
+        r.srv.clear_log();
+        n
+    }
+
+    #[test]
+    fn a_held_mismatch_still_takes_a_good_local_copy() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let set_dir = r.mnt().join("set");
+        std::fs::create_dir_all(&set_dir).unwrap();
+        let cand = r.mnt().join("cand.iso");
+        let reuse = Mutex::new(None::<PathBuf>);
+        let plan = |_: &Job, root: &Path, _: &[usize]| {
+            let mut f = r.fetch(root);
+            f.reuse.clone_from(&reuse.lock().unwrap());
+            Ok(Work::Fetch(Planned {
+                fetches: vec![f],
+                bad: Some(Bad {
+                    set_dir: set_dir.clone(),
+                    known: std::collections::HashSet::new(),
+                }),
+                ..Planned::default()
+            }))
+        };
+        r.srv.set(|b| b.body = body(1000, 7));
+        run_plan(&r, &plan);
+        assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Failed);
+        assert_eq!(full_gets(&r), 1);
+
+        // A bad local copy is tried, then the file is held: no download.
+        std::fs::write(&cand, b"not it").unwrap();
+        *reuse.lock().unwrap() = Some(cand.clone());
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, true));
+        assert!(j.error.unwrap_or_default().starts_with("skipped "));
+        assert_eq!(full_gets(&r), 0);
+
+        // A good one is taken, and its success clears the entry.
+        std::fs::write(&cand, &r.data).unwrap();
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Done, "{:?}", j.error);
+        assert_eq!(full_gets(&r), 0);
+        let ledger = std::fs::read_to_string(set_dir.join(".preserver/bad.json")).unwrap();
+        assert!(!ledger.contains("big.iso"), "{ledger}");
+    }
+
+    #[test]
+    fn a_skip_this_job_never_reported_is_news() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let set_dir = r.mnt().join("set");
+        std::fs::create_dir_all(&set_dir).unwrap();
+        let plan = |_: &Job, root: &Path, _: &[usize]| {
+            Ok(Work::Fetch(Planned {
+                fetches: vec![r.fetch(root)],
+                bad: Some(Bad {
+                    set_dir: set_dir.clone(),
+                    known: std::collections::HashSet::new(),
+                }),
+                ..Planned::default()
+            }))
+        };
+        // An entry this host never wrote, matching what upstream answers today.
+        let f = r.fetch(&r.mnt());
+        let mut e = bad::Entry::new(vec![f.url.clone()], f.expect.tag(), f.size, "forged");
+        e.seen = vec![r.dl.probe(&f.url).unwrap()];
+        bad::record(&set_dir, vec![e]);
+        r.srv.clear_log();
+
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, false));
+        assert_eq!(full_gets(&r), 0);
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, true));
     }
 
     #[test]

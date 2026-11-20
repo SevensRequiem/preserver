@@ -7,6 +7,8 @@
 //! with the reason, and nothing unverified becomes visible. Probes go only to URLs of the
 //! current plan (`Bad::known`), so a forged entry cannot direct traffic. An unreadable ledger
 //! counts as empty. One worker per lane runs one job at a time, so it is the only writer.
+//! Entries are bounded on load (count, URLs per entry, reason length), and a URL is probed at
+//! most once per batch, so a forged ledger costs at most one probe per URL of the plan.
 
 use crate::copy::exec::ensure_dir;
 use crate::mirror::generation::put;
@@ -15,12 +17,15 @@ use crate::public::versioned::{plain_dirs, read_meta};
 use anyhow::Result;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const VERSION: u8 = 1;
 const CAP: usize = 256;
+/// The file and its signature, sums and sums signature.
+const MAX_URLS: usize = 4;
+const MISMATCH: &str = "checksum mismatch";
 /// Entries of another build never match: the rules that wrote them may have changed.
 const BUILD: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,9 +52,27 @@ impl Entry {
             seen: Vec::new(),
             build: BUILD.into(),
             since: Timestamp::now(),
-            reason: reason.chars().take(200).collect(),
+            reason: clean(reason),
         }
     }
+
+    /// Well-formed: it names its file, no URL twice, and a probe result per URL once probed.
+    fn sane(&self) -> bool {
+        let distinct: HashSet<&String> = self.urls.iter().collect();
+        (1..=MAX_URLS).contains(&self.urls.len())
+            && distinct.len() == self.urls.len()
+            && (self.seen.is_empty() || self.seen.len() == self.urls.len())
+    }
+}
+
+/// The reason reaches job errors, the tray, the GUI and a terminal: no control characters
+/// (escape sequences), and short.
+fn clean(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,7 +96,16 @@ fn load(set_dir: &Path) -> Vec<Entry> {
     }
     let file = dir.join("bad.json");
     match read_meta(&file).map(|b| serde_json::from_slice::<Ledger>(&b)) {
-        Ok(Ok(l)) if l.v == VERSION => l.entries,
+        Ok(Ok(l)) if l.v == VERSION => l
+            .entries
+            .into_iter()
+            .filter(Entry::sane)
+            .take(CAP)
+            .map(|mut e| {
+                e.reason = clean(&e.reason);
+                e
+            })
+            .collect(),
         Ok(Ok(_)) => Vec::new(),
         Ok(Err(e)) => {
             tracing::warn!("{}: {e}", file.display());
@@ -113,28 +145,51 @@ fn record_into(entries: &mut Vec<Entry>, mut e: Entry) {
     entries.push(e);
 }
 
-/// Why each fetch is not downloaded, if it is not: its entry matches the fetch, it has no
-/// candidate to reuse (that costs no network and is proved against the hash), and every URL
-/// of the entry answers a probe exactly as recorded. A host whose probe fails is not asked
-/// again in this call, so a dead host costs one timeout. Once `stop` is true nothing more is
-/// probed or held, so a pause, cancel or yield does not wait behind the probes.
+/// Why a fetch is not downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub why: String,
+    /// Its reuse candidate is tried first: the entry is a download that did not match, and a
+    /// local file proved against the hash costs no network. A file refused at publish is held
+    /// outright, since the same bytes from anywhere get the same verdict.
+    pub adopt: bool,
+}
+
+/// Which fetches are not downloaded: those whose entry matches the fetch and every URL of
+/// which answers a probe exactly as recorded. Each URL is probed at most once per call, and a
+/// host whose probe fails is not asked again, so a dead host costs one timeout. Once `stop` is
+/// true nothing more is probed or held, so a pause, cancel or yield does not wait behind the
+/// probes.
 pub(crate) fn held(
     b: &Bad,
     fetches: &[Fetch],
     dl: &Downloader,
     stop: &dyn Fn() -> bool,
-) -> Vec<Option<String>> {
+) -> Vec<Option<Held>> {
     let entries = load(&b.set_dir);
     if entries.is_empty() {
         return Vec::new();
     }
     let mut dead = HashSet::new();
+    let mut probed: HashMap<String, Option<Seen>> = HashMap::new();
+    let mut probe = |u: &str| -> Option<Seen> {
+        if let Some(s) = probed.get(u) {
+            return s.clone();
+        }
+        let host = host_of(u);
+        if dead.contains(&host) || stop() {
+            return None;
+        }
+        let s = dl.probe(u);
+        if s.is_none() {
+            dead.insert(host);
+        }
+        probed.insert(u.to_owned(), s.clone());
+        s
+    };
     fetches
         .iter()
         .map(|f| {
-            if f.reuse.is_some() {
-                return None;
-            }
             let tag = f.expect.tag();
             let e = entries.iter().find(|e| {
                 e.urls.first() == Some(&f.url)
@@ -144,21 +199,9 @@ pub(crate) fn held(
                     && e.seen.len() == e.urls.len()
                     && e.urls.iter().skip(1).all(|u| b.known.contains(u))
             })?;
-            if stop() {
-                return None;
-            }
             for (u, seen) in e.urls.iter().zip(&e.seen) {
-                let host = host_of(u);
-                if dead.contains(&host) {
+                if probe(u).as_ref() != Some(seen) {
                     return None;
-                }
-                match dl.probe(u) {
-                    Some(s) if s == *seen => {}
-                    Some(_) => return None,
-                    None => {
-                        dead.insert(host);
-                        return None;
-                    }
                 }
             }
             let how = if e.seen.iter().any(Seen::has_validator) {
@@ -166,12 +209,15 @@ pub(crate) fn held(
             } else {
                 "upstream sends no validator"
             };
-            Some(format!(
-                "skipped {}: {} since {}, {how}",
-                f.url,
-                e.reason,
-                e.since.strftime("%Y-%m-%d")
-            ))
+            Some(Held {
+                why: format!(
+                    "skipped {}: {} since {}, {how}",
+                    f.url,
+                    e.reason,
+                    e.since.strftime("%Y-%m-%d")
+                ),
+                adopt: f.reuse.is_some() && e.reason == MISMATCH,
+            })
         })
         .collect()
 }
@@ -192,12 +238,7 @@ pub(crate) fn update(b: &Bad, fetches: &[Fetch], ok: &[usize], mismatched: &[(us
     });
     for (i, seen) in mismatched {
         let f = &fetches[*i];
-        let mut e = Entry::new(
-            vec![f.url.clone()],
-            f.expect.tag(),
-            f.size,
-            "checksum mismatch",
-        );
+        let mut e = Entry::new(vec![f.url.clone()], f.expect.tag(), f.size, MISMATCH);
         e.seen = vec![seen.clone()];
         record_into(&mut entries, e);
     }

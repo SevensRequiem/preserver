@@ -579,7 +579,7 @@ impl Public<'_> {
                     }
                 }
                 // An entry whose URLs cannot all be probed now has nothing to compare later.
-                let refused = refused
+                let refused: Vec<bad::Entry> = refused
                     .into_iter()
                     .filter_map(|mut e| {
                         e.seen = e
@@ -590,6 +590,11 @@ impl Public<'_> {
                         Some(e)
                     })
                     .collect();
+                for u in refused.iter().filter_map(|e| e.urls.first()) {
+                    if !job.reported.contains(u) {
+                        job.reported.push(u.clone());
+                    }
+                }
                 bad::record(&Self::public_dir(root).join(set), refused);
                 if let Err(e) = index::write(self.cat, &root.join("preserver")) {
                     tracing::warn!("index: {e:#}");

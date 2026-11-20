@@ -84,6 +84,7 @@ impl Store {
                 retry_seen: 0,
                 recheck_seen: 0,
                 known_bad: false,
+                reported: Vec::new(),
             };
             let file = self.file(&job.id, "json")?;
             match platform::private_file_new(&file) {

@@ -182,6 +182,24 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+pub(crate) fn open_rw_regular(path: &Path) -> io::Result<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() => return Err(io::Error::other("not a regular file")),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
 /// No atomic exchange here: the caller renames the old path aside, then the new one in.
 #[expect(
     clippy::unnecessary_wraps,

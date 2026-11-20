@@ -15,7 +15,7 @@ use crate::platform;
 use crate::resolve::hex;
 use crate::resolve::listing::join;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -552,13 +552,13 @@ impl Downloader {
 
     /// Opens the part, resuming from its sidecar when the sidecar fits; anything else restarts.
     fn open(f: &Fetch, side: &Path) -> Result<Part, Fail> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(f.part())
-            .map_err(Fail::Disk)?;
+        // The drive is anyone's: a link planted at the part's name would have `set_len` and
+        // the body land in whatever it points at. Anything but a regular file is removed.
+        let part = f.part();
+        if std::fs::symlink_metadata(&part).is_ok_and(|m| !m.is_file()) {
+            remove(&part)?;
+        }
+        let file = platform::open_rw_regular(&part).map_err(Fail::Disk)?;
         let len = file.metadata().map_err(Fail::Disk)?.len();
         let wants512 = matches!(f.expect, Expect::Sha512(_) | Expect::Both(..));
         let mut p = Part {
@@ -687,7 +687,9 @@ impl Downloader {
         p.file.sync_data().map_err(Fail::Disk)?;
         let tmp = suffixed(side, ".tmp");
         let json = serde_json::to_vec(&st).map_err(|e| Fail::Permanent(e.to_string()))?;
-        let mut t = File::create(&tmp).map_err(Fail::Disk)?;
+        // Removed first and created exclusively: a planted link is never followed.
+        remove(&tmp)?;
+        let mut t = File::create_new(&tmp).map_err(Fail::Disk)?;
         t.write_all(&json).map_err(Fail::Disk)?;
         t.sync_data().map_err(Fail::Disk)?;
         std::fs::rename(&tmp, side).map_err(Fail::Disk)?;
@@ -742,7 +744,12 @@ impl Downloader {
     /// renamed to `dest` only on a match. `Ok(false)` sends the caller to the network. Tried
     /// only while no `.part` exists: a bad candidate is read again only after a download of the
     /// same file failed verification and took its `.part` with it.
-    fn adopt(f: &Fetch, from: &Path, stop: &AtomicBool, done: &AtomicU64) -> Result<bool, Fail> {
+    pub(crate) fn adopt(
+        f: &Fetch,
+        from: &Path,
+        stop: &AtomicBool,
+        done: &AtomicU64,
+    ) -> Result<bool, Fail> {
         if matches!(f.expect, Expect::None | Expect::Apk(_)) || f.part().exists() {
             return Ok(false);
         }
@@ -1016,6 +1023,7 @@ mod tests {
     use crate::net::testserver::{Behaviour, Server, body};
     use crate::testutil::TempDir;
     use sha2::Digest;
+    use std::fs::OpenOptions;
     use ureq::tls::RootCerts;
 
     const CP: u64 = 1 << 20;
@@ -1750,6 +1758,30 @@ mod tests {
             }
             let p = Downloader::open(&f, &f.sidecar()).unwrap();
             assert_eq!(p.offset, if kept { 128 } else { 0 }, "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_links_at_the_part_and_sidecar_tmp_are_not_followed() {
+        let tmp = TempDir::new();
+        let data = body(3 * CP, 11);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let f = fetch(&srv, tmp.path(), "l.iso", &data);
+        let victims = [tmp.path().join("identity"), tmp.path().join("bashrc")];
+        for (v, at) in victims
+            .iter()
+            .zip([f.part(), suffixed(&f.sidecar(), ".tmp")])
+        {
+            std::fs::write(v, b"precious").unwrap();
+            std::os::unix::fs::symlink(v, at).unwrap();
+        }
+        dl(0)
+            .fetch(&f, &AtomicBool::new(false), &AtomicU64::new(0))
+            .unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        for v in &victims {
+            assert_eq!(std::fs::read(v).unwrap(), b"precious", "{}", v.display());
         }
     }
 
