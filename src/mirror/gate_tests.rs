@@ -297,6 +297,7 @@ impl<U: Upstream> Rig<U> {
                 },
                 settle: &|job, root, ok| p.settle(job, root, ok),
                 drive: &|_| DriveAt::Mounted(e.paths.mnt.clone()),
+                limit: &|| {},
             }
             .run(Pass::FRESH)
             .unwrap();

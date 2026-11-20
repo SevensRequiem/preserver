@@ -49,6 +49,15 @@ pub(crate) fn show_interval(secs: u64) -> String {
     format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
+/// `H:MM` or `HH:MM`, 00:00 to 23:59.
+pub(crate) fn parse_clock(s: &str) -> Option<Time> {
+    s.split_once(':')
+        .filter(|(h, m)| (1..=2).contains(&h.len()) && m.len() == 2)
+        .and_then(|(h, m)| num(h).zip(num(m)))
+        .filter(|(h, m)| *h < 24 && *m < 60)
+        .and_then(|(h, m)| Time::new(i8::try_from(h).ok()?, i8::try_from(m).ok()?, 0, 0).ok())
+}
+
 impl std::str::FromStr for Schedule {
     type Err = anyhow::Error;
 
@@ -56,12 +65,7 @@ impl std::str::FromStr for Schedule {
         if s.matches(':').count() == 2 {
             return parse_interval(s).map(Self::Every);
         }
-        let daily = s
-            .split_once(':')
-            .filter(|(h, m)| (1..=2).contains(&h.len()) && m.len() == 2)
-            .and_then(|(h, m)| num(h).zip(num(m)))
-            .filter(|(h, m)| *h < 24 && *m < 60)
-            .and_then(|(h, m)| Time::new(i8::try_from(h).ok()?, i8::try_from(m).ok()?, 0, 0).ok());
+        let daily = parse_clock(s);
         daily.map(Self::Daily).with_context(|| {
             format!(
                 "bad schedule {s:?}: give H:MM:SS for an interval since the last run (24:00:00) \

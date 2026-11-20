@@ -391,6 +391,9 @@ pub(crate) struct Worker<'a> {
     pub settle: &'a (dyn Fn(&mut Job, &Path, &[usize]) + Sync),
     /// Where the drive is; the worker never mounts it.
     pub drive: &'a (dyn Fn(&DriveId) -> DriveAt + Sync),
+    /// Brings the shared bandwidth bucket up to date; called before each job and every second
+    /// while one runs.
+    pub limit: &'a (dyn Fn() + Sync),
 }
 
 impl<'a> Worker<'a> {
@@ -406,6 +409,7 @@ impl<'a> Worker<'a> {
     pub(crate) fn run(&self, pass: Pass) -> Result<()> {
         reset(self.store, Lane::Download, pass)?;
         loop {
+            (self.limit)();
             let paused = self.store.control(None).pause;
             let mut jobs = self.jobs()?;
             for job in &mut jobs {
@@ -543,6 +547,7 @@ impl<'a> Worker<'a> {
             }
             let mut last = (Instant::now(), base.1);
             while !pool.wait(Duration::from_secs(1)) {
+                (self.limit)();
                 if let Some(h) = halt_requested(self.store, &job.id)
                     .or_else(|| outranked(self.store, job).then_some(Halt::Yield))
                 {
@@ -584,6 +589,7 @@ impl<'a> Worker<'a> {
                     Err(RecvTimeoutError::Disconnected) => return Err(anyhow!("job thread died")),
                     Err(RecvTimeoutError::Timeout) => {}
                 }
+                (self.limit)();
                 if halt.is_none()
                     && let Some(h) = halt_requested(self.store, &job.id)
                 {
@@ -869,6 +875,7 @@ mod tests {
                 plan: &plan,
                 settle: &|_, _, _| {},
                 drive,
+                limit: &|| {},
             }
             .run(pass)
             .unwrap();
@@ -977,6 +984,7 @@ mod tests {
             plan: &plan,
             settle: &|_, _, _| {},
             drive: &|_| DriveAt::Mounted(mnt.clone()),
+            limit: &|| {},
         };
         let mut small = None;
         std::thread::scope(|s| {
@@ -1199,6 +1207,7 @@ mod tests {
             plan,
             settle,
             drive: &*r.drive,
+            limit: &|| {},
         }
         .run(Pass::FRESH)
         .unwrap();
@@ -1330,6 +1339,45 @@ mod tests {
                 JobState::Paused
             };
             assert_eq!(r.store.job(&job.id).unwrap().state, want, "cancel={cancel}");
+        }
+    }
+
+    #[test]
+    fn the_limit_hook_runs_every_second_of_a_job() {
+        use std::sync::atomic::AtomicUsize;
+        for closure in [false, true] {
+            let r = Rig::new(3 * CP, CP);
+            let job = r.job();
+            let calls = AtomicUsize::new(0);
+            let plan = |_: &Job, root: &Path, _: &[usize]| {
+                if closure {
+                    Ok(Work::Run(Box::new(|_, _| {
+                        std::thread::sleep(Duration::from_millis(3200));
+                        Ok(())
+                    })))
+                } else {
+                    Ok(vec![r.fetch(root)].into())
+                }
+            };
+            Worker {
+                store: &r.store,
+                dl: &r.dl,
+                plan: &plan,
+                settle: &|_, _, _| {},
+                drive: &*r.drive,
+                limit: &|| {
+                    if matches!(
+                        r.store.job(&job.id).unwrap().state,
+                        JobState::Running { .. }
+                    ) {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+            }
+            .run(Pass::FRESH)
+            .unwrap();
+            assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Done);
+            assert!(calls.load(Ordering::Relaxed) >= 2, "closure {closure}");
         }
     }
 

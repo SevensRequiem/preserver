@@ -22,13 +22,13 @@ use crate::verify::Verifier;
 use crate::{actions, platform, status};
 use anyhow::{Context, Result, bail};
 use gix::protocol::transport::client::blocking_io::http::Http;
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use versioned::{Prepared, Staged};
 
 type Free<'a> = &'a (dyn Fn(&Path) -> std::io::Result<(u64, u64)> + Sync);
@@ -790,6 +790,46 @@ fn downloader(cfg: &Config) -> Downloader {
     )
 }
 
+/// Keeps the shared bucket at the rate `config.toml` gives for the time of day. The file is
+/// read again only when its mtime or length changes; a config that stops loading keeps the
+/// last good one.
+type Seen = (Option<(SystemTime, u64)>, Option<Config>);
+
+struct Limit<'a> {
+    dir: &'a Path,
+    throttle: Arc<Throttle>,
+    seen: Mutex<Seen>,
+}
+
+impl Limit<'_> {
+    fn refresh(&self) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let stamp = std::fs::metadata(self.dir.join("config.toml"))
+            .and_then(|m| Ok((m.modified()?, m.len())))
+            .ok();
+        if seen.0 != stamp {
+            seen.0 = stamp;
+            match Config::load(self.dir) {
+                Ok(c) => seen.1 = Some(c),
+                Err(e) => tracing::warn!(
+                    "bandwidth: config.toml does not load, keeping the last limit: {e:#}"
+                ),
+            }
+        }
+        let Some(cfg) = &seen.1 else {
+            return;
+        };
+        let mbit = cfg.mbit_at(Zoned::now().datetime());
+        if self.throttle.set_mbit(mbit) {
+            if mbit == 0 {
+                tracing::info!("download limit now off");
+            } else {
+                tracing::info!("download limit now {mbit} Mbit/s");
+            }
+        }
+    }
+}
+
 fn notify(urgent: bool, title: &str, body: &str) {
     platform::notify(urgent, title, body);
 }
@@ -822,12 +862,18 @@ fn public<'a>(cat: &'a Catalog, paths: &'a Paths, cfg: &Config, dl: &'a Download
 
 /// Runs the queue worker until nothing is runnable. The caller holds the queue lock.
 fn work(p: &Public, store: &Store, dl: &Downloader, pass: Pass) -> Result<()> {
+    let limit = Limit {
+        dir: &p.paths.cfg,
+        throttle: dl.throttle(),
+        seen: Mutex::default(),
+    };
     Worker {
         store,
         dl,
         plan: &|job, root, ok| p.plan(job, root, ok),
         settle: &|job, root, ok| p.settle(job, root, ok),
         drive: &platform::locate,
+        limit: &|| limit.refresh(),
     }
     .run(pass)
 }
@@ -850,7 +896,7 @@ pub(crate) fn queue_run(paths: &Paths, cfg: &Config) -> Result<()> {
 
 /// One pass of the daemon's download lane. It skips without a word when a CLI run holds the
 /// queue or nothing is runnable, so an idle tick writes nothing. The config and the
-/// downloader are rebuilt per pass, so an edited bandwidth applies without a restart.
+/// downloader are rebuilt per pass; the bandwidth limit also follows config edits while a job runs (`Limit`).
 pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
     let Some(_lock) = status::try_lock(&paths.lock_file("queue"))? else {
         return Ok(());

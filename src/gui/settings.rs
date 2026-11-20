@@ -3,9 +3,9 @@
 //! anything they cannot prove; the file is written once, or not at all.
 
 use super::{App, Done};
-use crate::config::{Config, Transport};
+use crate::config::{Config, Days, Transport};
 use crate::config_edit::{self, Edit, Place};
-use crate::schedule::{Schedule, show_interval};
+use crate::schedule::{Schedule, parse_clock, show_interval};
 use eframe::egui;
 use toml::{Table, Value};
 
@@ -56,12 +56,22 @@ pub(super) struct Folder {
     pub origin: String,
 }
 
+/// One `bandwidth_windows` entry as text; `days` is empty for every day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WinRow {
+    pub from: String,
+    pub to: String,
+    pub mbit: u32,
+    pub days: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Draft {
     pub owners: Vec<String>,
     pub primary: String,
     pub transport: Transport,
     pub bandwidth: u32,
+    pub windows: Vec<WinRow>,
     pub reserve: u8,
     pub local: Vec<Folder>,
     pub schedule: [Sched; 3],
@@ -74,6 +84,16 @@ impl Draft {
             primary: c.primary_uuid.to_string(),
             transport: c.transport,
             bandwidth: c.bandwidth_mbit,
+            windows: c
+                .bandwidth_windows
+                .iter()
+                .map(|w| WinRow {
+                    from: w.from.strftime("%H:%M").to_string(),
+                    to: w.to.strftime("%H:%M").to_string(),
+                    mbit: w.mbit,
+                    days: w.days.map_or_else(String::new, |d| d.names().join(" ")),
+                })
+                .collect(),
             reserve: c.reserve_percent,
             local: c
                 .local
@@ -123,6 +143,9 @@ pub(super) fn edits(old: &Draft, new: &Draft) -> Result<Vec<Edit>, String> {
             Place::Top("bandwidth_mbit"),
             Value::Integer(i64::from(new.bandwidth)),
         ));
+    }
+    if old.windows != new.windows {
+        out.push(windows(&new.windows)?);
     }
     if old.reserve != new.reserve {
         out.push(Edit::Set(
@@ -189,6 +212,41 @@ pub(super) fn edits(old: &Draft, new: &Draft) -> Result<Vec<Edit>, String> {
     Ok(out)
 }
 
+fn windows(rows: &[WinRow]) -> Result<Edit, String> {
+    if rows.is_empty() {
+        return Ok(Edit::Unset(Place::Top("bandwidth_windows")));
+    }
+    let mut out = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let n = i + 1;
+        let clock = |what: &str, text: &str| {
+            parse_clock(text.trim())
+                .map(|t| t.strftime("%H:%M").to_string())
+                .ok_or_else(|| format!("window {n}: {what} must be HH:MM, like 08:00"))
+        };
+        let mut t = Table::new();
+        t.insert("from".into(), Value::String(clock("from", &r.from)?));
+        t.insert("to".into(), Value::String(clock("to", &r.to)?));
+        t.insert("mbit".into(), Value::Integer(i64::from(r.mbit)));
+        let names: Vec<String> = r
+            .days
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            let days = Days::try_from(names).map_err(|e| format!("window {n}: {e}"))?;
+            let names = days.names().into_iter().map(|d| Value::String(d.into()));
+            t.insert("days".into(), Value::Array(names.collect()));
+        }
+        out.push(Value::Table(t));
+    }
+    Ok(Edit::Set(
+        Place::Top("bandwidth_windows"),
+        Value::Array(out),
+    ))
+}
+
 #[derive(Default)]
 pub(super) struct Form {
     /// The file as last loaded, and the form over it.
@@ -225,6 +283,7 @@ pub(super) fn page(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let find = fields(ui, d, old, &drives);
+    bandwidth_windows(ui, d);
     folders(ui, d);
 
     ui.separator();
@@ -302,7 +361,7 @@ fn fields(ui: &mut egui::Ui, d: &mut Draft, old: &Draft, drives: &[(String, Stri
         });
         ui.end_row();
 
-        ui.label("Bandwidth (Mbit/s, 0 = unlimited)");
+        ui.label("Bandwidth outside windows (Mbit/s, 0 = unlimited)");
         ui.add(
             egui::DragValue::new(&mut d.bandwidth)
                 .range(0..=10_000)
@@ -352,6 +411,44 @@ fn fields(ui: &mut egui::Ui, d: &mut Draft, old: &Draft, drives: &[(String, Stri
     });
 
     find
+}
+
+fn bandwidth_windows(ui: &mut egui::Ui, d: &mut Draft) {
+    ui.separator();
+    ui.strong("Bandwidth windows (the first that covers the time wins)");
+    egui::Grid::new("windows").num_columns(5).show(ui, |ui| {
+        ui.weak("from");
+        ui.weak("to");
+        ui.weak("Mbit/s (0 = unlimited)");
+        ui.weak("days (mon tue ..., empty = every day)");
+        ui.end_row();
+        let mut drop = None;
+        for (i, w) in d.windows.iter_mut().enumerate() {
+            ui.add(egui::TextEdit::singleline(&mut w.from).desired_width(50.0));
+            ui.add(egui::TextEdit::singleline(&mut w.to).desired_width(50.0));
+            ui.add(
+                egui::DragValue::new(&mut w.mbit)
+                    .range(0..=10_000)
+                    .clamp_existing_to_range(false),
+            );
+            ui.add(egui::TextEdit::singleline(&mut w.days).desired_width(200.0));
+            if ui.small_button("Remove").clicked() {
+                drop = Some(i);
+            }
+            ui.end_row();
+        }
+        if let Some(i) = drop {
+            d.windows.remove(i);
+        }
+    });
+    if ui.small_button("Add window").clicked() {
+        d.windows.push(WinRow {
+            from: "08:00".into(),
+            to: "23:00".into(),
+            mbit: 20,
+            days: String::new(),
+        });
+    }
 }
 
 fn folders(ui: &mut egui::Ui, d: &mut Draft) {
@@ -432,6 +529,20 @@ personal = \"24:00:00\"
         new.transport = Transport::Https;
         new.bandwidth = 0;
         new.reserve = 25;
+        new.windows = vec![
+            WinRow {
+                from: "8:00".into(),
+                to: "23:00".into(),
+                mbit: 20,
+                days: "fri, mon".into(),
+            },
+            WinRow {
+                from: "23:00".into(),
+                to: "07:00".into(),
+                mbit: 0,
+                days: String::new(),
+            },
+        ];
         new.schedule[0] = Sched {
             when: When::Off,
             text: String::new(),
@@ -459,10 +570,38 @@ personal = \"24:00:00\"
         let got = Draft::of(&Config::parse(&text).unwrap());
         let mut want = new.clone();
         want.schedule[1].text = "01:30".into();
+        want.windows[0].from = "08:00".into();
+        want.windows[0].days = "mon fri".into();
         for (i, f) in want.local.iter_mut().enumerate() {
             f.orig = Some(i);
         }
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_bad_window_is_refused_and_removing_all_unsets() {
+        let old = Draft::of(&Config::parse(TEXT).unwrap());
+        for (from, days) in [("25:00", ""), ("08:00", "moon")] {
+            let mut new = old.clone();
+            new.windows.push(WinRow {
+                from: from.into(),
+                to: "09:00".into(),
+                mbit: 1,
+                days: days.into(),
+            });
+            assert!(edits(&old, &new).is_err(), "{from} {days}");
+        }
+        let mut with = old.clone();
+        with.windows.push(WinRow {
+            from: "08:00".into(),
+            to: "09:00".into(),
+            mbit: 1,
+            days: String::new(),
+        });
+        assert_eq!(
+            edits(&with, &old),
+            Ok(vec![Edit::Unset(Place::Top("bandwidth_windows"))])
+        );
     }
 
     #[test]

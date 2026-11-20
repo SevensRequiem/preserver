@@ -498,6 +498,35 @@ path = \"/home/u/code\"
 
     #[cfg(unix)]
     #[test]
+    fn bandwidth_windows_set_and_unset() {
+        let multi = "bandwidth_windows = [\n  {from = \"08:00\", to = \"09:00\", mbit = 1}, # day\n  {from = \"22:00\", to = \"07:00\", mbit = 0},\n] # tail\n";
+        let with = SAMPLE.replace("\n# folders", &format!("{multi}\n# folders"));
+        let mut w = Table::new();
+        w.insert("from".into(), s("00:00"));
+        w.insert("to".into(), s("00:00"));
+        w.insert("mbit".into(), Value::Integer(3));
+        let set = Edit::Set(
+            Place::Top("bandwidth_windows"),
+            Value::Array(vec![Value::Table(w)]),
+        );
+        let one = "bandwidth_windows = [{ from = \"00:00\", mbit = 3, to = \"00:00\" }] # tail\n";
+        assert_eq!(apply(&with, &set).unwrap(), with.replace(multi, one));
+        let unset = Edit::Unset(Place::Top("bandwidth_windows"));
+        assert_eq!(apply(&with, &unset).unwrap(), SAMPLE);
+        let added = apply(SAMPLE, &set).unwrap();
+        assert!(
+            Config::parse(&format!(
+                "owners = [\"a\"]\nprimary_uuid = \"0123abcd-2d54\"\n{}",
+                &added
+                    [added.find("bandwidth_windows").unwrap()..added.find("\n# folders").unwrap()]
+            ))
+            .is_ok(),
+            "{added}"
+        );
+        assert!(added.find("bandwidth_windows").unwrap() < added.find("[[local]]").unwrap());
+    }
+
+    #[test]
     fn save_writes_once_or_not_at_all() {
         let tmp = crate::testutil::TempDir::new();
         let paths = crate::testutil::paths(tmp.path());

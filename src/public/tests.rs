@@ -111,6 +111,7 @@ impl Env {
                 plan: &|job, root, ok| p.plan(job, root, ok),
                 settle: &|job, root, ok| p.settle(job, root, ok),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
+                limit: &|| {},
             }
             .run(Pass::FRESH)
             .unwrap();
@@ -128,6 +129,7 @@ impl Env {
                 plan: &|job, root, ok| p.plan(job, root, ok),
                 settle: &|job, root, ok| p.settle(job, root, ok),
                 drive: &|_| DriveAt::Mounted(self.paths.mnt.clone()),
+                limit: &|| {},
             }
             .run(Pass::FRESH)
             .unwrap();
@@ -1400,4 +1402,30 @@ fn resolve_cache_survives_a_stop_and_ends_with_the_job() {
             "a finished job starts over"
         );
     });
+}
+
+#[test]
+fn limit_follows_config_edits() {
+    let tmp = TempDir::new();
+    let cfg = tmp.path().join("config.toml");
+    let head = "owners = [\"a\"]\nprimary_uuid = \"0123abcd-2d54\"\n";
+    let limit = Limit {
+        dir: tmp.path(),
+        throttle: Arc::new(Throttle::from_mbit(80)),
+        seen: Mutex::default(),
+    };
+    // Whole-day windows, so the answer does not depend on the time of day.
+    for (text, want) in [
+        ("bandwidth_mbit = 8\n".to_string(), 1e6),
+        (
+            "bandwidth_windows = [{from=\"00:00\",to=\"00:00\",mbit=16}]\n".to_string(),
+            2e6,
+        ),
+        ("bandwidth_mbit = [broken\n".to_string(), 2e6),
+        ("bandwidth_mbit = 0\n".to_string(), 0.0),
+    ] {
+        std::fs::write(&cfg, format!("{head}{text}")).unwrap();
+        limit.refresh();
+        assert_eq!(limit.throttle.bytes_per_sec(), want, "{text}");
+    }
 }

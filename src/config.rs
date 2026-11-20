@@ -1,7 +1,8 @@
 use crate::paths::Paths;
 use crate::platform;
-use crate::schedule::Schedule;
+use crate::schedule::{Schedule, parse_clock};
 use anyhow::{Context, Result, bail};
+use jiff::civil::{DateTime, Time, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,9 @@ pub(crate) struct Config {
     pub transport: Transport,
     #[serde(default = "default_bandwidth")]
     pub bandwidth_mbit: u32,
+    /// Overrides `bandwidth_mbit` while one covers the time; the first match wins.
+    #[serde(default)]
+    pub bandwidth_windows: Vec<Window>,
     #[serde(default = "default_reserve")]
     pub reserve_percent: u8,
     #[serde(default)]
@@ -115,6 +119,87 @@ pub(crate) struct Schedules {
     pub personal: Option<Schedule>,
     pub local: Option<Schedule>,
     pub public: Option<Schedule>,
+}
+
+pub(crate) const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// A non-empty set of weekdays; bit i is `Weekday::to_monday_zero_offset() == i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub(crate) struct Days(u8);
+
+impl TryFrom<Vec<String>> for Days {
+    type Error = String;
+
+    fn try_from(names: Vec<String>) -> Result<Self, String> {
+        if names.is_empty() {
+            return Err("days lists no day; leave it out for every day".into());
+        }
+        let mut bits = 0;
+        for n in &names {
+            let i = DAYS
+                .iter()
+                .position(|d| d == n)
+                .ok_or_else(|| format!("bad day {n:?}: use mon tue wed thu fri sat sun"))?;
+            bits |= 1 << i;
+        }
+        Ok(Self(bits))
+    }
+}
+
+impl Days {
+    fn has(self, d: Weekday) -> bool {
+        self.0 >> d.to_monday_zero_offset() & 1 == 1
+    }
+
+    /// In week order.
+    #[cfg_attr(
+        not(feature = "gui"),
+        expect(dead_code, reason = "only the GUI lists a window's days")
+    )]
+    pub(crate) fn names(self) -> Vec<&'static str> {
+        (0..7)
+            .filter(|i| self.0 >> i & 1 == 1)
+            .map(|i| DAYS[i])
+            .collect()
+    }
+}
+
+fn clock<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Time, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_clock(&s)
+        .ok_or_else(|| serde::de::Error::custom(format!("bad time {s:?}: give HH:MM, like 08:00")))
+}
+
+/// `from` up to but not including `to`. A window that wraps midnight, or has `from == to`
+/// (a whole day), belongs to the day it opens on for `days`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Window {
+    #[serde(deserialize_with = "clock")]
+    pub from: Time,
+    #[serde(deserialize_with = "clock")]
+    pub to: Time,
+    /// 0 means unlimited.
+    pub mbit: u32,
+    #[serde(default)]
+    pub days: Option<Days>,
+}
+
+impl Window {
+    fn covers(&self, at: DateTime) -> bool {
+        let t = at.time();
+        let opened = if self.from < self.to {
+            (self.from <= t && t < self.to).then(|| at.date())
+        } else if t >= self.from {
+            Some(at.date())
+        } else if t < self.to {
+            at.date().yesterday().ok()
+        } else {
+            None
+        };
+        opened.is_some_and(|d| self.days.is_none_or(|days| days.has(d.weekday())))
+    }
 }
 
 fn default_bandwidth() -> u32 {
@@ -147,6 +232,14 @@ fn valid_folder_name(s: &str) -> bool {
 }
 
 impl Config {
+    /// The limit in Mbit/s at a local time, 0 for none.
+    pub(crate) fn mbit_at(&self, at: DateTime) -> u32 {
+        self.bandwidth_windows
+            .iter()
+            .find(|w| w.covers(at))
+            .map_or(self.bandwidth_mbit, |w| w.mbit)
+    }
+
     pub(crate) fn load(dir: &Path) -> Result<Self> {
         let file = dir.join("config.toml");
         let text = std::fs::read_to_string(&file).with_context(|| {
@@ -289,11 +382,79 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_windows_parse() {
+        let w = |t: &str| {
+            Config::parse(&format!(
+                "owners = [\"a\"]\n{UUID}bandwidth_windows = [{t}]\n"
+            ))
+        };
+        for (text, err) in [
+            ("{from=\"22:00\",to=\"07:00\",mbit=5}", ""),
+            ("{from=\"00:00\",to=\"00:00\",mbit=0}", ""),
+            (
+                "{from=\"8:00\",to=\"9:30\",mbit=5,days=[\"mon\",\"mon\",\"sun\"]}",
+                "",
+            ),
+            ("{from=\"24:00\",to=\"07:00\",mbit=5}", "bad time"),
+            ("{from=\"08:60\",to=\"07:00\",mbit=5}", "bad time"),
+            ("{from=\"8\",to=\"07:00\",mbit=5}", "bad time"),
+            (
+                "{from=\"08:00\",to=\"09:00\",mbit=5,days=[]}",
+                "lists no day",
+            ),
+            (
+                "{from=\"08:00\",to=\"09:00\",mbit=5,days=[\"moon\"]}",
+                "bad day",
+            ),
+            ("{from=\"08:00\",to=\"09:00\",mibt=5}", "unknown field"),
+            ("{from=\"08:00\",to=\"09:00\",mbit=-1}", "invalid"),
+        ] {
+            match (w(text), err) {
+                (Ok(_), "") => {}
+                (Err(e), want) if !want.is_empty() => {
+                    assert!(format!("{e:#}").contains(want), "{text}: {e:#}");
+                }
+                (r, _) => panic!("{text}: {:?}", r.map(|_| ())),
+            }
+        }
+    }
+
+    #[test]
+    fn mbit_at_table() {
+        let win = |t: &str| {
+            Config::parse(&format!(
+                "owners = [\"a\"]\n{UUID}bandwidth_mbit = 80\nbandwidth_windows = [{t}]\n"
+            ))
+            .unwrap()
+        };
+        let a =
+            "{from=\"08:00\",to=\"23:00\",mbit=20,days=[\"mon\",\"tue\",\"wed\",\"thu\",\"fri\"]}";
+        let b = "{from=\"23:00\",to=\"07:00\",mbit=5,days=[\"fri\"]}";
+        let c = "{from=\"00:00\",to=\"00:00\",mbit=0,days=[\"sat\",\"sun\"]}";
+        // 2026-11-18 is a Wednesday.
+        let at = |d: i8, h: i8, m: i8| jiff::civil::datetime(2026, 11, 16 + d, h, m, 0, 0);
+        let first = win(&format!("{a},{b},{c}"));
+        let reordered = win(&format!("{a},{c},{b}"));
+        for (name, cfg, when, want) in [
+            ("wed 08:00", &first, at(2, 8, 0), 20),
+            ("wed 23:00", &first, at(2, 23, 0), 80),
+            ("fri 23:30", &first, at(4, 23, 30), 5),
+            ("sat 03:00 fri window first", &first, at(5, 3, 0), 5),
+            ("sat 03:00 weekend first", &reordered, at(5, 3, 0), 0),
+            ("thu 03:00", &first, at(3, 3, 0), 80),
+            ("sun 23:59", &first, at(6, 23, 59), 0),
+            ("sat 07:00 closed", &first, at(5, 7, 0), 0),
+        ] {
+            assert_eq!(cfg.mbit_at(when), want, "{name}");
+        }
+    }
+
+    #[test]
     fn defaults_cover_only_the_optional_keys() {
         let c = Config::parse(&format!("owners = [\"a\"]\n{UUID}")).unwrap();
         assert_eq!(c.transport, Transport::Ssh);
         assert_eq!(c.reserve_percent, 10);
-        assert!(c.local.is_empty());
+        assert!(c.local.is_empty() && c.bandwidth_windows.is_empty());
         let s = &c.schedule;
         assert!(s.personal.is_none() && s.local.is_none() && s.public.is_none());
     }
