@@ -249,7 +249,10 @@ fn tmp_of(path: &Path) -> PathBuf {
 }
 
 /// Replaces `path` atomically and durably.
-fn put(path: &Path, write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>) -> Result<()> {
+pub(crate) fn put(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
+) -> Result<()> {
     let tmp = tmp_of(path);
     let ctx = || path.display().to_string();
     let mut w = BufWriter::new(create_fresh(&tmp).with_context(ctx)?);
@@ -1201,6 +1204,7 @@ impl Gen {
                         fetches,
                         more: true,
                         whole: None,
+                        bad: None,
                     }));
                 }
             }
@@ -1492,6 +1496,7 @@ impl Gen {
                     fetches,
                     more: true,
                     whole: Some(self.whole()),
+                    bad: None,
                 }));
             }
             let mut missing = Vec::new();

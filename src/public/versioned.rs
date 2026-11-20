@@ -10,6 +10,7 @@ use crate::copy::exec::plain_file;
 use crate::mirror::generation::valid_path;
 use crate::net::download::{Expect, Fetch, part_expect};
 use crate::platform;
+use crate::queue::bad;
 use crate::resolve::{HF_BASE, Item, hex};
 use crate::verify::{SIDE_LIMIT, Verifier, side};
 use anyhow::{Context, Result, bail};
@@ -392,7 +393,8 @@ pub(crate) fn prepare(
                     side_links.push((from, side(&dst, url)));
                 }
             } else {
-                if !dst.exists() {
+                let fetch_main = !dst.exists();
+                if fetch_main {
                     let reuse = (!it.sha256.is_empty())
                         .then(|| {
                             index
@@ -422,18 +424,31 @@ pub(crate) fn prepare(
                     }
                     fetches.push(f);
                 }
+                // A file fetched again brings fresh side files: a re-signed .sig is what ends
+                // a hold in `queue/bad.rs`, and it must not be checked against the stale one.
                 for url in sides {
                     let beside = side(&dst, url);
-                    if !beside.exists() && !fetches.iter().any(|f| f.dest == beside) {
-                        fetches.push(Fetch {
-                            url: url.clone(),
-                            dest: beside,
-                            size: None,
-                            limit: SIDE_LIMIT,
-                            expect: Expect::None,
-                            reuse: None,
-                        });
+                    if fetches.iter().any(|f| f.dest == beside) {
+                        continue;
                     }
+                    if fetch_main {
+                        match std::fs::remove_file(&beside) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(e).with_context(|| beside.display().to_string());
+                            }
+                            _ => {}
+                        }
+                    } else if beside.exists() {
+                        continue;
+                    }
+                    fetches.push(Fetch {
+                        url: url.clone(),
+                        dest: beside,
+                        size: None,
+                        limit: SIDE_LIMIT,
+                        expect: Expect::None,
+                        reuse: None,
+                    });
                 }
             }
             slots.push(Slot {
@@ -551,8 +566,15 @@ impl Staged {
 
     /// Verifies every downloaded file and, only if all pass, makes the stage the newest
     /// version and prunes to `keep`. A file that fails is deleted with its signature and sums
-    /// files, so the next run fetches them again; the rest of the stage is kept.
-    pub(crate) fn publish(self, verifier: &Verifier, now: Timestamp) -> Result<String> {
+    /// files, so the next run fetches them again; the rest of the stage is kept. Each such
+    /// file is added to `refused` for the bad-file ledger, unless it was already gone (a
+    /// vanished drive is no verdict on the file).
+    pub(crate) fn publish(
+        self,
+        verifier: &Verifier,
+        now: Timestamp,
+        refused: &mut Vec<bad::Entry>,
+    ) -> Result<String> {
         let mut known = HashMap::new();
         let mut entries = Vec::new();
         let mut errs = Vec::new();
@@ -567,11 +589,16 @@ impl Staged {
                     Ok(v) => v,
                     Err(e) => {
                         let it = &slot.item;
+                        let sides = [&it.sig_url, &it.sums_url, &it.sums_sig_url];
+                        if std::fs::symlink_metadata(&dst).is_ok() {
+                            let mut urls = vec![it.url.clone()];
+                            urls.extend(sides.into_iter().flatten().cloned());
+                            let tag = expect(it).map(|e| e.tag()).unwrap_or_default();
+                            let reason = format!("{e:#}");
+                            refused.push(bad::Entry::new(urls, tag, it.size, &reason));
+                        }
                         let _ = std::fs::remove_file(&dst);
-                        for url in [&it.sig_url, &it.sums_url, &it.sums_sig_url]
-                            .into_iter()
-                            .flatten()
-                        {
+                        for url in sides.into_iter().flatten() {
                             let _ = std::fs::remove_file(side(&dst, url));
                         }
                         errs.push(format!("{}: {e:#}", slot.rel));

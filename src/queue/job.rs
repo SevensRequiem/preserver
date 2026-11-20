@@ -205,6 +205,13 @@ pub(crate) struct Job {
     /// The last `Control::retry` the worker acted on.
     #[serde(default)]
     pub retry_seen: u32,
+    /// The last `Control::recheck` a finished run honoured.
+    #[serde(default)]
+    pub recheck_seen: u32,
+    /// Failed only because files that failed verification before were skipped, upstream
+    /// unchanged: no new notification.
+    #[serde(default)]
+    pub known_bad: bool,
 }
 
 /// `<id>.ctl` (or `all.ctl` for every job): written by the CLI and tray only.
@@ -216,6 +223,9 @@ pub(crate) struct Control {
     pub priority: Option<u32>,
     /// Bumped by `queue retry`; a level would re-fire on every scan, a counter fires once.
     pub retry: u32,
+    /// Bumped only by a person (Retry, `public --recheck`), never by the scheduler: the next
+    /// run downloads files that `queue/bad.rs` would skip.
+    pub recheck: u32,
 }
 
 /// Ids are lower-case hex and dashes: safe as file names, and never `all`.
@@ -267,5 +277,13 @@ mod tests {
             transport: Some(Transport::Ssh)
         }));
         assert!(!JobKind::Local.same(&JobKind::Github { transport: None }));
+        let old: Job = serde_json::from_str(
+            r#"{"id":"a","kind":"local","priority":1,"state":"queued","attempts":0,
+            "drive":"0123-ABCD","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!((old.recheck_seen, old.known_bad), (0, false));
+        let ctl: Control = serde_json::from_str(r#"{"retry":3}"#).unwrap();
+        assert_eq!((ctl.retry, ctl.recheck), (3, 0));
     }
 }

@@ -82,6 +82,8 @@ impl Store {
                 progress: Progress::default(),
                 error: None,
                 retry_seen: 0,
+                recheck_seen: 0,
+                known_bad: false,
             };
             let file = self.file(&job.id, "json")?;
             match platform::private_file_new(&file) {

@@ -1,3 +1,4 @@
+pub(crate) mod bad;
 mod job;
 mod sched;
 mod store;

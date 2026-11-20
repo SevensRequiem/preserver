@@ -46,6 +46,9 @@ pub enum Command {
         /// Run here even when the daemon runs, instead of queueing for it
         #[arg(long, conflicts_with = "list")]
         foreground: bool,
+        /// Download files that failed verification before, even when upstream looks unchanged
+        #[arg(long, conflicts_with_all = ["list", "dry_run"])]
+        recheck: bool,
     },
     /// Inspect and control the job queue
     Queue {
@@ -232,13 +235,16 @@ pub fn run(cli: Cli) -> Result<()> {
             first_pass,
             list,
             foreground,
+            recheck,
         } => {
             let (mut paths, cfg) = load()?;
             if list {
                 print!("{}", public::list_report(&mut paths, &cfg)?);
                 return Ok(());
             }
-            public::run(&mut paths, &cfg, &sets, dry_run, first_pass, foreground)
+            public::run(
+                &mut paths, &cfg, &sets, dry_run, first_pass, foreground, recheck,
+            )
         }
         Command::Copy {
             target,

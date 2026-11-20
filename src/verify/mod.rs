@@ -200,7 +200,9 @@ impl Verifier<'_> {
                 return Ok(());
             }
             let msg = format!(
-                "{url} changed: recorded {old}, now {hash}; delete its line from {} to accept",
+                "{url} changed: recorded {old}, now {hash}; delete its line from {} to accept it, \
+                 then Retry or run 'preserver public --recheck', since an unchanged file is not \
+                 downloaded again",
                 self.tofu.display()
             );
             (self.note)(true, "Unsigned download changed", &msg);

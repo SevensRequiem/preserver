@@ -1,10 +1,11 @@
 //! The worker: one job at a time, its files over `STREAMS` threads with at most `PER_HOST` per
 //! host, per-file retries with backoff, and the controls applied while it runs.
 
+use super::bad::{self, Bad};
 use super::job::{BlockReason, Job, JobState, Lane, Progress};
 use super::store::Store;
 use crate::config::DriveId;
-use crate::net::download::{Downloader, Fail, Fetch, STREAMS};
+use crate::net::download::{Downloader, Fail, Fetch, STREAMS, Seen};
 use crate::platform::DriveAt;
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, HashMap};
@@ -17,7 +18,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) const PER_HOST: usize = 2;
 /// Tries in a row without progress per file per run; after that the job is Failed and the
-/// next run retries it.
+/// next run retries it. A checksum mismatch of a body fetched whole gets one try: it is what
+/// upstream serves (`Fail::Mismatch`).
 pub(crate) const TRIES: u32 = 6;
 
 /// The wait after the `n`th failure (from 0): 5 s·2ⁿ capped at 10 min, less up to a quarter
@@ -49,6 +51,10 @@ struct State {
     /// Plan positions that finished verified.
     ok: Vec<usize>,
     failed: Vec<String>,
+    /// Files skipped by the bad-file ledger; each also has its line in `failed`.
+    held: usize,
+    /// Plan positions whose whole download did not match, with what the server said.
+    mismatched: Vec<(usize, Seen)>,
     drive_gone: bool,
 }
 
@@ -67,13 +73,19 @@ struct Pool<'a> {
 }
 
 impl<'a> Pool<'a> {
-    fn new(fetches: &'a [Fetch]) -> Self {
+    /// `held[i]`, when given, is why fetch `i` is not downloaded at all.
+    fn new(fetches: &'a [Fetch], held: &[Option<String>]) -> Self {
         let hosts: Vec<String> = fetches.iter().map(Fetch::host).collect();
         let mut st = State {
             tries: vec![0; fetches.len()],
             ..State::default()
         };
         for (i, h) in hosts.iter().enumerate() {
+            if let Some(Some(msg)) = held.get(i) {
+                st.failed.push(msg.clone());
+                st.held += 1;
+                continue;
+            }
             st.queues.entry(h.clone()).or_default().insert(i);
         }
         Self {
@@ -165,6 +177,10 @@ impl<'a> Pool<'a> {
             Err(_) if gone => {
                 st.drive_gone = true;
                 self.halt();
+            }
+            Err(Fail::Mismatch { msg, seen }) => {
+                st.failed.push(msg);
+                st.mismatched.push((i, seen));
             }
             Err(Fail::Permanent(msg)) => st.failed.push(msg),
             Err(e @ (Fail::Retry { .. } | Fail::Disk(_))) => {
@@ -358,6 +374,8 @@ pub(crate) struct Planned {
     pub fetches: Vec<Fetch>,
     pub more: bool,
     pub whole: Option<Whole>,
+    /// The ledger of files that never verify: consulted before the batch, updated after it.
+    pub bad: Option<Bad>,
 }
 
 pub(crate) enum Work<'a> {
@@ -432,7 +450,13 @@ impl<'a> Worker<'a> {
         matches!((self.drive)(&job.drive), DriveAt::Mounted(r) if r.exists())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one job's life: plan, batches, outcome, settle"
+    )]
     fn run_job(&self, mut job: Job) -> Result<()> {
+        // Set again by this run only; an early failure must not inherit the last run's mark.
+        job.known_bad = false;
         let root = match (self.drive)(&job.drive) {
             DriveAt::Mounted(root) => root,
             DriveAt::Unmounted => {
@@ -462,6 +486,10 @@ impl<'a> Worker<'a> {
         };
         job.attempts += 1;
         job.error = None;
+        let c = self.store.control(Some(&job.id));
+        let recheck = c.recheck > job.recheck_seen;
+        // False when the run ended before its batches did, so a recheck stays pending.
+        let mut reached_end = true;
         // Files and bytes finished in earlier batches, when the planner gives no total.
         let mut seen = (0, 0);
         let mut ok = Vec::new();
@@ -478,9 +506,11 @@ impl<'a> Worker<'a> {
                 fetches,
                 more,
                 whole,
+                bad,
             } = planned;
             if more && fetches.is_empty() {
                 job.error = Some("planner returned an empty batch".into());
+                reached_end = false;
                 break JobState::Failed;
             }
             let base = whole
@@ -500,7 +530,8 @@ impl<'a> Worker<'a> {
             };
             self.store.save(&mut job)?;
 
-            let (st, halt, bytes) = self.batch(&job, &fetches, base);
+            let hold = bad.as_ref().filter(|_| !recheck);
+            let (st, halt, bytes) = self.batch(&job, &fetches, base, hold, bad.as_ref());
             job.progress.bytes_done = base.1 + bytes;
             job.progress.files_done = base.0 + st.files_done;
             job.progress.rate_bps = 0;
@@ -525,19 +556,40 @@ impl<'a> Worker<'a> {
                 }
                 Err(e) => {
                     job.error = Some(format!("{e:#}"));
+                    reached_end = false;
                     break JobState::Failed;
                 }
             }
         };
+        // A yielded, paused or blocked run has not downloaded everything yet: a recheck asked
+        // for stays pending until a run gets to the end.
+        if reached_end
+            && !matches!(
+                state,
+                JobState::Queued | JobState::Paused | JobState::Blocked(_)
+            )
+        {
+            job.recheck_seen = c.recheck;
+        }
         job.state = state;
         (self.settle)(&mut job, &root, &ok);
         self.store.save(&mut job)
     }
 
-    /// Downloads one batch over the pool, saving progress every second until it ends. Returns
-    /// the pool's state, what halted it and the bytes fetched.
-    fn batch(&self, job: &Job, fetches: &[Fetch], base: (u64, u64)) -> (State, Option<Halt>, u64) {
-        let pool = Pool::new(fetches);
+    /// Downloads one batch over the pool, saving progress every second until it ends. Fetches
+    /// the `hold` ledger knows as bad are skipped; the `record` ledger learns the outcome.
+    /// Returns the pool's state, what halted it and the bytes fetched.
+    fn batch(
+        &self,
+        job: &Job,
+        fetches: &[Fetch],
+        base: (u64, u64),
+        hold: Option<&Bad>,
+        record: Option<&Bad>,
+    ) -> (State, Option<Halt>, u64) {
+        let stop = || halt_requested(self.store, &job.id).is_some() || outranked(self.store, job);
+        let skip = hold.map_or_else(Vec::new, |b| bad::held(b, fetches, self.dl, &stop));
+        let pool = Pool::new(fetches, &skip);
         let done = AtomicU64::new(0);
         let drive_ok = || self.drive_ok(job);
         let mut halt = None;
@@ -568,6 +620,9 @@ impl<'a> Worker<'a> {
             }
         });
         let st = pool.st.into_inner().unwrap_or_else(PoisonError::into_inner);
+        if let Some(b) = record {
+            bad::update(b, fetches, &st.ok, &st.mismatched);
+        }
         (st, halt, done.load(Ordering::Relaxed))
     }
 
@@ -668,9 +723,14 @@ fn stopped(job: &mut Job, st: State, halt: Option<Halt>, fetches: &[Fetch]) -> J
         JobState::Queued
     } else {
         let n = st.failed.len();
+        job.known_bad = st.held > 0 && st.held == n;
+        let held = st.held;
         let mut msg = st.failed.into_iter().take(3).collect::<Vec<_>>().join("; ");
         if n > 3 {
             msg = format!("{msg} (and {} more)", n - 3);
+        }
+        if held > 0 {
+            msg.push_str(" (Retry or 'preserver public --recheck' downloads it again)");
         }
         job.error = Some(msg);
         JobState::Failed
@@ -711,7 +771,7 @@ mod tests {
             expect: Expect::None,
             reuse: None,
         }];
-        let p = Pool::new(&fetches);
+        let p = Pool::new(&fetches, &[]);
         let fail = |progressed| {
             {
                 let mut st = p.lock();
@@ -784,7 +844,7 @@ mod tests {
                 reuse: None,
             })
             .collect();
-        let pool = Pool::new(&fetches);
+        let pool = Pool::new(&fetches, &[]);
         let d = dl(0);
         let done = AtomicU64::new(0);
         std::thread::scope(|s| {
@@ -1195,6 +1255,130 @@ mod tests {
         let j = r.store.job(&job.id).unwrap();
         assert_eq!((j.state, j.attempts), (JobState::Done, 1));
     }
+    #[test]
+    fn a_mismatch_fails_at_once_and_is_held_next_run() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        let set_dir = r.mnt().join("set");
+        std::fs::create_dir_all(&set_dir).unwrap();
+        let wrong = Mutex::new(true);
+        let plan = |_: &Job, root: &Path, _: &[usize]| {
+            let mut f = r.fetch(root);
+            if *wrong.lock().unwrap() {
+                f.expect = Expect::Sha256([0; 32]);
+            }
+            Ok(Work::Fetch(Planned {
+                fetches: vec![f],
+                bad: Some(Bad {
+                    set_dir: set_dir.clone(),
+                    known: std::collections::HashSet::new(),
+                }),
+                ..Planned::default()
+            }))
+        };
+        let ledger = || std::fs::read_to_string(set_dir.join(".preserver/bad.json")).ok();
+        // Full downloads and probes since the last call.
+        let gets = || {
+            let hits = r.srv.hits();
+            r.srv.clear_log();
+            let probes = hits
+                .iter()
+                .filter(|h| h.range.as_deref() == Some("bytes=0-0"))
+                .count();
+            (hits.len() - probes, probes)
+        };
+
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, false));
+        assert_eq!(gets(), (1, 0), "a whole mismatch gets one try");
+        assert!(ledger().unwrap().contains(&r.srv.url("big.iso")));
+
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, true));
+        let err = j.error.unwrap_or_default();
+        assert!(
+            err.starts_with("skipped ") && err.contains("since"),
+            "{err}"
+        );
+        assert!(err.contains("--recheck"), "{err}");
+        assert_eq!(gets(), (0, 1));
+
+        run_plan(&r, &|_, _, _| Err(anyhow!("resolver down")));
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(
+            (j.state, j.known_bad),
+            (JobState::Failed, false),
+            "a new failure is news"
+        );
+
+        r.srv.set(|b| b.etag = Some("\"v2\"".into()));
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.known_bad), (JobState::Failed, false));
+        assert_eq!(gets(), (1, 1), "a changed upstream is downloaded");
+
+        r.store
+            .edit_control(Some(&job.id), |c| c.recheck += 1)
+            .unwrap();
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.recheck_seen), (JobState::Failed, 1));
+        assert_eq!(gets(), (1, 0), "a recheck downloads without probing");
+
+        *wrong.lock().unwrap() = false;
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!(j.state, JobState::Done, "{:?}", j.error);
+        assert!(!ledger().unwrap().contains("big.iso"));
+    }
+
+    #[test]
+    fn a_pause_keeps_a_pending_recheck() {
+        let r = Rig::new(6 * CP, 2 << 20);
+        let job = r.job();
+        r.store
+            .edit_control(Some(&job.id), |c| c.recheck = 1)
+            .unwrap();
+        r.run_until(3 * CP / 2, || {
+            r.store
+                .edit_control(Some(&job.id), |c| c.pause = true)
+                .unwrap();
+        });
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.recheck_seen), (JobState::Paused, 0));
+        r.store
+            .edit_control(Some(&job.id), |c| c.pause = false)
+            .unwrap();
+        r.run();
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.recheck_seen), (JobState::Done, 1));
+    }
+
+    #[test]
+    fn a_plan_error_after_a_batch_keeps_a_pending_recheck() {
+        let r = Rig::new(1000, 0);
+        let job = r.job();
+        r.store
+            .edit_control(Some(&job.id), |c| c.recheck = 1)
+            .unwrap();
+        let plan = |_: &Job, root: &Path, ok: &[usize]| {
+            if ok.is_empty() {
+                Ok(Work::Fetch(Planned {
+                    fetches: vec![r.fetch(root)],
+                    more: true,
+                    ..Planned::default()
+                }))
+            } else {
+                Err(anyhow!("listing gone"))
+            }
+        };
+        run_plan(&r, &plan);
+        let j = r.store.job(&job.id).unwrap();
+        assert_eq!((j.state, j.recheck_seen), (JobState::Failed, 0));
+    }
+
     fn run_plan<'a>(r: &'a Rig, plan: &'a Planner<'a>) {
         run_settle(r, plan, &|_, _, _| {});
     }
@@ -1240,6 +1424,7 @@ mod tests {
                     files_done: (n * (n - 1) / 2) as u64,
                     bytes_done: 1000 * (n * (n - 1) / 2) as u64,
                 }),
+                bad: None,
             }))
         };
         let settled = Mutex::new(Vec::new());
@@ -1281,6 +1466,7 @@ mod tests {
                 fetches: vec![r.fetch(root)],
                 more: true,
                 whole: None,
+                bad: None,
             }))
         });
         assert_eq!(r.store.job(&job.id).unwrap().state, JobState::Failed);
@@ -1420,6 +1606,7 @@ mod tests {
                     fetches: vec![r.fetch(root)],
                     more: true,
                     whole: None,
+                    bad: None,
                 }))
             };
             run_plan(&r, &plan);
@@ -1450,6 +1637,7 @@ mod tests {
                 fetches: vec![r.fetch(root)],
                 more: true,
                 whole: None,
+                bad: None,
             }))
         });
         let j = r.store.job(&job.id).unwrap();

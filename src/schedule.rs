@@ -378,6 +378,11 @@ mod tests {
         let ctl = |id: &str| store.control(Some(id));
         assert_eq!(ctl(&stopped[0]).retry, 1, "the key is asked for once");
         assert_eq!(ctl(&stopped[1]).retry, 1, "the failed set is retried once");
+        assert_eq!(
+            ctl(&stopped[1]).recheck,
+            0,
+            "only a person asks for files known bad"
+        );
         assert_eq!(ctl(&stopped[2]).retry, 0, "paused stays paused");
         assert_eq!(queued, Some(now.timestamp()));
         let jobs = store.jobs().unwrap();

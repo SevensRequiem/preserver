@@ -85,15 +85,19 @@ impl Fetch {
 
     /// The URL's host name, lower case, without user info or port: the per-host limit's key.
     pub(crate) fn host(&self) -> String {
-        let rest = self.url.split_once("://").map_or("", |(_, r)| r);
-        let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
-        let host = match auth.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or_default(),
-            None => auth.split(':').next().unwrap_or_default(),
-        };
-        host.to_ascii_lowercase()
+        host_of(&self.url)
     }
+}
+
+pub(crate) fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or("", |(_, r)| r);
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    let host = match auth.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => auth.split(':').next().unwrap_or_default(),
+    };
+    host.to_ascii_lowercase()
 }
 
 fn suffixed(p: &Path, suffix: &str) -> PathBuf {
@@ -112,6 +116,12 @@ pub(crate) enum Fail {
         progressed: bool,
     },
     Permanent(String),
+    /// A body fetched whole did not hash to the published value: what upstream serves, so
+    /// another try in the same run would only fetch it again. `seen` identifies that version.
+    Mismatch {
+        msg: String,
+        seen: Seen,
+    },
     /// A local file operation failed: the drive may be gone.
     Disk(io::Error),
     /// The stop flag was raised (pause, cancel, unplug elsewhere).
@@ -121,7 +131,9 @@ pub(crate) enum Fail {
 impl std::fmt::Display for Fail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Retry { msg, .. } | Self::Permanent(msg) => f.write_str(msg),
+            Self::Retry { msg, .. } | Self::Permanent(msg) | Self::Mismatch { msg, .. } => {
+                f.write_str(msg)
+            }
             Self::Disk(e) => write!(f, "write: {e}"),
             Self::Stopped => f.write_str("stopped"),
         }
@@ -161,6 +173,10 @@ impl Fail {
                 progressed,
             },
             Self::Permanent(msg) => Self::Permanent(format!("{at}: {msg}")),
+            Self::Mismatch { msg, seen } => Self::Mismatch {
+                msg: format!("{at}: {msg}"),
+                seen,
+            },
             other => other,
         }
     }
@@ -187,6 +203,21 @@ impl Validator {
         match self {
             Self::Etag(v) | Self::LastModified(v) => v,
         }
+    }
+}
+
+/// What a server said about one version of a file: its validator, length and the host that
+/// finally answered. Equal `Seen`s before and after mean upstream has not changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Seen {
+    validator: Option<Validator>,
+    len: Option<u64>,
+    host: String,
+}
+
+impl Seen {
+    pub(crate) fn has_validator(&self) -> bool {
+        self.validator.is_some()
     }
 }
 
@@ -243,6 +274,10 @@ struct Part {
     saved: u64,
     total: Option<u64>,
     validator: Option<Validator>,
+    /// The host of the hop that sent the body.
+    host: String,
+    /// The bytes before `offset` came from a sidecar, i.e. an earlier call.
+    resumed: bool,
     h256: Resumable<S256>,
     h512: Option<Resumable<S512>>,
 }
@@ -257,6 +292,8 @@ impl Part {
         self.saved = 0;
         self.total = None;
         self.validator = None;
+        self.host.clear();
+        self.resumed = false;
         self.h256 = Resumable::new();
         if self.h512.is_some() {
             self.h512 = Some(Resumable::new());
@@ -413,6 +450,7 @@ impl Downloader {
             }
             let (resp, hop, want) = self.request(f, part, ranged)?;
             let at = via(&f.url, &hop);
+            part.host = host_of(&hop);
             let status = resp.status().as_u16();
             let head = resp.headers().clone();
             let mut body = resp.into_body().into_reader();
@@ -484,6 +522,9 @@ impl Downloader {
                         ranged = false;
                         continue;
                     }
+                    // Recorded for `Fail::Mismatch` only: the 200 path never checkpoints.
+                    part.validator = Validator::from_headers(&head);
+                    part.total = len;
                     self.copy(&mut body, part, len, f, stop, done, None)
                         .map_err(|e| e.at(&at))?;
                     if let Some(s) = f.size.filter(|s| part.offset > *s) {
@@ -526,6 +567,8 @@ impl Downloader {
             saved: 0,
             total: None,
             validator: None,
+            host: String::new(),
+            resumed: false,
             h256: Resumable::new(),
             h512: wants512.then(Resumable::new),
         };
@@ -546,6 +589,7 @@ impl Downloader {
                 p.saved = st.offset;
                 p.total = Some(st.total);
                 p.validator = Some(st.validator);
+                p.resumed = true;
                 p.h256 = Resumable::resume(st.sha256, st.offset);
                 p.h512 = st.sha512.map(|s| Resumable::resume(s, st.offset));
             }
@@ -671,7 +715,20 @@ impl Downloader {
         if !ok {
             remove(side)?;
             remove(&f.part())?;
-            return Err(retry(format!("{}: checksum mismatch", f.url)));
+            let msg = format!("{}: checksum mismatch", f.url);
+            // A body fetched whole over TLS is what upstream serves. A resumed one may be a
+            // splice of two versions behind a careless server: one more try, from zero.
+            if p.resumed {
+                return Err(retry(msg));
+            }
+            return Err(Fail::Mismatch {
+                msg,
+                seen: Seen {
+                    validator: p.validator,
+                    len: p.total,
+                    host: p.host,
+                },
+            });
         }
         p.file.sync_data().map_err(Fail::Disk)?;
         drop(p.file);
@@ -778,6 +835,28 @@ impl Downloader {
             return Err(Fail::Disk(e));
         }
         Ok(true)
+    }
+
+    /// What the server says now about `url`, from a one-byte ranged GET whose body is dropped
+    /// unread: `None` for any failure or status other than 200 and 206. Not throttled.
+    pub(crate) fn probe(&self, url: &str) -> Option<Seen> {
+        let (resp, hop) = Self::call(url, Duration::from_secs(30), |hop| {
+            self.agent.get(hop).header("Range", "bytes=0-0")
+        })
+        .ok()?;
+        let head = resp.headers();
+        let len = match resp.status().as_u16() {
+            206 => content_range(head).map(|(_, _, t)| t),
+            200 => head
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()?.parse().ok()),
+            _ => return None,
+        };
+        Some(Seen {
+            validator: Validator::from_headers(head),
+            len,
+            host: host_of(&hop),
+        })
     }
 
     /// One request for a document or its headers: a 200 or an error, with whether to try again.
@@ -1206,16 +1285,121 @@ mod tests {
 
     #[test]
     fn checksum_mismatch_never_becomes_visible() {
+        for ranges in [true, false] {
+            let tmp = TempDir::new();
+            let data = body(100_000, 7);
+            let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+            srv.set(|b| b.ranges = ranges);
+            let mut f = fetch(&srv, tmp.path(), "e.bin", &data);
+            f.expect = Expect::Sha512([0; 64]);
+            let done = AtomicU64::new(0);
+            let err = dl(0).fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+            let Fail::Mismatch { msg, seen } = &err else {
+                panic!("ranges {ranges}: {err}");
+            };
+            assert!(msg.contains("checksum mismatch"), "ranges {ranges}: {msg}");
+            assert_eq!(
+                seen,
+                &Seen {
+                    validator: Some(Validator::Etag("\"v1\"".into())),
+                    len: Some(100_000),
+                    host: "127.0.0.1".into(),
+                },
+                "ranges {ranges}"
+            );
+            assert_eq!(done.load(Ordering::Relaxed), 0);
+            assert!(!f.dest.exists() && !f.part().exists() && !f.sidecar().exists());
+        }
+    }
+
+    #[test]
+    fn a_resumed_part_that_mismatches_retries_from_zero() {
         let tmp = TempDir::new();
-        let data = body(100_000, 7);
+        let data = body(5 * CP, 1);
         let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
-        let mut f = fetch(&srv, tmp.path(), "e.bin", &data);
-        f.expect = Expect::Sha512([0; 64]);
+        let d = dl(0);
+        let f = fetch(&srv, tmp.path(), "a.iso", &data);
         let done = AtomicU64::new(0);
-        let err = dl(0).fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
-        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        interrupted(&srv, &d, &f, &done);
+        // Another version under the same ETag behind a server that ignores If-Range: the
+        // resumed part becomes a splice.
+        srv.set(|b| {
+            b.body = body(5 * CP, 2);
+            b.if_range = false;
+        });
+        let err = d.fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Fail::Retry {
+                    progressed: false,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(!f.part().exists() && !f.sidecar().exists());
+        srv.clear_log();
+        let err = d.fetch(&f, &AtomicBool::new(false), &done).unwrap_err();
+        assert!(matches!(err, Fail::Mismatch { .. }), "{err}");
+        assert_eq!(srv.hits()[0].range.as_deref(), Some("bytes=0-"));
+
+        // A resumed part that a 200 resets inside the call was fetched whole after all.
+        let g = fetch(&srv, tmp.path(), "b.iso", &data);
+        srv.set(|b| {
+            b.body = data.clone();
+            b.if_range = true;
+        });
+        interrupted(&srv, &d, &g, &done);
+        srv.set(|b| {
+            b.body = body(5 * CP, 3);
+            b.ranges = false;
+        });
+        let err = d.fetch(&g, &AtomicBool::new(false), &done).unwrap_err();
+        assert!(matches!(err, Fail::Mismatch { .. }), "{err}");
         assert_eq!(done.load(Ordering::Relaxed), 0);
-        assert!(!f.dest.exists() && !f.part().exists());
+    }
+
+    #[test]
+    fn probe_reads_the_validator_and_length() {
+        let data = body(5000, 4);
+        let mirror = Server::start("127.0.0.2", Behaviour::new(data.clone()));
+        let srv = Server::start("127.0.0.1", Behaviour::new(data));
+        srv.set(|b| {
+            b.replies.insert(
+                "lm".into(),
+                (
+                    200,
+                    "Last-Modified: Wed, 21 Oct 2025 07:28:00 GMT\r\n".into(),
+                ),
+            );
+            b.replies.insert("gone".into(), (404, String::new()));
+            b.redirects.insert("moved".into(), mirror.url("x"));
+        });
+        let d = dl(0);
+        let etag = Some(Validator::Etag("\"v1\"".into()));
+        let seen = |validator: Option<Validator>, len: u64, host: &str| Seen {
+            validator,
+            len: Some(len),
+            host: host.into(),
+        };
+        assert_eq!(
+            d.probe(&srv.url("a")),
+            Some(seen(etag.clone(), 5000, "127.0.0.1"))
+        );
+        assert_eq!(srv.hits()[0].range.as_deref(), Some("bytes=0-0"));
+        let lm = Validator::LastModified("Wed, 21 Oct 2025 07:28:00 GMT".into());
+        assert_eq!(
+            d.probe(&srv.url("lm")),
+            Some(seen(Some(lm), 0, "127.0.0.1"))
+        );
+        assert_eq!(d.probe(&srv.url("gone")), None);
+        assert_eq!(
+            d.probe(&srv.url("moved")),
+            Some(seen(etag.clone(), 5000, "127.0.0.2"))
+        );
+        srv.set(|b| b.ranges = false);
+        assert_eq!(d.probe(&srv.url("a")), Some(seen(etag, 5000, "127.0.0.1")));
     }
 
     #[test]

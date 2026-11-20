@@ -249,8 +249,8 @@ pub(crate) fn snapshot(
     }
 }
 
-/// Mounts the job's drives, then asks its worker to run it again (a paused one too). The
-/// control file wakes the daemon by itself.
+/// Mounts the job's drives, then asks its worker to run it again (a paused one too), this time
+/// downloading files the bad-file ledger would skip. The control file wakes the daemon by itself.
 pub(crate) fn retry(paths: &Paths, id: &str) -> Result<()> {
     let store = Store::new(paths.queue.clone());
     let job = store.job(id)?;
@@ -264,6 +264,7 @@ pub(crate) fn retry(paths: &Paths, id: &str) -> Result<()> {
     }
     store.edit_control(Some(id), |c| {
         c.retry += 1;
+        c.recheck += 1;
         c.pause = false;
     })
 }

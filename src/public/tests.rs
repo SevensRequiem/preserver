@@ -1730,3 +1730,124 @@ fn a_tampered_reuse_source_is_downloaded_instead() {
     let new = t.set_dir().join(&version_dirs(&t.set_dir())[0]);
     assert_eq!(std::fs::read(new.join("src/a-2.iso")).unwrap(), data);
 }
+
+#[test]
+fn a_fetched_file_brings_fresh_side_files() {
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("public/demo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = Source {
+        name: "src".into(),
+        ..Source::default()
+    };
+    let set = catalog(2, vec![src.clone()]).sets.remove(0);
+    let item = |name: &str| Item {
+        sig_url: Some(format!("https://e.example/{name}.sig")),
+        sums_url: Some("https://e.example/SUMS".into()),
+        ..hash_item(name, name.as_bytes())
+    };
+    let items = vec![item("a"), item("b")];
+    let first = prepared(&set, &dir, &src, items.clone());
+    let names = |fs: &[Fetch]| -> Vec<String> {
+        let mut n: Vec<String> = fs
+            .iter()
+            .map(|f| f.dest.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names(&first), ["SUMS", "a", "a.sig", "b", "b.sig"]);
+
+    // A stale signature in the stage goes when its file is fetched again.
+    let sig = fetch_of(&first, "a.sig").dest.clone();
+    std::fs::write(&sig, b"stale").unwrap();
+    let again = prepared(&set, &dir, &src, items.clone());
+    assert_eq!(names(&again), ["SUMS", "a", "a.sig", "b", "b.sig"]);
+    assert!(!sig.exists());
+
+    // With its file present, the signature stays and is not fetched.
+    std::fs::write(&fetch_of(&first, "a").dest, b"a").unwrap();
+    std::fs::write(&sig, b"kept").unwrap();
+    let third = prepared(&set, &dir, &src, items);
+    assert_eq!(names(&third), ["SUMS", "b", "b.sig"]);
+    assert_eq!(std::fs::read(&sig).unwrap(), b"kept");
+}
+
+/// Full GETs of `path`, not the one-byte probes.
+fn full_gets(env: &Env, path: &str) -> usize {
+    env.srv
+        .hits()
+        .iter()
+        .filter(|h| h.path == path && h.method == "GET" && h.range.as_deref() != Some("bytes=0-0"))
+        .count()
+}
+
+fn ledger(env: &Env) -> String {
+    std::fs::read_to_string(env.set_dir().join(".preserver/bad.json")).unwrap_or_default()
+}
+
+#[test]
+fn a_bad_signature_is_not_downloaded_again_until_upstream_changes() {
+    let env = Env::new();
+    let data = b"the real release\n".to_vec();
+    let sig = env.key.sign(&data);
+    let wrong = env.key.sign(b"something else");
+    env.routes(&[("d/a.bin", &data), ("d/a.bin.sig", &wrong)]);
+    let cat = catalog(2, vec![env.signed("src", "d/a.bin")]);
+
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Failed);
+    assert!(job.error.unwrap().contains("bad signature"));
+    let parsed: serde_json::Value = serde_json::from_str(&ledger(&env)).unwrap();
+    let e = &parsed["entries"][0];
+    assert_eq!(e["urls"][0].as_str(), Some(&env.srv.url("d/a.bin")[..]));
+    assert_eq!(e["urls"][1].as_str(), Some(&env.srv.url("d/a.bin.sig")[..]));
+    assert_eq!(e["seen"].as_array().unwrap().len(), 2);
+
+    env.srv.clear_log();
+    let job = env.sync(&cat);
+    assert_eq!((job.state, job.known_bad), (JobState::Failed, true));
+    assert_eq!(full_gets(&env, "d/a.bin"), 0, "{:?}", env.srv.hits());
+    assert!(env.status()["detail"].as_str().unwrap().contains("skipped"));
+
+    // A recheck downloads it although upstream is unchanged.
+    env.store
+        .edit_control(Some(&job.id), |c| c.recheck += 1)
+        .unwrap();
+    env.srv.clear_log();
+    let job = env.sync(&cat);
+    assert_eq!((job.state, job.known_bad), (JobState::Failed, false));
+    assert_eq!(full_gets(&env, "d/a.bin"), 1);
+
+    // A re-signed file has a new ETag on its signature: fetched, verified, published.
+    env.routes(&[("d/a.bin", &data), ("d/a.bin.sig", &sig)]);
+    env.srv.clear_log();
+    let job = env.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(full_gets(&env, "d/a.bin"), 1);
+    assert_eq!(version_dirs(&env.set_dir()).len(), 1);
+    assert!(!ledger(&env).contains("a.bin"), "{}", ledger(&env));
+}
+
+#[test]
+fn a_repo_payload_that_never_matches_is_held() {
+    let mut env = Env::new();
+    env.walkers = SYNTH;
+    let src = publish_repo(&env, &[("pool/a", b"aaa")]);
+    env.srv.set(|b| {
+        b.routes
+            .as_mut()
+            .unwrap()
+            .insert("repo/pool/a".into(), b"bbb".to_vec());
+    });
+    let cat = catalog(2, vec![src]);
+    let job = env.sync(&cat);
+    assert_eq!((job.state, job.known_bad), (JobState::Failed, false));
+    assert!(ledger(&env).contains(&env.srv.url("repo/pool/a")));
+    assert_eq!(full_gets(&env, "repo/pool/a"), 1, "one try per run");
+
+    env.srv.clear_log();
+    let job = env.sync(&cat);
+    assert_eq!((job.state, job.known_bad), (JobState::Failed, true));
+    assert_eq!(full_gets(&env, "repo/pool/a"), 0, "{:?}", env.srv.hits());
+}

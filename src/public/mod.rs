@@ -16,14 +16,15 @@ use crate::net::client;
 use crate::net::download::{CHECKPOINT, Downloader};
 use crate::net::throttle::Throttle;
 use crate::paths::Paths;
-use crate::queue::{Job, JobKind, JobState, Lane, Pass, Store, Work, Worker, runnable};
+use crate::queue::bad::{self, Bad};
+use crate::queue::{Job, JobKind, JobState, Lane, Pass, Planned, Store, Work, Worker, runnable};
 use crate::resolve::{GH_API, HF_BASE, Item, Resolver};
 use crate::verify::Verifier;
 use crate::{actions, platform, status};
 use anyhow::{Context, Result, bail};
 use gix::protocol::transport::client::blocking_io::http::Http;
 use jiff::{Timestamp, Zoned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -300,7 +301,29 @@ impl Public<'_> {
             }
             Prepared::Staged(staged, fetches) => {
                 self.staged().insert(job.id.clone(), *staged);
-                Ok(fetches.into())
+                let known = by
+                    .iter()
+                    .flat_map(|(_, items)| items)
+                    .flat_map(|it| {
+                        [
+                            Some(&it.url),
+                            it.sig_url.as_ref(),
+                            it.sums_url.as_ref(),
+                            it.sums_sig_url.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                    })
+                    .collect();
+                Ok(Work::Fetch(Planned {
+                    fetches,
+                    bad: Some(Bad {
+                        set_dir: dir,
+                        known,
+                    }),
+                    ..Planned::default()
+                }))
             }
         }
     }
@@ -498,7 +521,13 @@ impl Public<'_> {
             }
         };
         match next {
-            Next::Batch(p) => Ok(Work::Fetch(p)),
+            Next::Batch(mut p) => {
+                p.bad = Some(Bad {
+                    set_dir: Self::public_dir(root).join(set),
+                    known: HashSet::new(),
+                });
+                Ok(Work::Fetch(p))
+            }
             Next::Ready => Ok(Vec::new().into()),
             Next::OverBudget { need, room } => {
                 gens.remove(job);
@@ -539,7 +568,8 @@ impl Public<'_> {
         match job.state {
             JobState::Done => {
                 let Some(staged) = staged else { return };
-                match staged.publish(&self.verifier, Timestamp::now()) {
+                let mut refused = Vec::new();
+                match staged.publish(&self.verifier, Timestamp::now(), &mut refused) {
                     Ok(version) => self.record(set, "ok", &version, ""),
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -548,6 +578,19 @@ impl Public<'_> {
                         job.error = Some(trunc(&msg, 600));
                     }
                 }
+                // An entry whose URLs cannot all be probed now has nothing to compare later.
+                let refused = refused
+                    .into_iter()
+                    .filter_map(|mut e| {
+                        e.seen = e
+                            .urls
+                            .iter()
+                            .map(|u| self.resolver.dl.probe(u))
+                            .collect::<Option<_>>()?;
+                        Some(e)
+                    })
+                    .collect();
+                bad::record(&Self::public_dir(root).join(set), refused);
                 if let Err(e) = index::write(self.cat, &root.join("preserver")) {
                     tracing::warn!("index: {e:#}");
                 }
@@ -914,6 +957,7 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
     status::job(&mut paths.clone(), "public", |paths| {
         work(&public(&cat, paths, &cfg, &dl), &store, &dl, pass)?;
         let mut errs = Vec::new();
+        let mut news = false;
         for j in store.jobs()? {
             let name = match &j.kind {
                 JobKind::Mirror { set, source } => format!("{set}/{source}"),
@@ -924,6 +968,8 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
                 // Nobody waits on the result here, unlike run(): the worker tidies up.
                 JobState::Done | JobState::Canceled => store.remove(&j.id)?,
                 JobState::Failed if j.updated >= start => {
+                    // A file skipped as known bad was reported when it first failed.
+                    news |= !j.known_bad;
                     errs.push(format!(
                         "{name}: {}",
                         j.error.as_deref().unwrap_or_default()
@@ -936,7 +982,9 @@ pub(crate) fn daemon_pass(paths: &Paths, pass: Pass) -> Result<()> {
             return Ok(());
         }
         let msg = errs.join("; ");
-        notify(true, "Public sync had failures", &trunc(&msg, 600));
+        if news {
+            notify(true, "Public sync had failures", &trunc(&msg, 600));
+        }
         bail!(msg)
     })
 }
@@ -1026,7 +1074,11 @@ fn list_text(cat: &Catalog, root: Option<&Path>, st: &status::Status) -> Result<
     Ok(out)
 }
 
-/// `preserver public [SET...] [--dry-run] [--first-pass] [--foreground]`.
+/// `preserver public [SET...] [--dry-run] [--first-pass] [--foreground] [--recheck]`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the CLI's flags, passed straight through"
+)]
 pub(crate) fn run(
     paths: &mut Paths,
     cfg: &Config,
@@ -1034,6 +1086,7 @@ pub(crate) fn run(
     dry: bool,
     first_pass: bool,
     foreground: bool,
+    recheck: bool,
 ) -> Result<()> {
     let cat = Catalog::embedded()?;
     let sets = cat.select(names, first_pass)?;
@@ -1055,6 +1108,15 @@ pub(crate) fn run(
     let store = Store::new(paths.queue.clone());
     let Some((_lock, ids)) = actions::handoff(paths, "queue", foreground, |tidy| {
         let jobs = enqueue_all(&store, &sets, &cfg.primary_uuid, tidy, &|_| false)?;
+        if recheck {
+            // A retry too, so a job running now runs again when it stops, rechecking.
+            for (_, id) in &jobs {
+                store.edit_control(Some(id), |c| {
+                    c.retry += 1;
+                    c.recheck += 1;
+                })?;
+            }
+        }
         Ok(jobs.into_iter().map(|(_, id)| id).collect())
     })?
     else {
@@ -1064,6 +1126,7 @@ pub(crate) fn run(
     status::job(paths, "public", |paths| {
         work(&public(&cat, paths, cfg, &dl), &store, &dl, Pass::FRESH)?;
         let mut errs = Vec::new();
+        let mut news = false;
         for id in &ids {
             let job = store.job(id)?;
             let name = match &job.kind {
@@ -1074,6 +1137,7 @@ pub(crate) fn run(
             match job.state {
                 JobState::Done => {}
                 JobState::Failed => {
+                    news |= !job.known_bad;
                     errs.push(format!("{name}: {}", job.error.unwrap_or_default()));
                 }
                 s => println!("{name}: {s} (job {id})"),
@@ -1083,7 +1147,9 @@ pub(crate) fn run(
             return Ok(());
         }
         let msg = errs.join("; ");
-        notify(true, "Public sync had failures", &trunc(&msg, 600));
+        if news {
+            notify(true, "Public sync had failures", &trunc(&msg, 600));
+        }
         bail!(msg)
     })
 }
