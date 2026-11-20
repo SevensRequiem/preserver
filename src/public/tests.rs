@@ -3,6 +3,7 @@ use super::*;
 use crate::catalog::{Kind, Resolve};
 use crate::keys::RsaKey;
 use crate::mirror::Anchor;
+use crate::net::download::Fetch;
 use crate::net::testserver::Server;
 use crate::platform::DriveAt;
 use crate::resolve::hex;
@@ -1428,4 +1429,304 @@ fn limit_follows_config_edits() {
         limit.refresh();
         assert_eq!(limit.throttle.bytes_per_sec(), want, "{text}");
     }
+}
+
+/// A visible version `<set>/2026-01-01` holding `files`, listed in its SHA256SUMS under their
+/// own hashes, plus `extra` sums lines.
+fn visible(set_dir: &Path, files: &[(&str, &[u8])], extra: &str) -> PathBuf {
+    let vd = set_dir.join("2026-01-01");
+    let mut sums = String::new();
+    for (rel, data) in files {
+        let p = vd.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, data).unwrap();
+        let _ = writeln!(sums, "{}  {rel}", hex(&Sha256::digest(data)));
+    }
+    std::fs::create_dir_all(&vd).unwrap();
+    std::fs::write(vd.join("SET.toml"), b"set = \"x\"\n").unwrap();
+    std::fs::write(vd.join("SHA256SUMS"), sums + extra).unwrap();
+    vd
+}
+
+fn hash_item(name: &str, data: &[u8]) -> Item {
+    Item {
+        name: name.into(),
+        url: format!("https://e.example/{name}"),
+        version: "1".into(),
+        sha256: hex(&Sha256::digest(data)),
+        size: Some(data.len() as u64),
+        ..Item::default()
+    }
+}
+
+fn prepared(set: &Set, dir: &Path, src: &Source, items: Vec<Item>) -> Vec<Fetch> {
+    match versioned::prepare(set, dir, &[(src, items)], u64::MAX).unwrap() {
+        Prepared::Staged(_, fetches) => fetches,
+        Prepared::Unchanged(v) => panic!("unchanged {v}"),
+    }
+}
+
+fn fetch_of<'a>(fetches: &'a [Fetch], name: &str) -> &'a Fetch {
+    fetches
+        .iter()
+        .find(|f| f.dest.file_name().unwrap() == name)
+        .unwrap()
+}
+
+#[test]
+fn prepare_finds_reuse_candidates_in_order() {
+    let tmp = TempDir::new();
+    let public = tmp.path().join("public");
+    let dir = public.join("demo");
+    let (a, b) = (&b"aaa"[..], &b"bbb"[..]);
+    let (upward, linked, dotted) = (&b"ccc"[..], &b"ddd"[..], &b"eee"[..]);
+    let own = visible(&dir, &[("s/a.bin", a)], "");
+    // `../x`, a dot directory and a link: each names an existing file with the right hash.
+    std::fs::write(public.join("x"), upward).unwrap();
+    std::fs::create_dir_all(dir.join(".staging/zz/s")).unwrap();
+    std::fs::write(dir.join(".staging/zz/s/e.bin"), dotted).unwrap();
+    let extra = format!(
+        "{}  ../../x\n{}  lnk/d.bin\n{}  .staging/zz/s/e.bin\n",
+        hex(&Sha256::digest(upward)),
+        hex(&Sha256::digest(linked)),
+        hex(&Sha256::digest(dotted)),
+    );
+    let other = visible(
+        &public.join("other"),
+        &[("t/a.bin", a), ("t/b.bin", b)],
+        &extra,
+    );
+    std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+    std::fs::write(tmp.path().join("elsewhere/d.bin"), linked).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tmp.path().join("elsewhere"), other.join("lnk")).unwrap();
+
+    let cat = catalog(1, Vec::new());
+    let src = Source {
+        name: "s".into(),
+        ..Source::default()
+    };
+    let mut up = hash_item("a2.bin", a);
+    up.sha256 = up.sha256.to_ascii_uppercase();
+    up.sig_url = Some("https://e.example/a2.bin.sig".into());
+    let bare = Item {
+        sha256: String::new(),
+        ..hash_item("f.bin", a)
+    };
+    let items = vec![
+        up,
+        hash_item("b.bin", b),
+        hash_item("c.bin", upward),
+        hash_item("d.bin", linked),
+        hash_item("e.bin", dotted),
+        bare,
+    ];
+    let fetches = prepared(&cat.sets[0], &dir, &src, items);
+    let cases = [
+        ("a2.bin", Some(own.join("s/a.bin"))),
+        ("b.bin", Some(other.join("t/b.bin"))),
+        ("c.bin", None),
+        ("d.bin", None),
+        ("e.bin", None),
+        ("f.bin", None),
+    ];
+    for (name, want) in cases {
+        assert_eq!(fetch_of(&fetches, name).reuse, want, "{name}");
+    }
+    assert!(
+        fetches
+            .iter()
+            .any(|f| f.url == "https://e.example/a2.bin.sig" && f.reuse.is_none()),
+        "a reused file still fetches its signature"
+    );
+}
+
+/// A part and a sidecar in an old stage; an empty `expect` writes a sidecar without the field.
+fn old_partial(stage: &Path, rel: &str, expect: &str, offset: u64) {
+    let part = stage.join(format!("{rel}.part"));
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    std::fs::write(&part, [7u8; 256]).unwrap();
+    let mut json = serde_json::json!({
+        "v": 1, "url": "https://old.example/x", "validator": {"etag": "\"v1\""},
+        "offset": offset, "total": 1000, "sha256": [0, 0, 0, 0, 0, 0, 0, 0], "sha512": null,
+    });
+    if !expect.is_empty() {
+        json["expect"] = expect.into();
+    }
+    std::fs::write(stage.join(format!("{rel}.part.json")), json.to_string()).unwrap();
+}
+
+#[test]
+fn prepare_moves_a_matching_partial_out_of_an_old_stage() {
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("public/demo");
+    let old = dir.join(".staging/aaaaaaaaaaaaaaaa");
+    let (a, b) = (&b"payload a"[..], &b"payload b"[..]);
+    let tag = |d: &[u8]| format!("sha256:{}", hex(&Sha256::digest(d)));
+    old_partial(&old, "s/a.bin", &tag(a), 128);
+    old_partial(&old, "s/b.bin", "", 128);
+    let cat = catalog(1, Vec::new());
+    let src = Source {
+        name: "s".into(),
+        ..Source::default()
+    };
+    let items = vec![hash_item("a-2.bin", a), hash_item("b-2.bin", b)];
+    let fetches = prepared(&cat.sets[0], &dir, &src, items);
+    let fa = fetch_of(&fetches, "a-2.bin");
+    assert_eq!(std::fs::read(fa.part()).unwrap(), [7u8; 256]);
+    assert!(fa.sidecar().is_file());
+    assert!(!fetch_of(&fetches, "b-2.bin").part().exists());
+    assert!(!old.exists(), "the old stage is deleted");
+
+    // With a visible file to reuse, the partial stays behind and goes with its stage.
+    let tmp = TempDir::new();
+    let dir = tmp.path().join("public/demo");
+    let old = dir.join(".staging/aaaaaaaaaaaaaaaa");
+    old_partial(&old, "s/a.bin", &tag(a), 128);
+    let vd = visible(&dir, &[("s/a.bin", a)], "");
+    let fetches = prepared(&cat.sets[0], &dir, &src, vec![hash_item("a-2.bin", a)]);
+    let fa = fetch_of(&fetches, "a-2.bin");
+    assert_eq!(fa.reuse, Some(vd.join("s/a.bin")));
+    assert!(!fa.part().exists() && !old.exists());
+
+    // Two old stages with the same file: the one with more bytes checkpointed moves,
+    // whichever stage `read_dir` lists first.
+    for (first, second) in [(200, 64), (64, 200)] {
+        let tmp = TempDir::new();
+        let dir = tmp.path().join("public/demo");
+        old_partial(
+            &dir.join(".staging/aaaaaaaaaaaaaaaa"),
+            "s/a.bin",
+            &tag(a),
+            first,
+        );
+        old_partial(
+            &dir.join(".staging/bbbbbbbbbbbbbbbb"),
+            "s/a.bin",
+            &tag(a),
+            second,
+        );
+        let fetches = prepared(&cat.sets[0], &dir, &src, vec![hash_item("a-2.bin", a)]);
+        let side: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fetch_of(&fetches, "a-2.bin").sidecar()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(side["offset"], 200, "offsets {first}, {second}");
+    }
+}
+
+impl Env {
+    /// An Alpine-style index source: one iso with a published sha256 and size.
+    fn indexed(&self) -> Source {
+        Source {
+            name: "src".into(),
+            kind: Some(Kind::Http),
+            resolve: Some(Resolve::YamlLite),
+            url: self.srv.url("rel/latest.yaml"),
+            assets: vec!["std".into()],
+            license: "MIT".into(),
+            ..Source::default()
+        }
+    }
+
+    /// Serves the index for `iso` at `version` and the iso itself.
+    fn serve_iso(&self, iso: &str, version: &str, data: &[u8]) {
+        let yaml = format!(
+            "-\n  flavor: std\n  iso: {iso}\n  version: {version}\n  sha256: {}\n  size: {}\n",
+            hex(&Sha256::digest(data)),
+            data.len()
+        );
+        self.routes(&[
+            ("rel/latest.yaml", yaml.as_bytes()),
+            (&format!("rel/{iso}"), data),
+        ]);
+    }
+
+    fn iso_hits(&self) -> usize {
+        self.srv
+            .hits()
+            .iter()
+            .filter(|h| h.path.rsplit('.').next() == Some("iso"))
+            .count()
+    }
+}
+
+#[test]
+fn a_version_bump_with_the_same_hash_is_linked_not_downloaded() {
+    let t = Env::new();
+    let data = crate::net::testserver::body(200 << 10, 21);
+    let cat = catalog(2, vec![t.indexed()]);
+    t.serve_iso("a-1.iso", "1", &data);
+    assert_eq!(t.sync(&cat).state, JobState::Done);
+    t.srv.clear_log();
+
+    t.serve_iso("a-2.iso", "2", &data);
+    let job = t.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(t.iso_hits(), 0);
+    let versions = version_dirs(&t.set_dir());
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    let (new, old) = (
+        t.set_dir().join(&versions[0]),
+        t.set_dir().join(&versions[1]),
+    );
+    assert_eq!(std::fs::read(new.join("src/a-2.iso")).unwrap(), data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ino = |p: PathBuf| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(ino(new.join("src/a-2.iso")), ino(old.join("src/a-1.iso")));
+    }
+    let sf = read_set_file(&new.join("SET.toml"));
+    assert_eq!(sf.entries.len(), 1);
+    assert_eq!(sf.entries[0].verify, "hash");
+    let sums = std::fs::read_to_string(new.join("SHA256SUMS")).unwrap();
+    assert!(sums.contains(&format!("{}  src/a-2.iso\n", hex(&Sha256::digest(&data)))));
+}
+
+#[test]
+fn a_file_another_set_holds_is_reused() {
+    let t = Env::new();
+    let data = crate::net::testserver::body(100 << 10, 22);
+    let held = visible(
+        &t.set_dir().parent().unwrap().join("other"),
+        &[("x/a.iso", &data)],
+        "",
+    );
+    let cat = catalog(1, vec![t.indexed()]);
+    t.serve_iso("a-1.iso", "1", &data);
+    let job = t.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(t.iso_hits(), 0);
+    let new = t.set_dir().join(&version_dirs(&t.set_dir())[0]);
+    assert_eq!(std::fs::read(new.join("src/a-1.iso")).unwrap(), data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ino = |p: PathBuf| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(ino(new.join("src/a-1.iso")), ino(held.join("x/a.iso")));
+    }
+    assert_eq!(
+        read_set_file(&new.join("SET.toml")).entries[0].verify,
+        "hash"
+    );
+}
+
+#[test]
+fn a_tampered_reuse_source_is_downloaded_instead() {
+    let t = Env::new();
+    let data = crate::net::testserver::body(100 << 10, 23);
+    let cat = catalog(2, vec![t.indexed()]);
+    t.serve_iso("a-1.iso", "1", &data);
+    assert_eq!(t.sync(&cat).state, JobState::Done);
+    let v1 = t.set_dir().join(&version_dirs(&t.set_dir())[0]);
+    std::fs::write(v1.join("src/a-1.iso"), vec![0u8; data.len()]).unwrap();
+    t.srv.clear_log();
+
+    t.serve_iso("a-2.iso", "2", &data);
+    let job = t.sync(&cat);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(t.iso_hits(), 1);
+    let new = t.set_dir().join(&version_dirs(&t.set_dir())[0]);
+    assert_eq!(std::fs::read(new.join("src/a-2.iso")).unwrap(), data);
 }

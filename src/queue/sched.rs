@@ -709,6 +709,7 @@ mod tests {
             size: None,
             limit: u64::MAX,
             expect: Expect::None,
+            reuse: None,
         }];
         let p = Pool::new(&fetches);
         let fail = |progressed| {
@@ -780,6 +781,7 @@ mod tests {
                 size: Some(data.len() as u64),
                 limit: u64::MAX,
                 expect: Expect::None,
+                reuse: None,
             })
             .collect();
         let pool = Pool::new(&fetches);
@@ -848,6 +850,7 @@ mod tests {
                 size: Some(self.data.len() as u64),
                 limit: u64::MAX,
                 expect: Expect::Sha256(sha2::Sha256::digest(&self.data).into()),
+                reuse: None,
             }
         }
 

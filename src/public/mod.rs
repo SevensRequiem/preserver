@@ -154,8 +154,9 @@ impl Public<'_> {
             .map(|s| s.est)
             .sum();
         let estimate = gb_bytes(versioned);
-        // A resumed job's stage holds part of the set already. A stage of an older plan is
-        // deleted by prepare(), so its bytes come back as free space.
+        // A resumed job's stage holds part of the set already. In a stage of an older plan,
+        // prepare() moves the partials whose expected hash the new plan still wants into the
+        // new stage and deletes the rest, whose bytes come back as free space.
         let mut staged = Vec::new();
         let stage = Self::public_dir(root).join(&set.name).join(".staging");
         if stage.is_dir() {

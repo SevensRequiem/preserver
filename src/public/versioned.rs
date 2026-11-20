@@ -1,9 +1,14 @@
 //! Verioned sets: `<set>/.staging/<plan16>/` fills up, and becomes `<set>/<date>/` in one
 //! rename once every file in it has verified. Files a new version shares with the previous
-//! one are hard links, so keeping several versions costs only what changed.
+//! one are hard links, so keeping several versions costs only what changed. A file whose
+//! published sha256 matches a file of any visible version on the drive (this set first, then
+//! the others) is linked from there and read back before it counts, and a partial download in
+//! an older stage moves into the new one when it was fetched against the same hash.
 
 use crate::catalog::{Kind, Set, Source};
-use crate::net::download::{Expect, Fetch};
+use crate::copy::exec::plain_file;
+use crate::mirror::generation::valid_path;
+use crate::net::download::{Expect, Fetch, part_expect};
 use crate::platform;
 use crate::resolve::{HF_BASE, Item, hex};
 use crate::verify::{SIDE_LIMIT, Verifier, side};
@@ -237,9 +242,93 @@ pub(crate) fn clear_other_stages(stage_root: &Path, keep: &str) {
     }
 }
 
+/// Files of visible versions on the drive by their `SHA256SUMS` hash, for the hashes in
+/// `want`: this set's versions newest first, then the other sets' by name. The sums file is
+/// drive data, so a hit is only a candidate that `Downloader` reads back before using it.
+/// In-place mirror trees have no `SET.toml` and are never scanned.
+fn reuse_index(dir: &Path, want: &HashSet<String>) -> HashMap<String, PathBuf> {
+    let mut sets = vec![dir.to_path_buf()];
+    if let Some(public) = dir.parent() {
+        let mut others: Vec<PathBuf> = std::fs::read_dir(public)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .filter(|p| p != dir)
+            .collect();
+        others.sort();
+        sets.extend(others);
+    }
+    let mut out = HashMap::new();
+    for set_dir in sets {
+        for v in version_dirs(&set_dir) {
+            let vd = set_dir.join(v);
+            let mut sums: Vec<(String, String)> =
+                read_sums(&vd.join("SHA256SUMS")).into_iter().collect();
+            sums.sort();
+            for (rel, h) in sums {
+                let h = h.to_ascii_lowercase();
+                if want.contains(&h)
+                    && !out.contains_key(&h)
+                    && valid_path(&rel)
+                    && plain_file(&vd, &rel)
+                {
+                    out.insert(h, vd.join(&rel));
+                    if out.len() == want.len() {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Partial downloads in the stages of older plans whose sidecar records an expected hash, by
+/// that hash: `(part, sidecar, offset)`, the one with the most bytes checkpointed when several
+/// stages hold the same file.
+fn old_partials(stage_root: &Path, keep: &str) -> HashMap<String, (PathBuf, PathBuf, u64)> {
+    let mut out = HashMap::new();
+    for e in std::fs::read_dir(stage_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if e.file_name().to_str() == Some(keep) || !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let stage = e.path();
+        let mut files = Vec::new();
+        let _ = regular_files(&stage, "", &mut files);
+        files.sort();
+        for (rel, _) in files {
+            let Some(base) = rel.strip_suffix(".part.json") else {
+                continue;
+            };
+            let (side, part) = (stage.join(&rel), stage.join(format!("{base}.part")));
+            if let Some((tag, offset)) = part_expect(&side)
+                && std::fs::symlink_metadata(&part).is_ok_and(|m| m.is_file())
+                && out.get(&tag).is_none_or(|(_, _, o)| *o < offset)
+            {
+                out.insert(tag, (part, side, offset));
+            }
+        }
+    }
+    out
+}
+
 /// Sets up the staging directory for the resolved set: links what the previous version
 /// already has and lists the downloads for the rest, signatures and sums files included.
+/// A file another visible version holds under the same published sha256 becomes the fetch's
+/// `reuse` candidate, and a partial from an older plan moves along when its expected hash
+/// matches; the older stages are deleted only after that.
 /// `room` is what the set may still take: the size limit of a body nobody announced.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the plan: carry, reuse or fetch"
+)]
 pub(crate) fn prepare(
     set: &Set,
     dir: &Path,
@@ -262,9 +351,16 @@ pub(crate) fn prepare(
     let stage_root = dir.join(".staging");
     let stage = stage_root.join(&plan[..16]);
     plain_dirs(&[dir, &stage_root, &stage])?;
-    clear_other_stages(&stage_root, &plan[..16]);
     std::fs::create_dir_all(&stage).with_context(|| stage.display().to_string())?;
 
+    let want: HashSet<String> = by
+        .iter()
+        .flat_map(|(_, items)| items)
+        .filter(|it| !it.sha256.is_empty())
+        .map(|it| it.sha256.to_ascii_lowercase())
+        .collect();
+    let mut index = None;
+    let mut partials = old_partials(&stage_root, &plan[..16]);
     let mut slots = Vec::new();
     let mut fetches: Vec<Fetch> = Vec::new();
     let mut side_links = Vec::new();
@@ -297,13 +393,34 @@ pub(crate) fn prepare(
                 }
             } else {
                 if !dst.exists() {
-                    fetches.push(Fetch {
+                    let reuse = (!it.sha256.is_empty())
+                        .then(|| {
+                            index
+                                .get_or_insert_with(|| reuse_index(dir, &want))
+                                .get(&it.sha256.to_ascii_lowercase())
+                                .cloned()
+                        })
+                        .flatten();
+                    let f = Fetch {
                         url: it.url.clone(),
                         dest: dst.clone(),
                         size: it.size,
                         limit: room,
                         expect: expect(it).with_context(|| rel.clone())?,
-                    });
+                        reuse,
+                    };
+                    // The part goes first: a crash between the two leaves a part with no
+                    // sidecar, which restarts from zero, never a sidecar over other bytes.
+                    let tag = f.expect.tag();
+                    if f.reuse.is_none()
+                        && !tag.is_empty()
+                        && !f.part().exists()
+                        && let Some((part, side, _)) = partials.remove(&tag)
+                        && std::fs::rename(&part, f.part()).is_ok()
+                    {
+                        let _ = std::fs::rename(&side, f.sidecar());
+                    }
+                    fetches.push(f);
                 }
                 for url in sides {
                     let beside = side(&dst, url);
@@ -314,6 +431,7 @@ pub(crate) fn prepare(
                             size: None,
                             limit: SIDE_LIMIT,
                             expect: Expect::None,
+                            reuse: None,
                         });
                     }
                 }
@@ -333,6 +451,7 @@ pub(crate) fn prepare(
             link_or_copy(&from, &to);
         }
     }
+    clear_other_stages(&stage_root, &plan[..16]);
     let staged = Staged {
         set: set.clone(),
         sources: by.iter().map(|(s, _)| (*s).clone()).collect(),

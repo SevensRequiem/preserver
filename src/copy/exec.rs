@@ -269,7 +269,7 @@ pub(crate) fn delete_kit(archive: &Path) -> Result<()> {
 /// A regular file at `base/rel`, with plain directories all the way: the old version lives on
 /// the untrusted target, so a link swapped in for one of its directories must not pull a file
 /// from elsewhere into the set.
-fn plain_file(base: &Path, rel: &str) -> bool {
+pub(crate) fn plain_file(base: &Path, rel: &str) -> bool {
     let mut p = base.to_path_buf();
     let mut parts = rel.split('/').peekable();
     while let Some(c) = parts.next() {

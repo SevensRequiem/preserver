@@ -4,9 +4,15 @@
 //! (`sync_data` comes before the sidecar's rename) and `sha256`/`sha512` are the midstates of
 //! exactly those bytes. A resume truncates the part to `offset`, restores the hashers and asks
 //! for the rest with `If-Range`, so a changed file comes back as a 200 and starts over.
+//!
+//! A fetch with `reuse` first links or copies that file and reads it back against `expect`;
+//! only when that fails does it go to the network, in the same call. A sidecar that records a
+//! non-empty expected hash also resumes under a new URL when the fetch expects the same hash.
 
 use super::hash::{Resumable, S256, S512};
 use super::throttle::Throttle;
+use crate::platform;
+use crate::resolve::hex;
 use crate::resolve::listing::join;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -39,6 +45,19 @@ pub(crate) enum Expect {
     Apk([u8; 20]),
 }
 
+impl Expect {
+    /// The expected hash as text: the sidecar's `expect` field.
+    pub(crate) fn tag(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Sha256(a) => format!("sha256:{}", hex(a)),
+            Self::Sha512(b) => format!("sha512:{}", hex(b)),
+            Self::Both(a, b) => format!("sha256:{} sha512:{}", hex(a), hex(b)),
+            Self::Apk(q) => format!("apk-q1:{}", hex(q)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Fetch {
     pub url: String,
@@ -50,6 +69,9 @@ pub(crate) struct Fetch {
     /// past it. A known `size` is the limit instead.
     pub limit: u64,
     pub expect: Expect,
+    /// A visible file on the same drive believed to hold these bytes: linked or copied and
+    /// checked against `expect` before anything is downloaded.
+    pub reuse: Option<PathBuf>,
 }
 
 impl Fetch {
@@ -177,6 +199,41 @@ struct PartState {
     total: u64,
     sha256: [u32; 8],
     sha512: Option<[u64; 8]>,
+    /// `Expect::tag` of the fetch that wrote it. Older sidecars have none and resume only
+    /// under their own URL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    expect: String,
+}
+
+/// The sidecar, read without following a link or waiting on a FIFO, and capped: it sits on a
+/// drive anyone may have written to.
+fn read_side(side: &Path) -> Option<PartState> {
+    let mut buf = Vec::new();
+    platform::open_regular(side)
+        .ok()?
+        .take(64 << 10)
+        .read_to_end(&mut buf)
+        .ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// The expected hash a current-format sidecar records, if any, and the bytes it vouches for.
+pub(crate) fn part_expect(side: &Path) -> Option<(String, u64)> {
+    read_side(side)
+        .filter(|s| s.v == SIDECAR_VERSION && !s.expect.is_empty())
+        .map(|s| (s.expect, s.offset))
+}
+
+/// Whether the digests match what `e` expects. `Apk` needs the whole file and is checked by
+/// `finish` itself, so it never matches here.
+fn sums_match(e: &Expect, sha256: &[u8], sha512: Option<&[u8]>) -> bool {
+    match e {
+        Expect::None => true,
+        Expect::Sha256(w) => sha256 == w,
+        Expect::Sha512(w) => sha512 == Some(w),
+        Expect::Both(a, b) => sha256 == a && sha512 == Some(b),
+        Expect::Apk(_) => false,
+    }
 }
 
 struct Part {
@@ -309,6 +366,11 @@ impl Downloader {
     /// Downloads `f` to its `.part`, verifies it and renames it to `dest`. `stop` is checked
     /// between 64 KiB chunks; `done` counts bytes on disk for progress.
     pub(crate) fn fetch(&self, f: &Fetch, stop: &AtomicBool, done: &AtomicU64) -> Result<(), Fail> {
+        if let Some(from) = &f.reuse
+            && Self::adopt(f, from, stop, done)?
+        {
+            return Ok(());
+        }
         let side = f.sidecar();
         let mut part = Self::open(f, &side)?;
         // This call's share of `done` is always `part.offset` (open, copy and reset keep it so).
@@ -467,17 +529,17 @@ impl Downloader {
             h256: Resumable::new(),
             h512: wants512.then(Resumable::new),
         };
-        let st = std::fs::read(side)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<PartState>(&b).ok())
-            .filter(|st| {
-                st.v == SIDECAR_VERSION
-                    && st.url == f.url
-                    && st.offset <= len
-                    && st.offset < st.total
-                    && st.offset % BLOCK == 0
-                    && st.sha512.is_some() == wants512
-            });
+        // A part under another URL resumes when both name the same published hash: that hash,
+        // checked in `finish` and again at publish, names the bytes, and If-Range still turns a
+        // server's different version into a restart rather than a splice.
+        let st = read_side(side).filter(|st| {
+            st.v == SIDECAR_VERSION
+                && (st.url == f.url || (!st.expect.is_empty() && st.expect == f.expect.tag()))
+                && st.offset <= len
+                && st.offset < st.total
+                && st.offset % BLOCK == 0
+                && st.sha512.is_some() == wants512
+        });
         match st {
             Some(st) => {
                 p.offset = st.offset;
@@ -576,6 +638,7 @@ impl Downloader {
             total,
             sha256,
             sha512: p.h512.as_ref().and_then(Resumable::midstate).map(|m| m.0),
+            expect: f.expect.tag(),
         };
         p.file.sync_data().map_err(Fail::Disk)?;
         let tmp = suffixed(side, ".tmp");
@@ -598,15 +661,12 @@ impl Downloader {
         let sha256 = p.h256.finish();
         let sha512 = p.h512.map(Resumable::finish);
         let ok = match &f.expect {
-            Expect::None => true,
-            Expect::Sha256(w) => sha256 == w,
-            Expect::Sha512(w) => sha512.as_deref() == Some(w),
-            Expect::Both(a, b) => sha256 == a && sha512.as_deref() == Some(b),
             Expect::Apk(q) => {
                 // The part is read whole even when resumed: the midstate covers only SHA-256.
                 p.file.sync_data().map_err(Fail::Disk)?;
                 crate::mirror::alpine::apk_holds(&p.file, q).map_err(Fail::Disk)?
             }
+            e => sums_match(e, &sha256, sha512.as_deref()),
         };
         if !ok {
             remove(side)?;
@@ -618,6 +678,106 @@ impl Downloader {
         std::fs::rename(f.part(), &f.dest).map_err(Fail::Disk)?;
         remove(&suffixed(side, ".tmp"))?;
         remove(side)
+    }
+
+    /// Takes `from` as the download when its bytes prove to be the expected ones: hard linked
+    /// (or copied where links are impossible) to `<dest>.reuse`, read back while hashing and
+    /// renamed to `dest` only on a match. `Ok(false)` sends the caller to the network. Tried
+    /// only while no `.part` exists: a bad candidate is read again only after a download of the
+    /// same file failed verification and took its `.part` with it.
+    fn adopt(f: &Fetch, from: &Path, stop: &AtomicBool, done: &AtomicU64) -> Result<bool, Fail> {
+        if matches!(f.expect, Expect::None | Expect::Apk(_)) || f.part().exists() {
+            return Ok(false);
+        }
+        let tmp = suffixed(&f.dest, ".reuse");
+        remove(&tmp)?;
+        let Ok(src) = platform::open_regular(from) else {
+            return Ok(false);
+        };
+        let Ok(len) = src.metadata().map(|m| m.len()) else {
+            return Ok(false);
+        };
+        if f.size.is_some_and(|s| s != len) || len > f.size.unwrap_or(f.limit) {
+            return Ok(false);
+        }
+        // `hard_link` does not follow a final symlink on Linux, and `open_regular` then refuses
+        // what it made; either way the bytes read are the ones `dest` will hold.
+        let (mut reader, mut writer) = if std::fs::hard_link(from, &tmp).is_ok() {
+            if let Ok(r) = platform::open_regular(&tmp) {
+                (r, None)
+            } else {
+                remove(&tmp)?;
+                return Ok(false);
+            }
+        } else {
+            // Not `link_or_copy`: its `fs::copy` cannot be stopped.
+            (src, Some(File::create_new(&tmp).map_err(Fail::Disk)?))
+        };
+        let mut h256 = Resumable::<S256>::new();
+        let mut h512 =
+            matches!(f.expect, Expect::Sha512(_) | Expect::Both(..)).then(Resumable::<S512>::new);
+        let mut buf = vec![0u8; CHUNK];
+        let mut got = 0u64;
+        let give_up = |got: u64| {
+            done.fetch_sub(got, Ordering::Relaxed);
+            remove(&tmp)
+        };
+        loop {
+            // Relaxed: the flag carries no data, as in `copy`.
+            if stop.load(Ordering::Relaxed) {
+                give_up(got)?;
+                return Err(Fail::Stopped);
+            }
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => {
+                    give_up(got)?;
+                    return Ok(false);
+                }
+            };
+            if let Some(w) = &mut writer
+                && let Err(e) = w.write_all(&buf[..n])
+            {
+                give_up(got)?;
+                return Err(Fail::Disk(e));
+            }
+            h256.update(&buf[..n]);
+            if let Some(h) = &mut h512 {
+                h.update(&buf[..n]);
+            }
+            got += n as u64;
+            done.fetch_add(n as u64, Ordering::Relaxed);
+            if got > len {
+                break;
+            }
+        }
+        if got != len {
+            give_up(got)?;
+            return Ok(false);
+        }
+        if let Some(w) = &writer
+            && let Err(e) = w.sync_data()
+        {
+            give_up(got)?;
+            return Err(Fail::Disk(e));
+        }
+        let sha512 = h512.map(Resumable::finish);
+        if !sums_match(&f.expect, &h256.finish(), sha512.as_deref()) {
+            give_up(got)?;
+            tracing::info!(
+                "{}: reuse of {} did not match, downloading",
+                f.url,
+                from.display()
+            );
+            return Ok(false);
+        }
+        drop(writer);
+        if let Err(e) = std::fs::rename(&tmp, &f.dest) {
+            give_up(got)?;
+            return Err(Fail::Disk(e));
+        }
+        Ok(true)
     }
 
     /// One request for a document or its headers: a 200 or an error, with whether to try again.
@@ -799,6 +959,7 @@ mod tests {
                 sha2::Sha256::digest(data).into(),
                 sha2::Sha512::digest(data).into(),
             ),
+            reuse: None,
         }
     }
 
@@ -1229,8 +1390,350 @@ mod tests {
                 size: None,
                 limit: u64::MAX,
                 expect: Expect::None,
+                reuse: None,
             };
             assert_eq!(f.host(), want, "{url}");
         }
+    }
+
+    #[test]
+    fn expect_tag() {
+        let (a, b, q) = ([0xABu8; 32], [0x0Fu8; 64], [0x1Cu8; 20]);
+        let cases = [
+            (Expect::None, String::new()),
+            (Expect::Sha256(a), format!("sha256:{}", "ab".repeat(32))),
+            (Expect::Sha512(b), format!("sha512:{}", "0f".repeat(64))),
+            (
+                Expect::Both(a, b),
+                format!("sha256:{} sha512:{}", "ab".repeat(32), "0f".repeat(64)),
+            ),
+            (Expect::Apk(q), format!("apk-q1:{}", "1c".repeat(20))),
+        ];
+        for (e, want) in cases {
+            assert_eq!(e.tag(), want, "{e:?}");
+        }
+        assert_ne!(Expect::Sha256(a).tag(), Expect::Both(a, b).tag());
+    }
+
+    #[test]
+    fn a_moved_url_resumes_when_the_hash_is_published() {
+        let tmp = TempDir::new();
+        let data = body(5 * CP + 999, 4);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let d = dl(0);
+        let old = Fetch {
+            url: srv.url("old/a.iso"),
+            ..fetch(&srv, tmp.path(), "a.iso", &data)
+        };
+        let done = AtomicU64::new(0);
+        interrupted(&srv, &d, &old, &done);
+
+        let new = Fetch {
+            url: srv.url("new/a.iso"),
+            ..old.clone()
+        };
+        d.fetch(&new, &AtomicBool::new(false), &done).unwrap();
+        assert_eq!(std::fs::read(&new.dest).unwrap(), data);
+        let hits = srv.hits();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("new/a.iso"), "{}", hits[0].path);
+        assert_eq!(hits[0].range.as_deref(), Some("bytes=2097152-"));
+        assert_eq!(hits[0].if_range.as_deref(), Some("\"v1\""));
+        assert_eq!(srv.served(), data.len() as u64 - 2 * CP);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table and the files each case needs"
+    )]
+    fn resume_rule_across_urls() {
+        let data = body(1000, 6);
+        let both = Expect::Both(
+            sha2::Sha256::digest(&data).into(),
+            sha2::Sha512::digest(&data).into(),
+        );
+        let mid256 = {
+            let mut h = Resumable::<S256>::new();
+            h.update(&data[..128]);
+            h.midstate().unwrap().0
+        };
+        let mid512 = {
+            let mut h = Resumable::<S512>::new();
+            h.update(&data[..128]);
+            h.midstate().unwrap().0
+        };
+        let (same, moved) = ("https://a.example/x.iso", "https://b.example/x.iso");
+        let zeros = format!("sha256:{}", "00".repeat(32));
+        // (case, sidecar url, sidecar expect, sidecar has sha512, fetch expect, symlink, kept)
+        let cases: [(&str, &str, String, bool, Expect, bool, bool); 7] = [
+            (
+                "no expect, same url",
+                same,
+                String::new(),
+                true,
+                both.clone(),
+                false,
+                true,
+            ),
+            (
+                "no expect, new url",
+                moved,
+                String::new(),
+                true,
+                both.clone(),
+                false,
+                false,
+            ),
+            (
+                "expect == tag, new url",
+                moved,
+                both.tag(),
+                true,
+                both.clone(),
+                false,
+                true,
+            ),
+            (
+                "a different expect",
+                moved,
+                zeros,
+                true,
+                both.clone(),
+                false,
+                false,
+            ),
+            (
+                "Expect::None, new url",
+                moved,
+                String::new(),
+                false,
+                Expect::None,
+                false,
+                false,
+            ),
+            (
+                "sha512 presence differs",
+                moved,
+                both.tag(),
+                false,
+                both.clone(),
+                false,
+                false,
+            ),
+            (
+                "sidecar is a symlink",
+                same,
+                String::new(),
+                true,
+                both.clone(),
+                true,
+                false,
+            ),
+        ];
+        for (case, url, expect, has512, fexpect, link, kept) in cases {
+            if link && !cfg!(unix) {
+                continue;
+            }
+            let tmp = TempDir::new();
+            let f = Fetch {
+                url: same.into(),
+                dest: tmp.path().join("x.iso"),
+                size: Some(1000),
+                limit: u64::MAX,
+                expect: fexpect,
+                reuse: None,
+            };
+            std::fs::write(f.part(), &data[..256]).unwrap();
+            let st = PartState {
+                v: SIDECAR_VERSION,
+                url: url.into(),
+                validator: Validator::Etag("\"v1\"".into()),
+                offset: 128,
+                total: 1000,
+                sha256: mid256,
+                sha512: has512.then_some(mid512),
+                expect,
+            };
+            let json = serde_json::to_vec(&st).unwrap();
+            if link {
+                let real = tmp.path().join("real.json");
+                std::fs::write(&real, &json).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&real, f.sidecar()).unwrap();
+            } else {
+                std::fs::write(f.sidecar(), &json).unwrap();
+            }
+            let p = Downloader::open(&f, &f.sidecar()).unwrap();
+            assert_eq!(p.offset, if kept { 128 } else { 0 }, "{case}");
+        }
+    }
+
+    #[test]
+    fn old_sidecar_json_still_parses() {
+        let old = br#"{"v":1,"url":"https://a.example/x","validator":{"etag":"\"v1\""},"offset":128,"total":1000,"sha256":[1,2,3,4,5,6,7,8],"sha512":null}"#;
+        let st: PartState = serde_json::from_slice(old).unwrap();
+        assert!(st.expect.is_empty() && st.offset == 128);
+
+        let tmp = TempDir::new();
+        let data = body(3 * CP, 7);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let f = fetch(&srv, tmp.path(), "n.iso", &data);
+        interrupted(&srv, &dl(0), &f, &AtomicU64::new(0));
+        let json = String::from_utf8(std::fs::read(f.sidecar()).unwrap()).unwrap();
+        assert!(json.contains("\"expect\":\"sha256:"), "{json}");
+        assert_eq!(
+            part_expect(&f.sidecar()).map(|(t, _)| t),
+            Some(f.expect.tag())
+        );
+    }
+
+    /// A fetch of `data` whose reuse candidate is `held` (written when given).
+    fn reusing(srv: &Server, dir: &Path, data: &[u8], held: Option<&[u8]>) -> Fetch {
+        let cand = dir.join("held.iso");
+        if let Some(b) = held {
+            std::fs::write(&cand, b).unwrap();
+        }
+        Fetch {
+            reuse: Some(cand),
+            ..fetch(srv, dir, "r.iso", data)
+        }
+    }
+
+    #[test]
+    fn adopt_links_a_matching_file() {
+        let tmp = TempDir::new();
+        let data = body(300_000, 8);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        srv.set(|b| b.status = Some(404));
+        let f = reusing(&srv, tmp.path(), &data, Some(&data));
+        let done = AtomicU64::new(0);
+        dl(0).fetch(&f, &AtomicBool::new(false), &done).unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        assert!(srv.hits().is_empty());
+        assert_eq!(done.load(Ordering::Relaxed), data.len() as u64);
+        assert!(!suffixed(&f.dest, ".reuse").exists() && !f.part().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+            assert_eq!(ino(&f.dest), ino(f.reuse.as_ref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn adopt_falls_back_to_the_network() {
+        let data = body(200_000, 9);
+        let wrong = body(200_000, 10);
+        let cases: [(&str, Option<&[u8]>, bool, bool); 5] = [
+            ("same size, wrong bytes", Some(&wrong), false, false),
+            ("wrong size", Some(&data[..1000]), false, false),
+            ("a symlink to a matching file", None, true, false),
+            ("missing", None, false, false),
+            ("Expect::None", Some(&data), false, true),
+        ];
+        for (case, held, link, none) in cases {
+            if link && !cfg!(unix) {
+                continue;
+            }
+            let tmp = TempDir::new();
+            let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+            let mut f = reusing(&srv, tmp.path(), &data, held);
+            let cand = f.reuse.clone().unwrap();
+            if link {
+                let real = tmp.path().join("real.iso");
+                std::fs::write(&real, &data).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&real, &cand).unwrap();
+            }
+            if none {
+                f.expect = Expect::None;
+            }
+            let before = std::fs::read(&cand).ok();
+            let done = AtomicU64::new(0);
+            dl(0).fetch(&f, &AtomicBool::new(false), &done).unwrap();
+            assert_eq!(std::fs::read(&f.dest).unwrap(), data, "{case}");
+            assert_eq!(srv.hits().len(), 1, "{case}");
+            assert_eq!(std::fs::read(&cand).ok(), before, "{case}");
+            assert!(!suffixed(&f.dest, ".reuse").exists(), "{case}");
+            assert_eq!(done.load(Ordering::Relaxed), data.len() as u64, "{case}");
+        }
+    }
+
+    /// The copy branch (FAT/exFAT, where links fail): the candidate sits on another filesystem,
+    /// so `hard_link` gets EXDEV. Skipped where `/dev/shm` is missing or on the same device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_copies_when_a_link_is_impossible() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new();
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        let shm = Path::new("/dev/shm");
+        if dev(shm).is_none_or(|d| Some(d) == dev(tmp.path())) {
+            eprintln!("skipped: no /dev/shm on another filesystem");
+            return;
+        }
+        let other = shm.join(format!("preserver-test-{}-adopt", std::process::id()));
+        std::fs::create_dir_all(&other).unwrap();
+        let data = body(300_000, 13);
+        let wrong = body(300_000, 14);
+        // (case, candidate bytes, stop, network hits)
+        let cases: [(&str, &[u8], bool, usize); 3] = [
+            ("matching", &data, false, 0),
+            ("same size, wrong bytes", &wrong, false, 1),
+            ("stopped", &data, true, 0),
+        ];
+        for (case, held, stop, hits) in cases {
+            let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+            let cand = other.join("held.iso");
+            std::fs::write(&cand, held).unwrap();
+            let f = Fetch {
+                reuse: Some(cand.clone()),
+                ..fetch(&srv, tmp.path(), "c.iso", &data)
+            };
+            let _ = std::fs::remove_file(&f.dest);
+            let done = AtomicU64::new(0);
+            let got = dl(0).fetch(&f, &AtomicBool::new(stop), &done);
+            assert!(!suffixed(&f.dest, ".reuse").exists(), "{case}");
+            assert_eq!(std::fs::read(&cand).unwrap(), held, "{case}");
+            assert_eq!(srv.hits().len(), hits, "{case}");
+            if stop {
+                assert!(matches!(got, Err(Fail::Stopped)), "{case}");
+                assert!(!f.dest.exists(), "{case}");
+                assert_eq!(done.load(Ordering::Relaxed), 0, "{case}");
+                continue;
+            }
+            got.unwrap();
+            assert_eq!(std::fs::read(&f.dest).unwrap(), data, "{case}");
+            assert_eq!(done.load(Ordering::Relaxed), data.len() as u64, "{case}");
+            assert_ne!(dev(&f.dest), dev(&cand), "{case}: a copy, not a link");
+        }
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[test]
+    fn adopt_is_skipped_once_a_part_exists() {
+        let tmp = TempDir::new();
+        let data = body(200_000, 11);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let f = reusing(&srv, tmp.path(), &data, Some(&data));
+        std::fs::write(f.part(), b"left by an earlier attempt").unwrap();
+        d_fetch(&f).unwrap();
+        assert_eq!(std::fs::read(&f.dest).unwrap(), data);
+        assert_eq!(srv.hits().len(), 1);
+    }
+
+    #[test]
+    fn adopt_honours_the_stop_flag() {
+        let tmp = TempDir::new();
+        let data = body(200_000, 12);
+        let srv = Server::start("127.0.0.1", Behaviour::new(data.clone()));
+        let f = reusing(&srv, tmp.path(), &data, Some(&data));
+        let done = AtomicU64::new(0);
+        let err = dl(0).fetch(&f, &AtomicBool::new(true), &done).unwrap_err();
+        assert!(matches!(err, Fail::Stopped), "{err}");
+        assert!(!f.dest.exists() && !suffixed(&f.dest, ".reuse").exists());
+        assert_eq!(done.load(Ordering::Relaxed), 0);
+        assert!(srv.hits().is_empty());
     }
 }

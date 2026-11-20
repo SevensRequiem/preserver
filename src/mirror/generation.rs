@@ -1281,6 +1281,7 @@ impl Gen {
                 size: Some(e.size),
                 limit: e.size,
                 expect: expect_of(e.check),
+                reuse: None,
             });
             self.meta_out.push(i);
         }
@@ -1479,6 +1480,7 @@ impl Gen {
                     size: Some(size),
                     limit: size,
                     expect: expect_of(want.entry.check),
+                    reuse: None,
                 });
                 out.push(w);
                 bytes += size;

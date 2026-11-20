@@ -1241,6 +1241,7 @@ pub(crate) mod tests {
                 size: Some(len as u64),
                 limit: u64::MAX,
                 expect: Expect::Apk(q1),
+                reuse: None,
             }
         }
 
