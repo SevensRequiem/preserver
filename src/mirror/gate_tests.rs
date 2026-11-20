@@ -2,7 +2,7 @@
 //! the queue worker, the way `preserver public` runs it. A test body is written once and run
 //! for Fedora, Alpine and Debian; the git gate follows.
 
-use super::tests::{Env, GB, catalog, mirror};
+use super::tests::{Env, GB, catalog};
 use super::*;
 use crate::catalog::RepoFormat;
 use crate::mirror::alpine::Hash;
@@ -588,7 +588,7 @@ fn an_unchecked_corrupt_planted_pack_is_refused() {
     let g = Source {
         url: cgi.url("src"),
         license: "MIT".into(),
-        ..mirror("g", Kind::Git, 0.001)
+        ..super::tests::mirror("g", Kind::Git, 0.001)
     };
     let cat = catalog(2, vec![g]);
     let job = env.sync(&cat);

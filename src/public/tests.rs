@@ -1666,14 +1666,12 @@ fn a_version_bump_with_the_same_hash_is_linked_not_downloaded() {
     assert_eq!(t.iso_hits(), 0);
     let versions = version_dirs(&t.set_dir());
     assert_eq!(versions.len(), 2, "{versions:?}");
-    let (new, old) = (
-        t.set_dir().join(&versions[0]),
-        t.set_dir().join(&versions[1]),
-    );
+    let new = t.set_dir().join(&versions[0]);
     assert_eq!(std::fs::read(new.join("src/a-2.iso")).unwrap(), data);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let old = t.set_dir().join(&versions[1]);
         let ino = |p: PathBuf| std::fs::metadata(p).unwrap().ino();
         assert_eq!(ino(new.join("src/a-2.iso")), ino(old.join("src/a-1.iso")));
     }
@@ -1700,6 +1698,7 @@ fn a_file_another_set_holds_is_reused() {
     assert_eq!(t.iso_hits(), 0);
     let new = t.set_dir().join(&version_dirs(&t.set_dir())[0]);
     assert_eq!(std::fs::read(new.join("src/a-1.iso")).unwrap(), data);
+    assert_eq!(std::fs::read(held.join("x/a.iso")).unwrap(), data);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

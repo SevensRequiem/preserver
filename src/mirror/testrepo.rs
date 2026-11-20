@@ -313,6 +313,7 @@ fn a_pool_path_that_climbs_out_is_refused() {
     assert!(!s.hits().iter().any(|h| h.contains("pool/")));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_planted_by_hash_link_in_the_stage_is_cleared() {
     let mut s = Site::new(&["trixie"]);
